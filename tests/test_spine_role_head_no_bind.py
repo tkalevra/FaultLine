@@ -182,7 +182,7 @@ def test_genitive_name_frames_still_bind():
         assert ("wife", "spouse", "user") not in triples, (text, triples)
 
 
-# ── R2 (live bench 76e214a0 residual) — the attr/acomp PARSE-SHAPE COIN FLIP ─────────────────
+# ── R2 (live bench e4a72b6d residual) — the attr/acomp PARSE-SHAPE COIN FLIP ─────────────────
 # The sm tagger parses "My wife is Seren." with the name as attr, and "My wife is Isolde." with
 # the SAME construction's name as PROPN acomp — the measure-NP dobj/npadvmod coin-flip class.
 # The R1 complement scan missed acomp, the possessive weld edge shipped, and ingest linked it

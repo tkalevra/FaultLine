@@ -954,7 +954,7 @@ INGEST_INTENT_INDEPENDENT_HARVEST = os.environ.get(
 
 
 # CORRECTION-TURN HARVEST SUPPRESSION (correction-integrity F2, critic R1 2026-11-07; default ON).
-# Measured on bench seat 76e214a0: "Actually my wife is Magnus, not Seren." returned
+# Measured on bench seat e4a72b6d: "Actually my wife is Magnus, not Seren." returned
 # corrected+facts_superseded=1 (the /retract/correct supersede DID land; the report was TRUE at
 # write time), and then the SAME remember_facts turn's intent-independent harvest re-ingested the
 # CONTRASTIVE-NEGATED surface ("not Seren") as a LIVE (user, spouse, seren) edge - the
@@ -972,7 +972,7 @@ CORRECTION_HARVEST_SUPPRESS_OLD_VALUE = os.environ.get(
 ).strip().lower() not in ("false", "0", "no")
 
 # CORRECTION-TURN HARVEST REPORT RECONCILE (correction-integrity F5, critic R1 2026-11-07;
-# default ON). Measured on bench seat 76e214a0: "Actually I moved to Ashbell." returned
+# default ON). Measured on bench seat e4a72b6d: "Actually I moved to Ashbell." returned
 # status=failed with facts_superseded=0 - yet the DB showed the old residence row SUPERSEDED at
 # that timestamp and Ashbell live; recall rendered Ashbell. The destructive change had LANDED
 # through the intent-independent harvest (spine emits the lives_in edge; the ingest-side

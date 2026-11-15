@@ -25953,7 +25953,7 @@ def derive_sentence_facts(sentence, reference, prior_nps=None, dash_specifier_on
             # "My wife is Isolde." parses it PROPN acomp (the measure-NP dobj/npadvmod coin-flip
             # class) — and a frame whose name lands in acomp missed this scan entirely, the
             # possessive weld edge shipped, and ingest linked it onto the seat's PRE-EXISTING
-            # role-weld entity (live bench 76e214a0: committed=1 onto [wife], Isolde orphaned).
+            # role-weld entity (live bench e4a72b6d: committed=1 onto [wife], Isolde orphaned).
             # Accept the acomp slot too (PROPN-only, below; SPINE_ROLE_HEAD_NO_BIND-gated so the
             # certified flag-ON battery keeps its byte-identity on rollback).
             proper = None
@@ -32758,7 +32758,7 @@ def negated_name_assertion(text: str):
     via a possessive determiner) and whose REJECTED complement is a PROPER-NAME surface —
     e.g. "My wife is not Isolde.", "I am not Sam." That shape DENIES a stored identity
     value: a correction directive, never a question, and GLiNER2's verbose labels mis-score
-    it QUERY@~0.55 (measured live on bench 76e214a0, gate 0.50 — the misroute that ate the
+    it QUERY@~0.55 (measured live on bench e4a72b6d, gate 0.50 — the misroute that ate the
     correction 2/2 rounds). A negated CLASS complement ("my wife is not a vegetarian") is a
     brand-new negative FACT, not a correction — PROPN-only keeps this narrow. Grammar only
     (neg dep + Person=1/Poss=Yes morphology + POS), no word-lists, subject-agnostic.

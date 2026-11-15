@@ -3,7 +3,7 @@
 --
 -- WHY
 -- ---
--- Fog-family lab F5 (bench seat 76e214a0, DEV/FINDINGS-fog-family-lab-20261107.md): the turn
+-- Fog-family lab F5 (bench seat e4a72b6d, DEV/FINDINGS-fog-family-lab-20261107.md): the turn
 -- "We have a cat named Turnip." committed ONE fact and NO has_pet row — the always-on
 -- object-named-value seam (linguistics._chain_object_named_value) filed only the alias-only edge
 -- ((cat, also_known_as, Turnip)) while the raw SVO have-frame carries a rel the seed does not

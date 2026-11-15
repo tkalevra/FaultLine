@@ -1,6 +1,6 @@
 """Fog-family critic-R2 pins (2026-11-07) - the two R1 residuals in lane-A render/dose territory.
 
-R1 verdict residuals (live bench seat 76e214a0):
+R1 verdict residuals (live bench seat e4a72b6d):
 
   1. F7 (MINOR/NOTE) - the RECALL_PROVENANCE_DOSE cap-2 was NOT observable on the chunk-citation
      band: with 3 matching documents a personal query rendered THREE trailing citations, because
@@ -343,7 +343,7 @@ def test_hold_band_counts_as_spoken_fact_band():
 # -- R4 (critic R3 verdict GAPS): the POSSESSED-ROLE boundary shape -----------------
 # "who is Osric's wife?" (anchor Osric HAS a fact; 3 matching docs) rendered 3
 # UNCAPPED citations, and the anchor-vs-target question was open: whose facts does
-# the gate read? LIVE DETERMINATION (critic seat 76e214a0-..., measured 2026-11-07):
+# the gate read? LIVE DETERMINATION (critic seat e4a72b6d-..., measured 2026-11-07):
 # the walk returned ONE fact -- (osric, spouse, "husband"), Class B, llm_inferred,
 # doc-derived from the court poison chunk ("witness Osric's husband Anouk") -- and it
 # arrived in the payload WITHOUT a definition, because the F4 kinship gate DECLINED

@@ -7,7 +7,7 @@
 -- kin titles the seed floor never carried. The possessive kin rail resolves the possessed head
 -- through the per-tenant kinship_noun cue class; a title OUTSIDE the map falls to the generic
 -- ownership leg and files a PERSON as an OWNED OBJECT — measured on the blended-family smoke
--- seat 04de25ee: "My ex-wife Isabelle and I split up in 2022" minted (user, owns, ex-wife),
+-- seat 9e61c3d8: "My ex-wife Isabelle and I split up in 2022" minted (user, owns, ex-wife),
 -- so "what's my ex-wife's name?" could not resolve the referent while the current-wife query
 -- had to stay unpoisoned by it. The ex- prefix is a DISTINCT-REFERENT modifier (the 289 class):
 -- the ex-wife is never the current wife, so the ex titles carry their OWN rel — the wife/spouse
