@@ -224,6 +224,49 @@ def _lemmatize(word: str) -> str:
     return _suffix_lemma(w)
 
 
+# ── NOMINAL (noun-phrase) morphology — INFLECTIONAL ONLY ──────────────────────
+# A stem ending that takes "-es" rather than a bare "-s" plural: the English sibilant
+# classes (box→boxes, church→churches, dish→dishes, buzz→buzzes, glass→glasses). Any other
+# stem takes a bare "-s" (shoe→shoes, colour→colours), so only the sibilant set may strip
+# two characters. Bounded orthography, NOT a word list.
+_SIBILANT_STEM_ENDINGS: tuple = ("s", "x", "z", "ch", "sh")
+
+
+def _nominal_lemma(word: str) -> str:
+    """Lemmatize a token occupying a NOUN slot: strip the PLURAL inflection ONLY.
+
+    THE DISTINCTION, by its established name: **inflectional vs derivational morphology**
+    (Bauer 1983, *English Word-Formation*, CUP; Haspelmath & Sims 2010, *Understanding
+    Morphology*, 2nd ed., Hodder, ch. 5). Lemmatization is defined as the removal of
+    INFLECTION — the plural "-s" on a noun — and must NEVER undo DERIVATION, which creates a
+    distinct lexeme. English "-ing" on a nominal is derivational: it forms a deverbal noun
+    ("a firing", "a meeting", "a building"), the classic *derived nominal* of Chomsky (1970),
+    "Remarks on Nominalization", in Jacobs & Rosenbaum (eds.) *Readings in English
+    Transformational Grammar*, 184-221. Stripping it does not yield a lemma — it destroys the
+    lexeme ("kiln firing" → "kiln fir"; "favorite running shoes" → "favorite run sho").
+    Penn Treebank tags the head of such a compound NN, not VBG (Marcus et al. 1993,
+    *Computational Linguistics* 19(2)), which is exactly the signal the caller has already
+    established before routing here: the possessed head is a NOUN.
+
+    So this is the NOUN counterpart of ``_lemmatize``: no irregular-VERB table (applying it to
+    a noun mis-lemmatizes real nouns — "my saw" → "see"), no "-ed"/"-ing" strip, no silent-e
+    restoration (a verb-stem repair that has no nominal analogue). Plural only.
+
+    Deterministic, offline, no word list, no ML. Conservative: short tokens and unrecognized
+    endings pass through verbatim (an honest surface always beats an invented stem)."""
+    w = (word or "").lower()
+    if len(w) > 3 and w.endswith("ies"):
+        return w[:-3] + "y"                      # stories → story
+    if len(w) > 3 and w.endswith("es"):
+        stem = w[:-2]
+        if stem.endswith(_SIBILANT_STEM_ENDINGS):
+            return stem                          # boxes → box, glasses → glass
+        return w[:-1]                            # shoes → shoe (bare -s on an "-e" base)
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss") and not w.endswith("us"):
+        return w[:-1]                            # colours → colour, hours → hour
+    return w                                     # firing → firing, kiln → kiln
+
+
 def _guard_mint(token: str) -> str:
     """Refuse to mint a rel from a clitic-residue token (the "ve"/"ll"/"re" tail left by a
     stripped contraction apostrophe).
@@ -258,6 +301,205 @@ def normalize_rel(surface: str) -> str:
 
     Returns the snake_cased token (possibly empty string for empty/garbage input).
     """
+    return _normalize_surface(surface, _lemmatize)
+
+
+def normalize_nominal_rel(surface: str) -> str:
+    """RUNG 1-N — the NOMINAL twin of :func:`normalize_rel`, for a possessed NOUN PHRASE.
+
+    Identical pipeline (same tokenization, determiner/auxiliary stripping, preposition keeping
+    and snake_casing) with ONE substitution: tokens are lemmatized by :func:`_nominal_lemma`
+    (INFLECTIONAL plural strip only) instead of :func:`_lemmatize` (verb morphology).
+
+    WHY A SEPARATE ENTRY POINT rather than a smarter shared lemmatizer: the correct morphology
+    depends on the token's SYNTACTIC CATEGORY, which the caller already knows and this pure
+    module cannot see. ``normalize_rel`` is applied to a PREDICATE span, where "-ing"/"-ed" are
+    inflection to strip; ``normalize_nominal_rel`` is applied to a possessed-noun phrase whose
+    head the caller's dependency parse has already tagged NOUN, where "-ing" is derivational and
+    stripping it destroys the lexeme (see ``_nominal_lemma``). Same string in, different correct
+    answer, decided by the grammar at the call site — so the choice belongs to the caller.
+
+        normalize_rel("kiln firing")          -> "kiln_fir"      (verb reading)
+        normalize_nominal_rel("kiln firing")  -> "kiln_firing"   (nominal reading)
+        normalize_nominal_rel("favorite running shoes") -> "favorite_running_shoe"
+
+    Pure/deterministic — NO DB, NO LLM, NO embeddings, no word list."""
+    return _normalize_surface(surface, _nominal_lemma)
+
+
+# ----------------------------------------------------------------------------
+# SPELLING-VARIANT FOLD (identity-honesty, bug 3) - single-edit morphological closeness.
+#
+# THE DEFECT (measured on the owner's demo): 'My favourite colour is Blue' grew the rel
+# favourite_colour; 'what is my favorite colour' minted/grounded a JUNK twin because the
+# surface spellings differ and nothing folds them (normalize_rel is spelling-preserving).
+#
+# WHY NOT A DIALECT RULE TABLE: the tempting closed rule set (-our<->-or, -ise<->-ize,
+# -yse<->-yze) was BUILT and REFUTED in-session: the substring correspondence -our- -> -or-
+# ('favourite'->'favorite') also folds DIFFERENT LEXEMES ('works_for'<->'works_four';
+# 'for'/'four' pass each other's forward check), so any rule strong enough to catch
+# Oxford variants is strong enough to corrupt real rels. A restricted table that is safe
+# would have to enumerate exactly the variant words - the forbidden en-GB/en-US
+# dictionary. So the mechanism shipped here is NOT about dialects at all:
+#
+#   a NOVEL surface folds onto a LIVE rel when the two are SINGLE-EDIT MORPHOLOGICAL
+#   SIBLINGS - same token count, and exactly one token differs by a single-character
+#   edit (insert/delete/substitute). favourite/favorite, organise/organize,
+#   analyse/analyze, recieve/receive, colour/color are ALL single-edit pairs; distinct
+#   lexemes (works_for / has_pet / age) are not. Subject-agnostic, dictionary-free,
+#   deterministic; the fold TARGETS are the tenant's OWN live rels (DB metadata), and a
+#   grown rel_type_aliases row (source='engine') records each fold so every later
+#   occurrence resolves through the deterministic alias rail.
+#
+# Anti-pollution invariants, same family as resolve_seeded_by_morphology:
+#   * NEVER folds onto itself; only fires when the surface does NOT resolve (caller
+#     checks) and the target EXISTS in rel_types;
+#   * AMBIGUOUS (two live rels are both single-edit siblings - e.g. both dialect twins
+#     were already grown) -> None (a wrong fold is worse than a miss; the caller
+#     mints/defers exactly as today);
+#   * never cosine, never embeddings, no word lists.
+
+
+def _single_edit_distance(a: str, b: str) -> bool:
+    """True when two tokens differ by EXACTLY ONE character edit, Damerau-style:
+    insert, delete, substitute, OR adjacent transposition (recieve/receive - the most
+    common English typo class). Early-exit at distance 2. Pure string mechanism."""
+    if a == b:
+        return False
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:
+        diff_positions = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        if len(diff_positions) == 1:
+            return True                       # one substitution
+        if (len(diff_positions) == 2
+                and diff_positions[1] == diff_positions[0] + 1
+                and a[diff_positions[0]] == b[diff_positions[1]]
+                and a[diff_positions[1]] == b[diff_positions[0]]):
+            return True                       # one adjacent transposition
+        return False
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    # a is shorter by 1: exactly one insertion in b
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            if skipped:
+                return False
+            skipped = True
+            j += 1
+    return True
+
+
+def spelling_variant_key(rel: str) -> str:
+    """Identity under this mechanism: the rel itself. (Kept as a named seam so callers
+    and tests can ask for the fold surface without knowing the mechanism - single-edit
+    closeness has no canonical image, so the key IS the surface.)"""
+    return (rel or "").strip().lower()
+
+
+def _spelling_fold_keeps_prepositions() -> bool:
+    """Flag: refuse a single-edit fold whose ONE differing token is a load-bearing
+    preposition. Default TRUE = the SAFE direction (refuse). Set
+    ``SPELLING_FOLD_KEEP_PREPOSITIONS=false`` to restore the byte-for-byte legacy fold."""
+    return os.environ.get(
+        "SPELLING_FOLD_KEEP_PREPOSITIONS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def spelling_variant_siblings(surface: str, rel: str) -> bool:
+    """Are SURFACE and REL single-edit morphological siblings? Same token count,
+    exactly one token differs, and that difference is a single character edit.
+
+    ⛔ EXCEPT when that one differing token is a LOAD-BEARING PREPOSITION on EITHER side.
+    This module already declares ``_KEEP_PREPOSITIONS`` semantically load-bearing — its
+    comment is literally "lives_in ≠ lives_at" — and RUNG 1 protects those tokens from
+    being dropped during normalization. This predicate then ignored that declaration and
+    let a ONE-CHARACTER edit collapse the very tokens RUNG 1 preserved: ``in``↔``on``,
+    ``at``↔``as``, ``of``↔``on``/``or`` are all single substitutions.
+
+    WHY A PREPOSITION IS NOT A SPELLING VARIANT. Prepositions are a CLOSED CLASS, so a
+    single-edit neighbour of a preposition is virtually always ANOTHER REAL PREPOSITION —
+    a "real-word error" in the sense of Golding & Roth, *Applying Winnow to
+    Context-Sensitive Spelling Correction* (arXiv:cmp-lg/9607024, 1996), whose stated task
+    is "fixing spelling errors that happen to result in valid words". Their point is that
+    such confusions are UNDECIDABLE from the string and need context; edit distance alone
+    (Damerau, CACM 7(3):171-176, 1964) cannot separate a typo from a different word. In an
+    open-class content token (``colour``/``color``, ``recieve``/``receive``) a one-edit
+    neighbour is overwhelmingly a misspelling; in a closed-class function token it is a
+    DIFFERENT RELATION. ``sit_in`` ≠ ``sit_on``; ``believe_on`` ≠ ``believe_in``;
+    ``approve_on`` ≠ ``approve_of``.
+
+    MEASURED (2026-08-27, read-only across all 22 production tenants, 1,058 distinct
+    rel_types): 187 distinct preposition-collapsing folds were reachable in 22/22 tenants
+    — e.g. ``believe_on``→``believe_in``, ``approve_on``→``approve_of``,
+    ``build_in``→``build_on``, ``cave_on``→``cave_in``. The ingest seam
+    (``main.py`` ``ingest.rel_spelling_variant_folded``) REWRITES ``edge.rel_type`` and
+    grows a PERMANENT alias row on such a fold, so each one is a user-truth corruption
+    that persists for that tenant. The 9 live-vs-live preposition pairs already present on
+    production (``sit_in``/``sit_on``, ``born_in``/``born_on``, ``stay_in``/``stay_on``, …)
+    were ALREADY protected by ``resolve_grown_spelling_variant``'s ambiguity/already-live
+    guards; this closes the case those guards cannot see — a genuinely NOVEL surface one
+    preposition-edit from a live rel.
+
+    Both directions are refused ("on EITHER side") because the asymmetric case is no safer:
+    folding a non-preposition token onto a preposition invents a particle the user never
+    said. Fail-safe direction is REFUSE = leave the rel novel, which is this module's
+    stated bias ("a wrong fold is worse than a miss").
+    """
+    s_toks = [t for t in (surface or "").lower().split("_") if t]
+    r_toks = [t for t in (rel or "").lower().split("_") if t]
+    if not s_toks or len(s_toks) != len(r_toks):
+        return False
+    if sum(1 for s, r in zip(s_toks, r_toks) if s != r) != 1:
+        return False
+    _keep_preps = _spelling_fold_keeps_prepositions()
+    for s, r in zip(s_toks, r_toks):
+        if s != r:
+            if _keep_preps and (s in _KEEP_PREPOSITIONS or r in _KEEP_PREPOSITIONS):
+                return False
+            return _single_edit_distance(s, r)
+    return False
+
+
+def resolve_grown_spelling_variant(
+    surface: str, dsn: Optional[str] = None, schema: Optional[str] = None
+) -> Optional[str]:
+    """Fold a surface rel onto a LIVE rel that is its single-edit spelling sibling.
+
+    The metadata-driven rail this lane owns: read the tenant's OWN live rel_types (seed
+    plus grown - every rel the ingest seam can mint or match) and fold the surface onto
+    the unique live rel that is a single-edit sibling (favourite_colour -> the live
+    favorite_colour, or vice versa). Deterministic + DB-backed, NEVER cosine. Ambiguous
+    (both siblings already live) -> None. Fail-soft -> None. NEVER returns the surface."""
+    norm = normalize_rel(surface)
+    if not norm:
+        return None
+    try:
+        rels = _load_reltypes(dsn, schema)
+    except Exception:
+        return None
+    if norm in rels:
+        # the surface is ITSELF a live rel - folding would shadow a real concept.
+        # (the caller only folds on a MISS, but the resolver must hold the invariant
+        # on its own: an exact hit is not a variant)
+        return None
+    hits = {r for r in rels if r != norm and spelling_variant_siblings(norm, r)}
+    if len(hits) == 1:
+        return next(iter(hits))
+    return None
+
+def _normalize_surface(surface: str, lemma_fn) -> str:
+    """Shared RUNG-1 pipeline for :func:`normalize_rel` / :func:`normalize_nominal_rel`.
+
+    ``lemma_fn`` is the per-token lemmatizer the caller's syntactic reading selects. Keeping ONE
+    pipeline is load-bearing: the preference-copula deriver chain and the possessive-predication
+    harvest seam must produce the BYTE-IDENTICAL token for the same phrase or they stop deduping
+    and mint two rival concepts for one attribute."""
     if not surface:
         return ""
 
@@ -289,7 +531,7 @@ def normalize_rel(surface: str) -> str:
         i += 1
     # Edge: if ALL tokens are leading-drop words, keep the last as the token.
     if all(t in _LEADING_DROP for t in tokens):
-        return _suffix_lemma(tokens[-1])
+        return lemma_fn(tokens[-1])
     tokens = tokens[i:]
 
     # 2. Strip leading auxiliaries — but STOP at a light verb: a leading have/has/had/get/...
@@ -302,8 +544,8 @@ def normalize_rel(surface: str) -> str:
     if not tokens:
         return ""
 
-    # 3. Lemmatize the head verb.
-    head = _lemmatize(tokens[0])
+    # 3. Lemmatize the head (verb reading: verb morphology; nominal reading: plural strip only).
+    head = lemma_fn(tokens[0])
     rest = tokens[1:]
 
     # 4. Light-verb object fold: "have an issue with" → head=have(light), find first content noun.
@@ -315,7 +557,7 @@ def normalize_rel(surface: str) -> str:
                 continue
             if tok in _KEEP_PREPOSITIONS:
                 continue
-            noun = _lemmatize(tok)
+            noun = lemma_fn(tok)
             break
         if noun:
             return _guard_mint(f"{light_surface}_{noun}")
@@ -333,7 +575,7 @@ def normalize_rel(surface: str) -> str:
         if tok in _KEEP_PREPOSITIONS:
             out_tokens.append(tok)  # keep prepositions verbatim (load-bearing)
             continue
-        out_tokens.append(_lemmatize(tok))
+        out_tokens.append(lemma_fn(tok))
 
     token = "_".join(t for t in out_tokens if t)
     # Final snake_case hygiene.
@@ -403,7 +645,7 @@ def _connect(dsn: Optional[str], schema: Optional[str]):
     if schema:
         with conn.cursor() as cur:
             # Tenant schema ONLY — no public fallthrough (per-tenant isolation).
-            cur.execute(f'SET search_path TO "{schema}"')
+            cur.execute(f'SET search_path TO "{schema}"')  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query, python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.lang.security.audit.sqli.psycopg-sqli.psycopg-sqli — schema from UUID-derived source with validation
     return conn
 
 

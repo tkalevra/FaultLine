@@ -8,15 +8,21 @@ import atexit
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+from src.api import errors as _errors  # THE ONE ERROR SEAM — persisted error columns are rendered bodies
 
 import httpx
 import psycopg2
 import redis
+from src.api.db_read import release_read_transaction  # READ-BARRIER — see the "idle in transaction" incident block below
 from src.api.llm_client import get_llm_headers, get_embedding_headers, GATE_MIN, GATE_MAX, GATE_DEFAULT, clamp_gate
 from src.api.llm_calls import (
     call_llm_with_retry_sync,
@@ -24,15 +30,39 @@ from src.api.llm_calls import (
     generate_rel_type_phrasing,
     LLMTimeouts,
     LLMModels,
+    response_message_text,
 )
+from src.api import llm_lane as _llm_lane
+from src.api import ingest_transport as _ingest_transport  # replay marker contract — the reextract lane is a replaying writer (reextract-replay-resurrection)
+
+# Sent on every LLM-bearing call this process makes to the BACKEND API. The lane is a
+# property of the CALLER (dprompt charter: never an operation-name list): this process is
+# deferrable upkeep, so the extraction it asks the backend to perform must run in the
+# backend's BACKGROUND lane — defer when there is no capacity, never fail open. The header
+# is what carries that declaration across the HTTP boundary (see the API's
+# _llm_lane_from_header middleware); without it the call executes INTERACTIVE in the API
+# process and fires UNCAPPED after LLM_RATE_MAX_WAIT_S (the wedged_failopen storm shape).
+_BACKEND_LANE_HEADERS = {_llm_lane.LANE_HEADER: _llm_lane.LANE_BACKGROUND}
+from src.api.llm_lane import LLMUnavailable
 from src.entity_registry.registry import preference_rank, EntityRegistry
-from src.api.db_read import release_read_transaction  # READ-BARRIER — no read transaction
-# may ride across a blocking seam (claim SELECTs vs tenant work)
-from src.api import llm_lane as _llm_lane  # background-lane declaration headers for backend HTTP
-from src.api import ingest_transport as _ingest_transport  # replay/lane markers on re-send POSTs
+from src.entity_registry import weld_guard
+
+
+class _MergeRefused(Exception):
+    """The arrival weld guard declined one of the surfaces an entity merge would move.
+
+    Raised inside the merge's own transaction so the EXISTING rollback path undoes every step
+    already applied — a merge is one identity claim and must apply whole or not at all. Caught
+    explicitly (never as a generic merge failure) so a deliberate refusal is not reported as an
+    error; see the merge block in ``resolve_name_conflicts``.
+    """
+from src.api import node_role as _node_role  # FIRST-CLASS value/place property (THE HARD LINE, migration 192); flag VALUE_PLACE_FIRST_CLASS
+from src.api import hardline_guard as _ladder_hardline  # THE HARD-LINE ingest guard for subclass_of rungs (ladder-on-value); FAIL-CLOSED, flag HARDLINE_LADDER_GUARD default OFF
+from src.ingest import document_structure as _docstruct  # shared transcript line shapes
+from src.re_embedder import sweep_ledger as _sweep  # per-seat work ledger (migration 207)
 from src.re_embedder import growth_work_queue  # durable breadcrumb for brain-starved growth (migration 300, gauntlet R8)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=getattr(logging, os.getenv("FAULTLINE_LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger(__name__)
 
 
@@ -58,66 +88,454 @@ def _rollback_and_reapply_search_path(db_conn, schema_name: str) -> None:
         return
     try:
         with db_conn.cursor() as _spc:
-            _spc.execute(f"SET search_path TO {schema_name}")
+            _spc.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+        # READ BARRIER — COMMIT THE RE-BIND. `SET` is a statement like any other: psycopg2
+        # opened a NEW transaction to run it and holds it open until commit/rollback. Every
+        # caller of this helper is an `except` arm that goes straight back to work — often a
+        # network or LLM call, or the next tenant's whole pass — so an uncommitted re-bind put
+        # the connection back into `idle in transaction` for the whole of it. Under
+        # `idle_in_transaction_session_timeout` (1min on pre-prod) that is the connection being
+        # KILLED, and every later statement on it fails "connection already closed": the
+        # recovery helper was itself re-arming the failure it exists to recover from.
+        # Committing is also what makes the bind survive a later ROLLBACK — a COMMITTED
+        # `SET search_path` is not undone by rollback, an uncommitted one is.
+        db_conn.commit()
     except Exception as sp_err:
         log.warning(f"re_embedder.search_path_reapply_failed schema={schema_name}: {sp_err}")
 
 
-# Embedding model name — PURE CONFIG, read from env (no code literal). Default lives in
-# .env.example. Empty when unset; the LOCAL fastembed CPU path needs no model name, and the
-# external-API fallback fail-safes (hash vector / None) rather than crashing the loop.
-_EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "").strip()
+def tenant_schema_is_live(admin_conn, schema_name: str) -> bool:
+    """Deterministic GHOST-TENANT health probe for the poll loop's per-tenant fan-out.
+
+    Returns True iff ``schema_name`` is a REAL, provisioned tenant schema — it EXISTS and
+    carries the core per-tenant table ``staged_facts``. Returns False for a GHOST: a schema
+    that was DROPPED (or never finished provisioning → 0 tables) yet is still flagged
+    ``status='ready'`` in ``public.user_provisioning`` (on pre-prod, ~15 leftover
+    benchmark/throwaway seats — see cortex ``bug-reembedder-cascade-and-tenant-hygiene``).
+
+    WHY THIS EXISTS: a ghost schema makes EVERY per-tenant pass in ``main()`` throw
+    ``UndefinedTable`` on its first ``SELECT ... FROM staged_facts`` → the psycopg2 txn ABORTS →
+    on any pass that shares one connection across tenants, every SUBSEQUENT statement then fails
+    with "current transaction is aborted, commands ignored" — the "one bad tenant aborts the
+    loop" cascade that STALLS Class-B promotion + Class-C sync for HEALTHY tenants. Dropping
+    ghosts from ``ready_schemas`` ONCE per cycle (a single structural chokepoint feeding all the
+    per-tenant loops) makes the loop RESILIENT to such rows existing — the durable code fix.
+    (Deleting the orphan ``user_provisioning`` / ``account_users`` rows is a separate DATA/ops
+    cleanup, main-loop-owned; the code must not depend on it.)
+
+    Deterministic — a ``pg_catalog`` lookup via ``to_regclass`` (schema-qualified: NULL when the
+    schema OR the table is absent; NO fuzzy/ILIKE, NO cosine). Runs on the ADMIN connection with
+    a fully-qualified name (search_path-independent), so it never touches/dirties a per-tenant
+    connection.
+
+    FAIL-SAFE toward INCLUSION (WE DON'T FORGET): any probe error → True (treat as live and let
+    the per-tenant isolation below handle it) so a transient catalog hiccup can NEVER mass-skip
+    healthy tenants and stall promotion. Never raises.
+    """
+    if not schema_name:
+        return False
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (f"{schema_name}.staged_facts",))
+            row = cur.fetchone()
+        return bool(row and row[0] is not None)
+    except Exception as probe_err:
+        # Fail-SAFE toward inclusion: never let a probe error mass-skip live tenants. Clean the
+        # admin txn (a raised probe may have aborted it) so the next tenant's probe runs clean.
+        try:
+            admin_conn.rollback()
+        except Exception:
+            pass
+        log.warning(
+            f"re_embedder.tenant_health_probe_failed schema={schema_name} "
+            f"(fail-safe: treating tenant as live): {probe_err}"
+        )
+        return True
 
 
+def _saas_suspended_user_ids(postgres_dsn: str, candidate_user_ids) -> set:
+    """SAAS_MODE-only: return the subset of ``candidate_user_ids`` that must be SKIPPED by the
+    ready-tenant loop — because **either the ACCOUNT or the SEAT itself is not active**.
+
+    ⚠️ THE SEAT HALF WAS MISSING UNTIL 2026-08-12, AND IT WAS THE EXPENSIVE HALF. The predicate
+    was ``a.status <> 'active'`` alone — the ACCOUNT's status — so a **revoked seat on an active
+    account was swept on every cycle, forever**. Measured on production the day it was found:
+    **13 revoked seats vs 8 active**, i.e. 62% of the swept population was dead weight, and the
+    single largest graph on the box (3 836 entities / 2 857 facts) belonged to a REVOKED seat.
+    A revoked seat cannot be used by anyone, so every cycle spent on it is pure waste — and it is
+    not free: it is re-extraction, embedding and reconciliation over the whole graph.
+
+    Data is NOT deleted here. Revocation stops the *processing*, it does not drop the schema —
+    deprovisioning a revoked seat's data is a separate, destructive, owner-gated decision.
+
+    Backward-compat + fail-SAFE (never silently drops all tenants):
+    - SAAS_MODE off                         → empty set (process every tenant, unchanged).
+    - control-plane tables absent           → empty set (public core / pre-131 DB).
+    - a tenant NOT registered as a seat      → NOT in the set (unaffected — legacy tenants
+                                               and non-SaaS deployments keep working).
+    - ANY error                              → empty set (process everything, never a mass skip).
+
+    A user is skipped ONLY when we positively confirm its account OR its seat is non-active.
+    """
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return set()
+    except Exception:
+        return set()
+
+    candidates = [str(u) for u in (candidate_user_ids or []) if u]
+    if not candidates:
+        return set()
+
+    try:
+        with psycopg2.connect(postgres_dsn) as _cp:
+            with _cp.cursor() as cur:
+                # Guard: control-plane tables must exist (pre-131 / public-core DBs skip clean).
+                cur.execute("SELECT to_regclass('public.account_users'), "
+                            "to_regclass('public.accounts')")
+                reg = cur.fetchone()
+                if not reg or reg[0] is None or reg[1] is None:
+                    return set()
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                    """
+                    SELECT au.user_id::text
+                    FROM public.account_users au
+                    JOIN public.accounts a ON a.account_id = au.account_id
+                    WHERE au.user_id::text = ANY(%s)
+                      AND (a.status <> 'active' OR au.status <> 'active')
+                    """,
+                    (candidates,),
+                )
+                return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        log.warning(f"re_embedder.saas_status_skip_check_failed (processing all tenants): {e}")
+        return set()
 
 
-# ── GROWTH / RECALL-UPLIFT SUPPORT (public-core port of the R6-R9 lane) ────────────────
+# ── Re-embedder composed on/off rule (SaaS control plane, migrations 223 + 224) ─────────
+# The control-plane resolvers are composed AND: a tenant is processed iff BOTH are TRUE.
+#   GLOBAL  : saas.platform_settings.re_embedder_enabled()  (migration 223, 5s-TTL cached)
+#   TENANT  : saas.accounts.re_embedder_enabled(account_id) (migration 224, 5s-TTL cached)
+# GLOBAL False → the whole loop IDLES this cycle (no per-tenant work); TENANT False → only
+# that tenant is skipped (continue to the next). The resolvers are fail-CLOSED (False when the
+# control plane is unreadable AND nothing is cached) — GPU-protective, cost-free, mirroring the
+# offline/api_addon kill-switch posture. These two helpers are the SINGLE read site for the rule
+# in the back-end. SAAS off / saas/ absent → True (process normally), so the public core is
+# byte-for-byte unchanged (FOSS never imports saas). A tenant NOT registered as an active seat
+# (legacy / pre-SaaS) → True (never mass-skipped; mirrors _saas_suspended_user_ids). Never raises.
+def _saas_re_embedder_global_enabled() -> bool:
+    """True iff the GLOBAL re-embedder switch is ON (process this cycle).
+
+    SAAS off / saas/ absent → True (public core unchanged). SaaS on → the resolver verdict,
+    which is fail-closed (False on an unreadable control plane). Never raises.
+    """
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return True
+        from saas import platform_settings as _ps
+        return _ps.re_embedder_enabled()
+    except Exception:
+        return True
+
+
+def _saas_re_embedder_tenant_enabled(user_id) -> bool:
+    """True iff THIS tenant's re-embedder switch is ON (process it).
+
+    SAAS off / saas/ absent → True (public core unchanged). A tenant that is NOT a registered
+    active seat (legacy / pre-SaaS) → True (unaffected). SaaS on + active seat → the resolver
+    verdict, which is fail-closed (False on an unreadable control plane). Never raises.
+    """
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return True
+        from saas.llm_context import _account_for_user
+        account_id = _account_for_user(str(user_id))
+        if not account_id:
+            return True  # legacy / non-seat tenant — never mass-skipped
+        from saas import accounts as _accts
+        return _accts.re_embedder_enabled(account_id)
+    except Exception:
+        return True
+
+
+# ── SaaS Gap-B (background loop): per-tenant BYO engine-brain bind for the IN-PROCESS LLM ops
+# ────────────────────────────────────────────────────────────────────────────────────────────
+# The re_embedder runs many per-tenant `for … in ready_schemas` loops. EACH sets the DB
+# search_path to the tenant schema, but the *LLM* routing hangs on a SEPARATE ContextVar
+# (`saas.llm_context._current_llm_config`) that the DB search_path does NOT touch — and this
+# process never sets the request-path `rel_type_overlay` schema ContextVar, so the schema-derived
+# fallback in `current_llm_config()` cannot fire here either. Without an EXPLICIT bind in each
+# LLM-calling loop, every background LLM call (ontology eval, the ±6 what-is/climb ENRICHMENT
+# grounder, taxonomy discovery, name-conflict arbitration, NL phrasing fill) falls through to the
+# process-global env brain — a dead/wrong endpoint on the CPU-only SaaS host (the "ENRICHMENT →
+# global default" prod hang) and, in a live multi-tenant deployment, a cross-tenant routing risk.
+# These two helpers are the SINGLE SOURCE OF TRUTH for that bind/clear; reused by every LLM loop
+# below AND the primary sync loop so the invariant "an LLM call under tenant T's search_path uses
+# T's brain" is structural, not remembered. ABSOLUTE bind (overwrites every call → a no-config
+# tenant can never inherit the previous tenant's brain across the single-threaded loop) +
+# fail-closed (no brain → sentinel → the LLM stack returns its safe empty default, ZERO network
+# spend). SAAS off / no saas dir → no-op. Never raises (a bind failure must never crash the loop).
 #
-# _BACKEND_LANE_HEADERS declares background-lane intent on HTTP calls the re_embedder
-# makes to the API (the API-side middleware may admit/defer by lane; an unmarked call
-# runs interactive). Kept with the ported R7/R9 machinery because the recall-miss
-# uplift's /ingest commit is exactly such a call.
-_BACKEND_LANE_HEADERS = {_llm_lane.LANE_HEADER: _llm_lane.LANE_BACKGROUND}
+# ── THE SECOND HALF OF THE SAME SEAM: WHO the call is made AS ────────────────────────────────
+# The bind above decides WHERE a background LLM call goes. It does NOT decide WHO it is
+# ATTRIBUTED to — that is the `user_id=` argument every centralized LLM call takes, and it was a
+# hardcoded literal (`"re_embedder"`) on all seven background call sites in this file. That
+# literal owns no account (`SELECT count(*) FROM public.accounts WHERE name='re_embedder' OR
+# slug='re_embedder'` → 0 on production), so:
+#   • `saas.brain_health.record`/`probe_event` bucketed the SEAT'S OWN failures under a junk id.
+#     `public.user_provisioning.user_id` is a UUID column, so `_schema_for_user('re_embedder')`
+#     can never resolve — every one of those events was built, buffered and then DROPPED at
+#     flush. The tenant's endpoint-health card therefore never saw the background lane at all,
+#     while the operator log filled with `brain_probe … seat=re_embed` (uid[:8] of the literal).
+#   • `build_llm_payload` stamped the literal as the OpenWebUI `chat_id`.
+# The schema the loop already holds IS the seat — `faultline_<uuid-with-underscores>`, the same
+# derivation `resolve_name_conflicts` does off `current_schema()` — so the identity costs nothing
+# to carry. It is set by the SAME helper that binds the brain and cleared by the same clear, so
+# the endpoint and the identity can never drift apart.
+#
+# A MODULE GLOBAL, deliberately, NOT a ContextVar: these growth loops are single-threaded (the
+# same assumption `bind_schema_brain_absolute` states for the brain ContextVar), and the one
+# thread-pool fan-out in this file (document chunks) calls the BACKEND over HTTP rather than the
+# in-process LLM stack. A worker thread would read a ContextVar's DEFAULT — the wrong answer —
+# where it reads the correct current tenant from a global.
+_current_seat_user_id: Optional[str] = None
 
-# Connect-level exception types: the request was NEVER delivered (see
-# _is_backend_unreachable below for why the distinction carries this lane's
-# failure accounting).
-_UNREACHABLE_EXC_TYPES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-_HTTPX_ERROR_TYPE = httpx.HTTPError
+# Attribution fallback when the bound schema names no seat (a non-`faultline_<uuid>` schema, or
+# nothing bound yet). Byte-for-byte the pre-fix literal, so the one case that genuinely has no
+# seat to name is unchanged — and it is still rejected by the health sinks, which is correct.
+_NO_SEAT_USER_ID = "re_embedder"
 
-# Env-tunable HTTP ceiling for the drain's backend /ingest commits.
-_DOC_INGEST_HTTP_TIMEOUT = float(os.getenv("DOC_INGEST_HTTP_TIMEOUT", "180"))
+# Operation label the spend pre-flight below records its refusals under. Duplicated from
+# `saas.brain_health.OP_ENGINE_SWEEP` on purpose: this is the OS-level re_embedder process and
+# the public core has no `saas/` package to import from (same convention as `_CATEGORY_PENDING_RE`
+# and `_SEED_STRUCTURAL_FIELDS` below). The two MUST stay equal.
+_BRAIN_PREFLIGHT_OP = "ENGINE_SWEEP"
 
 
-def _is_backend_unreachable(exc: BaseException) -> bool:
-    """Did this exception mean WE NEVER REACHED THE BACKEND AT ALL?
+def _seat_user_id_for_schema(schema_name: str) -> Optional[str]:
+    """``faultline_<uuid-with-underscores>`` → that seat's user uuid, or None.
 
-    Connect-level (refused / DNS / connect timeout / pool exhaustion) → the request
-    was never delivered. NOTHING was read, so this is not a property of the work
-    item — the correct response is a retry deferral, not a failure mark. Read-level
-    timeouts (request delivered, answer unknown) stay caller-scoped."""
-    if isinstance(exc, _UNREACHABLE_EXC_TYPES):
+    Pure string derivation — no DB read, no `saas` import — plus a UUID SHAPE CHECK, so it
+    answers identically in SaaS and OSS deployments and can never hand a junk identity to the
+    health sinks (which is the whole defect being closed). Anything that is not a tenant schema
+    (the cortex `flagent_*` firewall, `public`, an unset search_path) → None → the caller falls
+    back to `_NO_SEAT_USER_ID`. Never raises.
+    """
+    try:
+        s = (schema_name or "").strip().lower()
+        if not s.startswith("faultline_"):
+            return None
+        uid = s[len("faultline_"):].replace("_", "-")
+        return str(uuid.UUID(uid))
+    except Exception:  # noqa: BLE001 — a malformed schema name is "no seat", never a crash
+        return None
+
+
+def _reembedder_bind_tenant_brain(schema_name: str) -> None:
+    global _current_seat_user_id
+    # Identity FIRST and unconditionally: it is a pure string transform, so it is set even when
+    # the brain bind below no-ops (SAAS off / no saas package). One statement, two facts, one
+    # call site — the endpoint and the identity cannot be bound out of step.
+    _current_seat_user_id = _seat_user_id_for_schema(schema_name)
+    try:
+        from saas.llm_context import bind_schema_brain_absolute
+        bind_schema_brain_absolute(schema_name)
+    except ModuleNotFoundError as _missing:
+        # THE OSS NO-OP STATE, NOT A FAILURE: the public core has no saas package at all —
+        # this helper's documented "SAAS off / no saas dir -> no-op" (silent, byte-for-byte).
+        # Exactly that one miss stays silent; a missing TRANSITIVE dependency (saas present,
+        # 'redis'/'httpx' gone) or a missing saas submodule is a REAL breakage and falls
+        # through to the loud path below. (Adversarial-review defect 1: warning here would
+        # stream un-actionable lines on every OSS rig, per tenant per cycle.)
+        if str(_missing) == "No module named 'saas'":
+            return
+        log.warning(
+            f"re_embedder.tenant_brain_bind_failed schema={schema_name} "
+            f"exc={type(_missing).__name__}: {_missing} "
+            "note=in_process_llm_ops_failclosed (http lanes rebind server-side; "
+            "identity still set; bind NOT verified)")
+        return
+    except Exception as _bind_err:  # noqa: BLE001 — fail-safe (the lane continues), but LOUD
+        # THE SWALLOW THAT TOOK A LIVE REPRO TO CLOSE (2026-10-21, seat c591f22b): a bare
+        # `except: pass` here meant a bind that failed to even RUN (import error, unexpected
+        # raise) was indistinguishable from a healthy bind, and every consumer of this seam —
+        # the document drain, the growth loops — proceeded with NO brain and NO evidence.
+        # Fail-safe is kept (never raise into a background loop); silent-downgrade is not.
+        log.warning(
+            f"re_embedder.tenant_brain_bind_failed schema={schema_name} "
+            f"exc={type(_bind_err).__name__}: {_bind_err} "
+            "note=in_process_llm_ops_failclosed (http lanes rebind server-side; "
+            "identity still set; bind NOT verified)")
+        return
+    # THE OTHER HALF OF THE SAME SILENCE: bind_schema_brain_absolute NEVER raises — it
+    # resolves internally to None/no-brain on ANY lookup failure (schema→seat→account chain,
+    # control-plane read, resolver error), so an exception-free bind can still leave the lane
+    # BRAINLESS. Read the bind's outcome back the way an LLM call would see it and say so:
+    # a brainless lane is never silent again. WARN, not CRIT — "this tenant has no routable
+    # brain" is a per-tenant state the alarm stream already carries for real refusals
+    # (saas.global_brain_refused), and the doc lane's HTTP harvest re-resolves server-side;
+    # the point of this line is that the bind site itself states what it bound.
+    try:
+        from saas.config import saas_mode_enabled
+        if not saas_mode_enabled():
+            return
+        from saas.llm_context import current_llm_config
+        cfg = current_llm_config()
+        if cfg is None:
+            log.warning(
+                f"re_embedder.tenant_brain_bind_unresolved schema={schema_name} "
+                "note=no_routable_brain_bound (no owning ACTIVE account resolved or the "
+                "resolution chain errored) - in-process LLM ops will fail closed; never silent")
+        elif cfg.get("no_brain") or not cfg.get("base_url"):
+            log.warning(
+                f"re_embedder.tenant_brain_bind_no_routable_brain schema={schema_name} "
+                f"account={cfg.get('account_id') or '-'} "
+                f"reason={cfg.get('no_brain_reason') or 'no_base_url'} "
+                "note=in-process_llm_ops_fail_closed (the doc lane's HTTP harvest "
+                "re-resolves server-side; growth loops are deterministic-only until a "
+                "brain is configured)")
+    except Exception:  # noqa: BLE001 — an observer must never break the bind it reports on
+        pass
+
+
+def _reembedder_clear_tenant_brain() -> None:
+    global _current_seat_user_id
+    _current_seat_user_id = None
+    try:
+        from saas.llm_context import clear_schema_brain
+        clear_schema_brain()
+    except Exception:
+        pass
+
+
+def _reembedder_llm_user_id() -> str:
+    """The identity the CURRENT background LLM call is made as — the bound seat, or the
+    no-seat literal. Read at the call site (not captured at import) so it always describes the
+    tenant the loop is actually working."""
+    return _current_seat_user_id or _NO_SEAT_USER_ID
+
+
+# ── VALIDATE-BEFORE-SPEND: never open a tenant's wallet for a call that cannot land ───────────
+# The sweep ledger (`sweep_ledger.py`) answers "did this seat's INPUT change?". It cannot answer
+# "can this seat's brain be CALLED?", and those are different questions with the same cost: a
+# seat whose rel_types stay un-phrased because it has no brain is PERMANENTLY DIRTY, so the
+# ledger correctly says "run" and every LLM-bearing subsystem then walks its input, issues its
+# per-row calls, and fail-closes on each one — N warnings and N wasted tenant queries per seat
+# per cycle, for a verdict that was knowable before the first row was read. That is the measured
+# prod shape (`llm_call.saas_no_brain_failclosed`, tens per burst).
+#
+# THE SAME PREDICATE, MOVED EARLIER — NOT A SECOND ONE. This reads
+# `llm_calls._saas_brain_unavailable()`, which is the exact function the LLM stack itself
+# fail-closes on. It therefore CANNOT diverge from the fail-closed contract and it CANNOT weaken
+# it: it can only stop work that was already guaranteed to return `{}`. SAAS off →
+# `_saas_brain_unavailable()` is always False → the gate is open → byte-for-byte today's OSS
+# behaviour. Any error → open (fail-safe direction is RUN, sweep_ledger invariant 1).
+#
+# IT IS FREE. The brain is already bound by `_reembedder_bind_tenant_brain`, so the check is a
+# ContextVar read and a dict lookup — no DB, no network, no new table.
+#
+# AND IT RECORDS — into the ROLLING WINDOW aggregate (`brain_health.record`), under the REAL
+# seat, so "the background engine declined to run for you N times" reaches the tenant's own
+# console instead of an identity nobody owns. One record per seat per subsystem per cycle
+# replaces one per LLM CALL: strictly less telemetry, correctly addressed.
+#
+# ⚠️ THE WINDOW ONLY — NOT the `probe_event` alarm stream, and NOT via `_health_note` (which tees
+# both). The alarm stream is LAST-WRITE-WINS, which works only because every lane on it emits its
+# SUCCESS side too; a refusal has no success twin to emit ("I did not call" is not an outcome), so
+# putting it there would pin the seat's card to that refusal forever, long after they configured a
+# brain. The window decays on its own and needs no counterpart. The alarm stream already learns
+# "this seat has no brain" from the lanes that observe REAL calls (TURN / EXTRACT / REFRAME).
+#
+# THE LEDGER IS DELIBERATELY NOT RECORDED on a gated skip: `record_run` is never reached, so the
+# subsystem stays DUE and resumes on the very next cycle after a brain is configured. A gate that
+# marked the work done would hide it for up to `REEMBED_SWEEP_MAX_INTERVAL`.
+def _reembedder_llm_lane_open(user_id, subsystem: str, schema_name: str = "") -> bool:
+    """True = this subsystem may spend. False = it has no reachable brain; skip it, unrecorded."""
+    # Read live (like sweep_ledger.marking_enabled) so it can be toggled per deployment/test.
+    if not _flag("REEMBED_LLM_BRAIN_PREFLIGHT", "true"):
         return True
-    if isinstance(exc, (ConnectionRefusedError, ConnectionError)) and not isinstance(
-            exc, _HTTPX_ERROR_TYPE):
+    # Only LLM-bearing subsystems have spend to guard. The registry already states which — reuse
+    # it rather than keep a second list that would drift the day a subsystem gains an LLM call.
+    if not (_sweep.SUBSYSTEMS.get(subsystem) or {}).get("llm"):
         return True
+    try:
+        from src.api.llm_calls import _saas_brain_unavailable
+        if not _saas_brain_unavailable():
+            # (#229) GROWTH DEFERRAL rides THIS existing validate-before-spend seam — not a
+            # second admission system. The brain is already bound (ContextVar, free read), so
+            # asking the auto-posture "is this brain inside a measured tighten window?" is a
+            # dict lookup. A brain whose recent p95 tightened op budgets does not get growth/
+            # enrichment spend this cycle: the sweep skips UNRECORDED (the ledger's own rule
+            # for a gated skip — the subsystem stays DUE and resumes the cycle after the
+            # posture cooldown expires). Fail-open on ANY error → growth proceeds as today.
+            try:
+                from saas import brain_posture
+                _posture_rem = brain_posture.growth_deferred()
+            except Exception:  # noqa: BLE001 — no saas package / any fault: fail-open
+                _posture_rem = None
+            if _posture_rem and _posture_rem > 0:
+                log.info(
+                    "re_embedder.llm_skip_posture "
+                    f"subsystem={subsystem} schema={schema_name} user={str(user_id)[:8]} "
+                    f"reason=brain_posture_cooldown remaining_s={int(_posture_rem)} "
+                    "note=growth deferred while the brain's measured p95 tightens op budgets; "
+                    "ledger NOT recorded so the work stays due"
+                )
+                # R8 GROWTH WORKSTACK: the skip is no longer UNRECORDED. A durable
+                # breadcrumb (per-tenant growth_work_queue, migration 300) names WHAT
+                # was starved, so recovery drains it priority-first instead of hoping
+                # the ledger's max-interval re-finds it. Fail-safe: a queue failure
+                # falls through to today's skip-unrecorded behaviour (the ledger still
+                # keeps the work due).
+                try:
+                    growth_work_queue.record_deferred(
+                        schema_name, subsystem, user_id=str(user_id))
+                except Exception:  # noqa: BLE001 — the breadcrumb must never break the gate
+                    pass
+                return False
+            return True
+    except Exception:  # noqa: BLE001 — fail-safe: an import/resolve fault must never mass-skip
+        return True
+
+    # The seat the CALLER named (it comes straight off `ready_schemas`, the authoritative pair)
+    # with the loop-bound derivation as the fallback — the two agree, and brain_health rejects a
+    # non-uuid at its own door either way, so a junk id can never reach the aggregate.
+    _uid = str(user_id or "") or _reembedder_llm_user_id()
+    try:
+        from saas import brain_health
+        brain_health.record(_uid, brain_health.M_NO_BRAIN, operation=_BRAIN_PREFLIGHT_OP)
+    except Exception:  # noqa: BLE001 — no saas package / any fault: an observer must never
+        pass           # break its host, and the log line below still carries the evidence
+    log.info(
+        "re_embedder.llm_skip_no_brain "
+        f"subsystem={subsystem} schema={schema_name} user={str(_uid)[:8]} "
+        f"reason=tenant_brain_unavailable_failclosed "
+        "note=zero LLM calls this cycle; ledger NOT recorded so the work stays due"
+    )
+    # R8 GROWTH WORKSTACK — same breadcrumb as the posture branch above: record WHAT
+    # was starved so the drain-on-recovery pass (the next cycle the lane opens) can
+    # re-attempt it priority-first. Idempotent across cycles of outage via the
+    # partial unique; fail-safe throughout.
+    try:
+        growth_work_queue.record_deferred(schema_name, subsystem, user_id=_uid)
+    except Exception:  # noqa: BLE001 — the breadcrumb must never break the gate
+        pass
     return False
 
 
-# Bracketed structural header line ("[Date: ...]", "[Session: ...]") — scaffolding,
-# never content.
-_DOC_HEADER_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
-
-
-def _lane_has_no_content(text: str) -> bool:
-    """True iff every non-blank line of `text` is a bracketed structural header.
-
-    Deterministic and content-free by construction: it asks only whether a line is
-    scaffolding, never what the line says."""
-    for line in (text or "").splitlines():
-        if line.strip() and not _DOC_HEADER_RE.match(line):
-            return False
-    return True
+def _reembedder_claim(snap, user_id, subsystem: str, schema_name: str = "") -> bool:
+    """The ONE gate an LLM-bearing subsystem passes: the seat's input CHANGED (sweep ledger) AND
+    its brain can be CALLED (spend pre-flight). Deterministic subsystems see only the ledger, so
+    their behaviour is unchanged. Callers must NOT `record_run` when this returns False."""
+    if not _sweep.claim(snap, user_id, subsystem):
+        _sweep.log_skip(snap, user_id, subsystem, schema_name)
+        return False
+    return _reembedder_llm_lane_open(user_id, subsystem, schema_name)
 
 
 def _growth_drain_lane_open(user_id, schema_name, operation_type) -> bool:
@@ -127,26 +545,16 @@ def _growth_drain_lane_open(user_id, schema_name, operation_type) -> bool:
     UNCONDITIONALLY: their runner spends zero brain — the R9 spine deriver +
     GLiNER2 run IN-PROCESS and the only wire call is the /ingest commit door,
     which is brain-free. A blanket brain-lane check gating them is exactly how
-    8 recall_miss_reexamine markers sat pending for 3+ hours on the private
-    prod (measured 2026-10-25: 135 re_embedder.llm_skip lines / 24h — the
-    document drain kept the lane permanently fail-closed — and ZERO
-    growth_work_drain lines, so the drain never ran once). Brain-bearing
-    operations keep the lane verdict via the lane machinery when one exists.
-
-    FOSS-port note: this engine has no brain-lane/posture machinery (the
-    private lineage delegates to ``_reembedder_llm_lane_open`` — not part of
-    the public core). The delegation seam is kept verbatim: when a lane check
-    is present (test wiring, a future port of the lane) brain-bearing
-    operations consult it with the "ontology_eval" brain-level proxy; without
-    one the lane is trivially OPEN — matching this engine's behaviour, where
-    the drain has always run ungated and BUG-08's starvation could not occur.
-    """
+    8 recall_miss_reexamine markers sat pending for 3+ hours on prod (measured
+    2026-10-25: 135 re_embedder.llm_skip lines / 24h — the document drain kept
+    the lane permanently fail-closed — and ZERO growth_work_drain lines, so the
+    drain never ran once). Brain-bearing operations keep today's verdict via
+    _reembedder_llm_lane_open ("ontology_eval" is the brain-level proxy — any
+    LLM-bearing name reads the same ContextVar + posture), and a closed lane
+    keeps recording its breadcrumb there (rate-limited retry next cycle)."""
     if operation_type in growth_work_queue.DETERMINISTIC_OPERATIONS:
         return True
-    _lane = globals().get("_reembedder_llm_lane_open")
-    if _lane is not None:
-        return bool(_lane(user_id, "ontology_eval", schema_name))
-    return True
+    return _reembedder_llm_lane_open(user_id, "ontology_eval", schema_name)
 
 
 # ── R8 GROWTH WORKSTACK — drain-on-recovery ────────────────────────────────────
@@ -241,7 +649,7 @@ def _gliner2_type_doc(sdoc, gmodel, labels):
 
     Mirrored mechanics (keep in sync with main.py::_build_typed_doc): the
     ROUND-7 machine-value veto (``is_value_shape`` — a value is never an entity
-    span), the coordinated-surface split ("Mia, Theo" → two spans), exact
+    span), the coordinated-surface split ("Marina, Theo" → two spans), exact
     case-insensitive substring locate → ``char_span(contract)`` (never fuzzy),
     longest-first overlap resolution, ``set_ents``. DELIBERATELY ABSENT: the
     GLiNER2 RELATION pass (main.py writes ``doc._.rel``) — that phase needs the
@@ -1054,6 +1462,17 @@ def _growth_work_reattempt(operation_type, target_id, conn, user_id, schema_name
             for rel_type in novel_rels:
                 discovered = _llm_discover_taxonomy_from_facts(
                     conn, "system", [{"rel_type": rel_type}])
+                # HOLLOW-GROUPING GUARD (BUG-05 fix 3) — compact mirror of the in-flow
+                # discovery guard: a grouping with NO defining rels scopes nothing while
+                # reading identical to a healthy row; hollow-by-construction is never
+                # minted (61/574 hollow at filing, dominated by paper front-matter).
+                if discovered and discovered.get("taxonomy_name") \
+                        and not (discovered.get("rel_types_defining_group") or []):
+                    log.warning(f"re_embedder.growth_drain.taxonomy_hollow_declined "
+                                f"rel_type={str(rel_type)[:60]} "
+                                f"note=LLM returned no rel_types_defining_group, refusing "
+                                f"to mint a hollow grouping (BUG-05 fix 3)")
+                    continue
                 if discovered and discovered.get("taxonomy_name"):
                     with conn.cursor() as cur:
                         cur.execute(
@@ -1162,27 +1581,10 @@ def _growth_work_item_done(operation_type, target_id, conn) -> bool:
         return False
 
 
-# === FLAG: DOC_REMINE_ENABLED (gauntlet R2, default OFF) — the DOCUMENT-lane re-mine =====
-#
-# The migration-197 analog for the `documents` table: re-queue terminal documents whose
-# chunks produced ZERO committed edges (or that terminated 'partial') so the normal
-# drain re-reads them against the ontology as it stands NOW. OFF BY DEFAULT: applying
-# migration 298 changes nothing; the owner flips DOC_REMINE_ENABLED=true after deploy.
-DOC_REMINE_ENABLED = os.getenv(
-    "DOC_REMINE_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
-_DOC_REMINE_BATCH = max(1, int(os.getenv("DOC_REMINE_BATCH", "2")))
-_DOC_REMINE_MAX_ATTEMPTS = max(1, int(os.getenv("DOC_REMINE_MAX_ATTEMPTS", "3")))
-_DOC_REMINE_MIN_AGE_HOURS = max(0.0, float(os.getenv("DOC_REMINE_MIN_AGE_HOURS", "24")))
-_DOC_REMINE_INTERVAL_S = max(60, int(os.getenv("DOC_REMINE_INTERVAL_SECONDS", "900")))
-
-# Tenants already found to lack migration 298 — log once, then self-disable the lane
-# (the flag must never be able to STOP the drain that already works).
-_remine_columns_missing_schemas: set = set()
-
-# Module-local pass cadence + rotation cursor. Single-element lists so the call sites can
-# stay stateless (the pacing inside the prepass is the ONE source of truth).
-_DOC_REMINE_LAST_RUN = [0.0]
-_DOC_REMINE_CURSOR = [None]
+# Embedding model name — PURE CONFIG, read from env (no code literal). Default lives in
+# .env.example. Empty when unset; the LOCAL fastembed CPU path needs no model name, and the
+# external-API fallback fail-safes (hash vector / None) rather than crashing the loop.
+_EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "").strip()
 
 
 def _flag(name: str, default: str = "true") -> bool:
@@ -1208,6 +1610,12 @@ _RUNG6_BRIDGING = _flag("RUNG6_BRIDGING", "false")
 # Cosine threshold retained for the (now demoted) suggestion path.
 _ONTOLOGY_COSINE_THRESHOLD = float(os.environ.get("ONTOLOGY_COSINE_THRESHOLD", "0.85"))
 
+# Frequency required to APPROVE a novel rel_type into <tenant>.rel_types. Default 1 = usable on
+# derivation, per the engine-structure ruling (see LINGUISTIC_CUE_GROWTH_THRESHOLD). Set to 3 to
+# restore the legacy freq gate. This is ENGINE STRUCTURE ONLY — it is unrelated to, and must never be
+# confused with, the `staged_facts.confirmed_count >= 3` C→B promotion of INFERRED USER MEMORY.
+REL_TYPE_APPROVAL_THRESHOLD = max(1, int(os.environ.get("REL_TYPE_APPROVAL_THRESHOLD", "1") or 1))
+
 # Layer-placement sentinel: a novel rel that no taxonomy covered is minted with this
 # category so it is a TRACKED candidate (never a silent "general" orphan). MUST match
 # main._CATEGORY_PENDING — the in-flow quarantine writes it, this background drain reads it.
@@ -1228,18 +1636,63 @@ _CATEGORY_PENDING_RE = "pending_placement"
 # their PG row lives) and are simply never SERVED to the query lane.
 _VECTOR_CLASS_C_ONLY = _flag("VECTOR_CLASS_C_ONLY", "true")
 
-# User-memory vector lane retirement (ratified 2026-07-31). When OFF (default), the re-embedder
-# stops embedding Class-C user-memory rows to Qdrant. C stays queryable from staged_facts
-# (Postgres) via fetch_facts_from_anchor. Default OFF = retirement active (the ratified direction).
+# User-memory vector lane retirement (ratified 2026-07-31). When OFF, the re-embedder stops
+# embedding Class-C user-memory rows to Qdrant (the cortex `flagent-*` collections are NEVER in
+# this loop — they are written by cortex._upsert_cortex_point, structurally separate). C stays
+# queryable from staged_facts (Postgres) via fetch_facts_from_anchor. Default OFF — the vector
+# tier is retired for user memory out-of-box; set USER_MEMORY_VECTOR_LANE=true to re-activate the
+# legacy lane (back-compat only).
 _USER_MEMORY_VECTOR_LANE = _flag("USER_MEMORY_VECTOR_LANE", "false")
+
+# ── REMOVAL: the user-memory Qdrant vector lane (REMOVE_QDRANT_MEMORY_LANE, default ON) ──
+# OWNER RULING (2026-11-14): THE VECTOR STORE IS FOR THE CORTEX MEMORY ONLY — full stop.
+# Default ON = the lane is REMOVED: every memory-side Qdrant contact in this module (the
+# per-user staged/facts sync loops, ensure_collection/upsert_to_qdrant/_qdrant_delete_fact_point,
+# reconcile_qdrant's memory-collection scroll, the inverted-sweep point cleanup, the run_cycle
+# default-collection ensure) is dead — the mark-synced bookkeeping loops (pure SQL, no Qdrant)
+# KEEP running so qdrant_synced stops flapping. Flag OFF = THE ROLLBACK ARM: the legacy
+# lane returns governed byte-for-byte by USER_MEMORY_VECTOR_LANE.
+# CORTEX UNTOUCHED: the flagent-* collections are written by cortex._upsert_cortex_point
+# (src/api/cortex.py) and are NEVER in this module's loops; nothing here gates cortex.
+# PREREQ NOTE (documented, NOT built) — IF A MEMORY VECTOR LANE IS EVER RE-ACTIVATED:
+# embed_text's LOCAL fastembed path returns a list of np.float32 elements; every json=
+# request body (upsert_to_qdrant's PUT, the search-side POST) raises "Object of type float32
+# is not JSON serializable" — the lane can neither write (per-row raises, caught) nor read
+# (search returns []). A float() cast at embed_text's return AND at every upsert/search body
+# is the MINIMUM prerequisite; without it nothing can work (audit-measured uplift 0.000).
+_REMOVE_QDRANT_MEMORY_LANE = _flag("REMOVE_QDRANT_MEMORY_LANE", "true")
 
 # Hierarchy rel_types (rung-4 closed set, DESIGN §"The deterministic resolution ladder"). Used by
 # convergence + bridging validation. Mechanism, not ontology CONTENT — these are the structural
 # classification rels, identical to the closed set the canonical ladder enforces.
 _HIERARCHY_RELS = ("instance_of", "is_a", "subclass_of", "part_of", "member_of")
 
+
+# ── REFLEXIVE HIERARCHY TAUTOLOGY — async growth-write guard ──
+# The ASYNC growth writers do not run through `wgm.gate.validate_edge`, so the reflexive-hierarchy
+# rejection that landed at the gate (`WGM_REJECT_REFLEXIVE_HIERARCHY`) does not cover them. `X
+# subclass_of X` is RDFS-ENTAILED by X being a class at all (RDF 1.1 Semantics entailment rule
+# **rdfs10**, https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative): it carries
+# ZERO information, cycles what must be a DAG, and renders as "Parent is a subclass of Parent".
+# SAME FLAG as the gate (decisions live once — one contract, two enforcement points).
+# Purely STRUCTURAL: id identity + the row's own `is_hierarchy_rel` flag (already carried on the
+# staged row from the ingest-time rel_types metadata). No rel-name literal, no vocabulary, no fuzzy
+# match. Fail-safe → False (promote as today) on any error.
+def _reflexive_hierarchy_blocked(subject_id, object_id, is_hierarchy_rel) -> bool:
+    """True iff this edge is a hierarchy SELF-LOOP and the rejection flag is ON."""
+    try:
+        if not _flag("WGM_REJECT_REFLEXIVE_HIERARCHY", "false"):
+            return False
+        if not is_hierarchy_rel:
+            return False
+        s = str(subject_id or "").strip().lower()
+        o = str(object_id or "").strip().lower()
+        return bool(s) and s == o
+    except Exception:  # noqa: BLE001 — fail-safe: never break the growth loop on the guard
+        return False
+
 # THE HARD LINE — the SKOS naming/label rels whose OBJECT is a NAME (a memory: Rex,
-# Apollo, "Alex"), NOT a type. An alias registered as the object of one of these edges is a
+# Apollo, "Sam"), NOT a type. An alias registered as the object of one of these edges is a
 # proper name and is NEVER a valid L4 classification subject — the subclass_of ladder hangs
 # off the TYPE node (dog, computer), never off the name. Same fixed SKOS-identity invariant the
 # rest of the codebase pins (main._ALIAS_BACKED_NAME_RELS = pref_name/also_known_as, the
@@ -1545,11 +1998,12 @@ def add_member_taxonomy_if_not_severed(cur, parent_taxonomy: str, child_taxonomy
     the structural-correction lock can never be bypassed.
     """
     if taxonomy_link_is_severed(cur, parent_taxonomy, child_taxonomy):
-        log.info("re_embedder.nesting_growth_refused_user_severed",
-                 parent=parent_taxonomy, child=child_taxonomy)
+        log.info("re_embedder.nesting_growth_refused_user_severed "
+                 f"parent={parent_taxonomy} child={child_taxonomy}")
         return False
     try:
-        cur.execute(
+        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
             """
             UPDATE entity_taxonomies
                SET member_taxonomies =
@@ -1565,8 +2019,8 @@ def add_member_taxonomy_if_not_severed(cur, parent_taxonomy: str, child_taxonomy
         )
         return cur.rowcount > 0
     except Exception as e:
-        log.warning("re_embedder.add_member_taxonomy_failed",
-                    parent=parent_taxonomy, child=child_taxonomy, error=str(e)[:120])
+        log.warning("re_embedder.add_member_taxonomy_failed "
+                    f"parent={parent_taxonomy} child={child_taxonomy} error={str(e)[:120]}")
         return False
 
 
@@ -1576,7 +2030,8 @@ def fetch_unsynced(db_conn, user_id: str, confidence_threshold: float = 0.0) -> 
     Per-user schema context: user_id is passed as parameter (schema provides isolation).
     """
     with db_conn.cursor() as cur:
-        cur.execute(
+        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
             f"""
             SELECT id, subject_id, object_id, rel_type, provenance,
                    confidence, confirmed_count, last_seen_at, contradicted_by,
@@ -1618,7 +2073,8 @@ def fetch_unsynced_staged(db_conn, user_id: str) -> list[dict]:
     Per-user schema context: user_id is passed as parameter (schema provides isolation).
     """
     with db_conn.cursor() as cur:
-        cur.execute(
+        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
             """
             SELECT id, subject_id, object_id, rel_type, provenance,
                    confidence, confirmed_count, last_seen_at, fact_class, source_ref
@@ -1728,10 +2184,59 @@ def embed_text(text: str, qwen_api_url: str, timeout: float = 30.0, fallback: bo
     if embedding_url:
         embed_url = embedding_url
     else:
-        embed_url = qwen_api_url.replace("/chat/completions", "/embeddings")
+        # THE ONE JOIN, not a string replace. `.replace("/chat/completions", "/embeddings")`
+        # is one of the four hand-rolled builders llm_client's endpoint header names by name:
+        # it silently produces "" for any endpoint that does not literally contain that
+        # substring (anthropic's /v1/messages, openwebui's /api/chat/completions → wrong or
+        # unchanged), and it cannot know the backend. get_embedding_url IS the join's
+        # embeddings sibling and is backend-aware.
+        try:
+            from src.api.llm_client import get_embedding_url
+            embed_url = get_embedding_url(qwen_api_url or "")
+        except Exception:  # noqa: BLE001 — fail-safe: no endpoint is the documented SaaS state
+            embed_url = ""
+
+    # No endpoint to fall back to. In SAAS_MODE this is the NORMAL state: the chat-brain
+    # resolvers fail closed with no tenant bound (see llm_client.saas_global_brain_blocked),
+    # and SaaS embeddings are documented to live on the LOCAL fastembed path above
+    # (TODO(byo-embedding)). Borrowing the operator's global endpoint here would be the
+    # very fallthrough the CPU-cloud constraint forbids — so skip the call entirely rather
+    # than POST to an empty/derived URL and eat an exception per row.
+    if not embed_url:
+        if fallback:
+            return hash_vector(text)
+        return None
+
+    # CONNECT/READ SPLIT (BUG-brain-connect-timeout-burns-full-budget-20261026, critic
+    # round 2026-11-06): the embeddings POST is an LLM POST seam too — a bare-number
+    # timeout (the drain passes 30.0; several callers 10.0) sets httpx's CONNECT phase to
+    # the FULL budget, so a SYN-blackholed embeddings host burned it at dial. Same
+    # normalization as the chat seams: connect = LLM_CONNECT_TIMEOUT_S, read untouched,
+    # a caller-supplied tighter connect never widened. The embed path has no breaker, so
+    # this cap is the ONLY thing bounding the dial.
+    try:
+        from src.api.llm_calls import split_connect_timeout
+        timeout = split_connect_timeout(timeout)
+    except Exception:  # noqa: BLE001 — public core has no saas/ package
+        pass
 
     try:
-        if _http_client_sync:
+        _byo = None
+        try:
+            from src.api.llm_calls import _tenant_byo_cfg
+            if _tenant_byo_cfg() is not None:
+                from saas.llm_config import shared_guarded_client
+                _byo = shared_guarded_client()   # CALL-TIME egress pin (IS1): tenant embedding_url
+        except Exception:  # noqa: BLE001 — public core has no saas/ package
+            _byo = None
+        if _byo is not None:
+            response = _byo.post(
+                embed_url,
+                json={"model": _EMBEDDING_MODEL, "input": text},
+                headers=get_embedding_headers(),
+                timeout=timeout,
+            )
+        elif _http_client_sync:
             response = _http_client_sync.post(
                 embed_url,
                 json={"model": _EMBEDDING_MODEL, "input": text},
@@ -1794,19 +2299,32 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
 
     Returns True if collection exists with correct schema or was created/recreated.
     Returns False on any unrecoverable failure.
+
+    REMOVAL (REMOVE_QDRANT_MEMORY_LANE, default ON): this helper served the user MEMORY
+    collections only (cortex ensures its own via qdrant_partition.ensure_tenant_index).
+    Under the removal it is dead — returns False without any HTTP. Rollback arm: the
+    legacy body below runs verbatim.
     """
+    if _REMOVE_QDRANT_MEMORY_LANE:
+        return False
     _EXPECTED_DIM = 768
     _CORRECT_SCHEMA = {"size": _EXPECTED_DIM, "distance": "Cosine"}
+
+    from src.api.qdrant_partition import qdrant_headers, ensure_tenant_index, shared_mode
 
     def _create_collection() -> bool:
         """PUT the collection with the correct anonymous-vector schema."""
         create_response = httpx.put(
             f"{qdrant_url}/collections/{collection}",
             json={"vectors": _CORRECT_SCHEMA},
+            headers=qdrant_headers(),
             timeout=10.0,
         )
         if create_response.status_code == 200:
             log.info(f"re_embedder.collection_created collection={collection}")
+            # Shared-collection model: co-locate each tenant's points via the is_tenant index.
+            if shared_mode():
+                ensure_tenant_index(collection, qdrant_url)
             return True
         log.error(
             f"re_embedder.collection_create_failed collection={collection} "
@@ -1818,10 +2336,15 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
         # Use pooled client instead of bare httpx.get() (dBug-051: prevent connection churn)
         response = _http_client.get(
             f"{qdrant_url}/collections/{collection}",
+            headers=qdrant_headers(),
             timeout=10.0
         )
 
         if response.status_code == 200:
+            # Shared-collection model: ensure the tenant index exists even when the
+            # collection was created by an earlier run / another writer (idempotent).
+            if shared_mode():
+                ensure_tenant_index(collection, qdrant_url)
             # Validate that the existing collection uses anonymous-vector schema.
             # OpenWebUI may pre-create collections with named-vector schema ("vectors": {})
             # which causes Qdrant to return 400 on bare-list searches.
@@ -1859,6 +2382,7 @@ def ensure_collection(collection: str, qdrant_url: str) -> bool:
 
             delete_response = _http_client.delete(
                 f"{qdrant_url}/collections/{collection}",
+                headers=qdrant_headers(),
                 timeout=10.0,
             )
             if delete_response.status_code not in (200, 404):
@@ -1947,9 +2471,22 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
         # None for conversational facts.
         "source_ref": row.get("source_ref"),
     }
-    # Collision-free point id derived from (source_table, fact_id) — never the bare
-    # table id, which would alias facts#N onto staged#N in the shared collection.
-    point_id = derive_qdrant_point_id(source_table, row["id"])
+    # REMOVAL (REMOVE_QDRANT_MEMORY_LANE, default ON): the memory-side vector upsert is
+    # gone — returns False with zero HTTP (callers treat False as "not synced", which is
+    # the honest state: Postgres stays authoritative). Cortex upserts are structurally
+    # separate (cortex._upsert_cortex_point) and never route through here.
+    # Rollback arm: the legacy body below runs verbatim. NOTE: even the rollback arm
+    # cannot write until the float()-cast prerequisite is applied (see the flag block) —
+    # the local fastembed vectors are np.float32 lists and json= rejects them.
+    if _REMOVE_QDRANT_MEMORY_LANE:
+        return False
+    # Partition choke-point: stamp tenant_id (no-op in collection_per_seat) + derive a
+    # collision-free point id. In collection_per_seat this is byte-for-byte the legacy
+    # UUIDv5(source_table:fact_id); in shared_payload it folds the seat uuid in so two
+    # seats' facts#N never alias onto one shared point.
+    from src.api.qdrant_partition import stamp_tenant, resolve_point_id, qdrant_headers
+    payload = stamp_tenant(payload, row.get("user_id"))
+    point_id = resolve_point_id(row.get("user_id"), source_table, row["id"])
     try:
         # Use persistent pooled client if available, fallback to httpx.put() for backward compatibility
         if _http_client_sync:
@@ -1964,6 +2501,7 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                         }
                     ]
                 },
+                headers=qdrant_headers(),
                 timeout=30.0
             )
         else:
@@ -1978,6 +2516,7 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
                         }
                     ]
                 },
+                headers=qdrant_headers(),
                 timeout=30.0
             )
 
@@ -1992,6 +2531,38 @@ def upsert_to_qdrant(row: dict, vector: list[float], collection: str, qdrant_url
         return False
 
 
+def _qdrant_delete_fact_point(qdrant_url: str, user_id, source_table: str, fact_id,
+                              *, timeout: float = 10.0):
+    """Partition-aware delete of ONE fact/staged point (choke-point routed).
+
+    collection_per_seat → byte-for-byte the legacy bare-id `{"points":[uuid]}` delete on the
+    per-seat collection. shared_payload → the id is tenant-namespaced AND the delete is a
+    filtered `{filter:{must:[tenant, {has_id:[id]}]}}` so it can never touch a colliding id
+    from another tenant; an unbound seat THROWS (require_tenant). Fail-safe: best-effort at
+    the call sites (they wrap in try/except), so this returns the response or raises for the
+    unbound-tenant poison case (a bug, surfaced loud).
+
+    REMOVAL (REMOVE_QDRANT_MEMORY_LANE, default ON): the single funnel for the Class-C
+    lifecycle jobs' memory-point deletes (promote/expire/decay/reap). Removed with the
+    lane — returns None with zero HTTP; the Postgres tombstone/expiry writes at the call
+    sites are UNCHANGED (they are core lifecycle, not lane code). Rollback arm: verbatim.
+    """
+    if _REMOVE_QDRANT_MEMORY_LANE:
+        return None
+    from src.api.qdrant_partition import (
+        resolve_partition, require_tenant, build_delete_body, resolve_point_id, qdrant_headers,
+    )
+    collection, tflt = resolve_partition(user_id, "memory")
+    require_tenant(tflt, op="delete", collection=collection)
+    pid = resolve_point_id(user_id, source_table, fact_id, "memory")
+    return httpx.post(
+        f"{qdrant_url}/collections/{collection}/points/delete",
+        json=build_delete_body(tflt, point_ids=[pid]),
+        headers=qdrant_headers(),
+        timeout=timeout,
+    )
+
+
 def mark_synced(db_conn, fact_id: int) -> None:
     """Mark a fact as synced to Qdrant."""
     with db_conn.cursor() as cur:
@@ -2002,23 +2573,17 @@ def mark_synced(db_conn, fact_id: int) -> None:
     db_conn.commit()
 
 
-def promote_facts(db_conn) -> None:
-    """Promote facts to long-term memory by increasing confidence for eligible facts."""
-    with db_conn.cursor() as cur:
-        # Increase confidence for facts that have been confirmed multiple times or are old
-        cur.execute(
-            """
-            UPDATE facts
-            SET confidence = LEAST(confidence + 0.1, 1.0)
-            WHERE superseded_at IS NULL
-            AND (confirmed_count >= 2 OR last_seen_at < now() - interval '7 days')
-            AND confidence < 1.0
-            """
-        )
-        promoted_count = cur.rowcount
-        if promoted_count > 0:
-            log.info(f"re_embedder.promoted {promoted_count} facts to long-term memory")
-    db_conn.commit()
+# REMOVED 2026-08-12 — `promote_facts(db_conn)`. Zero callers anywhere in the repo (verified
+# across src/, tests/, DEV/, saas/, benchmarks/, tools/), so it never ran. Deleted rather than
+# left lying around because if anything ever HAD wired it up it would have been wrong twice
+# over, and its name sits one keystroke from the two functions that are real:
+#   • It inflated `facts.confidence` by +0.1 for any row with `confirmed_count >= 2` OR simply
+#     older than 7 days — i.e. confidence rising with AGE, on an unbounded blanket UPDATE of
+#     every live row in the bound schema. Confidence is set from PROVENANCE at ingest
+#     (`assign_class_and_confidence`); nothing is entitled to drift it upward later.
+#   • It called that "promotion to long-term memory", which is not what promotion means here.
+#     The real mechanism is the C→B tier transition at `confirmed_count >= 3` — see
+#     `promote_staged_facts` and `promote_class_c_hits` in this module. A and B never promote.
 
 
 def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
@@ -2034,7 +2599,8 @@ def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
     try:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SET search_path TO {schema_name}")
+                cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
 
                 # Find hierarchy node IDs (things that appear as objects of subclass_of/instance_of)
                 cur.execute("""
@@ -2096,18 +2662,30 @@ def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
                                     AND f2.rel_type = 'instance_of' AND f2.superseded_at IS NOT NULL)
                         """, (type_name, node_id))
                     except Exception as _qe:
-                        log.error("reconcile_hierarchy.candidate_query_failed",
-                                  schema=schema_name, type_name=type_name, error=str(_qe))
+                        log.error("reconcile_hierarchy.candidate_query_failed "
+                                  f"schema={schema_name} type_name={type_name} error={str(_qe)}")
                         continue
 
                     for (entity_id,) in cur.fetchall():
+                        # FIRST-CLASS value/place stamp (migration 192, flag VALUE_PLACE_FIRST_CLASS
+                        # default OFF). THE primary ASYNC gap this closes: reconcile_hierarchy
+                        # auto-places any entity whose entity_type matches a hierarchy alias with NO
+                        # value/name guard. A user VALUE node (stamped favorite_colour/scalar object)
+                        # must NEVER be auto-typed `instance_of` — the async tier has no in-flight
+                        # edge, so the persisted stamp is the only guard. OFF → False (byte-identical).
+                        if _node_role.is_protected_value(conn, entity_id):
+                            continue
                         try:
                             cur.execute("""
+                                -- STATE THE AUTHORSHIP, DO NOT INHERIT IT: reconciliation is the
+                                -- engine typing a node, never the person saying so. Recall's
+                                -- type-assertion gate reads fact_provenance, so this row must
+                                -- carry it explicitly rather than inherit the column default.
                                 INSERT INTO staged_facts
-                                    (subject_id, object_id, rel_type, fact_class, provenance, confidence,
-                                     first_seen_at, expires_at)
-                                VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_reconciliation', 0.6,
-                                        now(), now() + interval '30 days')
+                                    (subject_id, object_id, rel_type, fact_class, provenance,
+                                     fact_provenance, confidence, first_seen_at, expires_at)
+                                VALUES (%s, %s, 'instance_of', 'B', 'hierarchy_reconciliation',
+                                        'llm_inferred', 0.6, now(), now() + interval '30 days')
                                 ON CONFLICT (subject_id, object_id, rel_type)
                                 DO UPDATE SET last_seen_at = now(),
                                     confirmed_count = staged_facts.confirmed_count + 1,
@@ -2116,9 +2694,9 @@ def _reconcile_hierarchy_links(dsn: str, schema_name: str) -> int:
                             """, (entity_id, node_id))
                             created += 1
                         except Exception as _ie:
-                            log.error("reconcile_hierarchy.insert_failed",
-                                      schema=schema_name, entity_id=entity_id, node_id=node_id,
-                                      error=str(_ie))
+                            log.error("reconcile_hierarchy.insert_failed "
+                                      f"schema={schema_name} entity_id={entity_id} "
+                                      f"node_id={node_id} error={str(_ie)}")
                             continue
 
                 if created:
@@ -2135,7 +2713,8 @@ def _upgrade_staged_facts_with_known_rels(dsn: str, schema_name: str) -> int:
     try:
         with psycopg2.connect(dsn) as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SET search_path TO {schema_name}")
+                cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                 # PER-TENANT: join against the tenant's OWN rel_types (seeded + grown).
                 # public is template-only — a rel approved into THIS tenant must trigger the
                 # C→B upgrade, which a public-only join would miss. UNQUALIFIED resolves to
@@ -2213,7 +2792,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         db_conn: PostgreSQL connection (per-user schema context via search_path)
         qdrant_url: Qdrant service URL for staged collection cleanup
         user_id: User UUID for collection naming (optional, derived from schema context)
-        schema_name: User schema name (e.g., "faultline_alice"). If provided, sets search_path.
+        schema_name: User schema name (e.g., "faultline_christopher"). If provided, sets search_path.
         promotion_threshold: Confirmed count threshold for promotion (default 3, configurable)
 
     Returns:
@@ -2231,7 +2810,8 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         if schema_name:
             try:
                 with db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}")
+                    cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
             except Exception as e:
                 log.warning(f"re_embedder.search_path_setup_failed schema={schema_name}: {e}")
                 # Continue with current search_path
@@ -2241,7 +2821,8 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
         # expires_at extended so they survive long enough to reach the next threshold.
         try:
             with db_conn.cursor() as cur:
-                cur.execute(
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                     """
                     UPDATE staged_facts
                     SET fact_class   = 'B',
@@ -2266,11 +2847,13 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
             log.error(f"re_embedder.class_c_upgrade_failed: {e}")
 
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT id, subject_id, object_id, rel_type,
                        provenance, COALESCE(fact_provenance, 'llm_inferred'), confidence,
-                       temporal_status, event_date, event_date_granularity, source_ref
+                       temporal_status, event_date, event_date_granularity, source_ref,
+                       COALESCE(is_hierarchy_rel, false)
                 FROM staged_facts
                 WHERE fact_class = 'B'
                   AND confirmed_count >= %s
@@ -2279,10 +2862,37 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                 (promotion_threshold,)
             )
             candidates = cur.fetchall()
+        # READ BARRIER: the work set is materialised; end the transaction BEFORE the
+        # per-row loop, which makes Qdrant calls on this same connection.
+        release_read_transaction(db_conn, context="re_embedder.promote_staged_facts.fetch")
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, fact_prov, conf, temporal_status, event_date, event_date_granularity, source_ref = row
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.promote_staged_facts.iteration")
+            sid, subject, obj, rel_type, prov, fact_prov, conf, temporal_status, event_date, event_date_granularity, source_ref, is_hierarchy_rel = row
             # user_id is implicit in per-user schema context (set by SET search_path)
+            # ASYNC-WRITE GUARD: promotion is a COPY that never re-validates, so a hierarchy
+            # self-loop already staged would land in `facts`. Reject it here (same flag/contract
+            # as the gate) and TOMBSTONE the staged row so it is not re-examined every cycle. No
+            # user content is lost — a self-loop names exactly ONE entity, already registered.
+            if _reflexive_hierarchy_blocked(subject, obj, is_hierarchy_rel):
+                log.warning("re_embedder.reflexive_hierarchy_promotion_rejected",
+                            extra={"staged_id": sid, "rel_type": rel_type,
+                                   "entity_id": str(subject)[:16]})
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE staged_facts SET promoted_at = now() WHERE id = %s", (sid,))
+                    db_conn.commit()
+                except Exception:  # noqa: BLE001 — fail-safe: leave the row, never break the loop
+                    try:
+                        db_conn.rollback()
+                    except Exception:
+                        pass
+                continue
             try:
                 log.info(
                     f"re_embedder.promoting_staged_fact staged_id={sid}"
@@ -2295,10 +2905,19 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                         "INSERT INTO facts"
                         " (subject_id, object_id, rel_type, provenance,"
                         "  confidence, fact_class, fact_provenance, qdrant_synced,"
-                        "  temporal_status, event_date, event_date_granularity, source_ref)"
+                        "  temporal_status, event_date, event_date_granularity, source_ref,"
+                        # STRUCTURAL FLAG PASSTHROUGH: promote the staged row's own
+                        # is_hierarchy_rel, set at ingest from the rel_types metadata (the
+                        # SAME authoritative source store.py writes into facts). Without it
+                        # the INSERT took the column DEFAULT false, so a promoted hierarchy
+                        # rung (subclass_of/part_of/…) landed with is_hierarchy_rel=false —
+                        # latent-wrong. Subject-agnostic: driven by the rel_type's metadata
+                        # carried on the staged row, no rel-name literals. Structural flag,
+                        # so ON CONFLICT keeps the existing row's value (mirrors store.py).
+                        "  is_hierarchy_rel)"
                         " VALUES (%s, %s, %s, %s, %s, 'B', %s, false,"
-                        "  COALESCE(%s, 'now'), %s, %s, %s)"
-                        " ON CONFLICT (subject_id, object_id, rel_type)"
+                        "  COALESCE(%s, 'now'), %s, %s, %s, %s)"
+                        " ON CONFLICT (subject_id, object_id, rel_type) WHERE superseded_at IS NULL"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
@@ -2315,7 +2934,8 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
                         # citation into facts; a citation-less promotion never nulls one.
                         "   source_ref = COALESCE(EXCLUDED.source_ref, facts.source_ref)",
                         (subject, obj, rel_type, prov, conf, fact_prov,
-                         temporal_status, event_date, event_date_granularity, source_ref)
+                         temporal_status, event_date, event_date_granularity, source_ref,
+                         is_hierarchy_rel)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET promoted_at = now() WHERE id = %s",
@@ -2332,12 +2952,7 @@ def promote_staged_facts(db_conn, qdrant_url: str, user_id: str = None, schema_n
 
                 # Best-effort: delete staged Qdrant point after promotion commits
                 try:
-                    collection = derive_collection(user_id)
-                    httpx.post(
-                        f"{qdrant_url}/collections/{collection}/points/delete",
-                        json={"points": [derive_qdrant_point_id("staged_facts", sid)]},
-                        timeout=5.0
-                    )
+                    _qdrant_delete_fact_point(qdrant_url, user_id, "staged_facts", sid, timeout=5.0)
                 except Exception as e:
                     log.warning(f"Failed to delete staged Qdrant point {sid} after promotion: {e}")
 
@@ -2391,7 +3006,8 @@ def expire_staged_facts(db_conn, qdrant_url: str, user_id: str = None) -> int:
         # Class B is long-term memory; once a fact earns B it does not decay.
         # Only Class C (short-term/speculative) participates in the decay cycle.
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 UPDATE staged_facts
                 SET confirmed_count = confirmed_count - 1,
@@ -2412,8 +3028,19 @@ def expire_staged_facts(db_conn, qdrant_url: str, user_id: str = None) -> int:
         # Fresh rows start at confirmed_count=0 but have expires_at = now()+30d — keep them.
         # Only delete when the window has expired AND score is zero (never confirmed or fully decayed).
         # Class B facts are never removed here; retraction handles their lifecycle.
+        #
+        # PROCESSABILITY GATES THE CLOCK. Expiry is definitional for short-term memory, but a row
+        # is only fairly reaped if it HAD its chance to be typed. A seat whose brain cannot be
+        # resolved fails every extraction, so none of its rows ever got that chance and the
+        # thirty days it "sat there" were ours, not theirs. Withhold the removal (the decay above
+        # is non-destructive and still runs) until there is a brain again.
+        if _tenant_brain_unavailable():
+            log.info(f"re_embedder.staged_expiry_withheld user_id={user_id} "
+                     "reason=brain_unavailable note=row never had its chance to be typed")
+            return expired
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT id FROM staged_facts
                 WHERE fact_class    = 'C'
@@ -2423,15 +3050,18 @@ def expire_staged_facts(db_conn, qdrant_url: str, user_id: str = None) -> int:
                 """
             )
             stale = cur.fetchall()
+        # READ BARRIER: the very next statement is a Qdrant delete with a 10s timeout,
+        # once per stale row. Holding this SELECT's transaction across them is the wound.
+        release_read_transaction(db_conn, context="re_embedder.expire_staged_facts.fetch")
 
-        collection = derive_collection(user_id) if user_id else os.getenv("QDRANT_COLLECTION", "faultline-test")
         for (staged_id,) in stale:
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.expire_staged_facts.iteration")
             try:
-                httpx.post(
-                    f"{qdrant_url}/collections/{collection}/points/delete",
-                    json={"points": [derive_qdrant_point_id("staged_facts", staged_id)]},
-                    timeout=10.0,
-                )
+                _qdrant_delete_fact_point(qdrant_url, user_id, "staged_facts", staged_id, timeout=10.0)
             except Exception:
                 pass  # Best effort Qdrant cleanup
 
@@ -2487,7 +3117,8 @@ def decay_class_c_hits(db_conn, qdrant_url: str, user_id: str = None, limit: int
         # A row with hit_count <= 1 will hit zero on this decrement and must be dropped
         # (need its id + qdrant point), so we select all eligible and branch per-row.
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT id, hit_count
                 FROM staged_facts
@@ -2500,23 +3131,24 @@ def decay_class_c_hits(db_conn, qdrant_url: str, user_id: str = None, limit: int
                 (limit,)
             )
             idle_rows = cur.fetchall()
+        # READ BARRIER: same shape as expire_staged_facts — a 10s Qdrant delete per row.
+        release_read_transaction(db_conn, context="re_embedder.decay_class_c_hits.fetch")
 
         if not idle_rows:
             return stats
 
-        collection = derive_collection(user_id) if user_id else os.getenv("QDRANT_COLLECTION", "faultline-test")
-
         for staged_id, hit_count in idle_rows:
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.decay_class_c_hits.iteration")
             try:
                 new_hits = (hit_count if hit_count is not None else 1) - 1
                 if new_hits <= 0:
                     # DROP — best-effort Qdrant delete first (match expiry pattern), then row.
                     try:
-                        httpx.post(
-                            f"{qdrant_url}/collections/{collection}/points/delete",
-                            json={"points": [derive_qdrant_point_id("staged_facts", staged_id)]},
-                            timeout=10.0,
-                        )
+                        _qdrant_delete_fact_point(qdrant_url, user_id, "staged_facts", staged_id, timeout=10.0)
                     except Exception:
                         pass  # Best-effort Qdrant cleanup
                     with db_conn.cursor() as cur:
@@ -2533,7 +3165,8 @@ def decay_class_c_hits(db_conn, qdrant_url: str, user_id: str = None, limit: int
                 else:
                     # Decrement hit_count, reset the 30-day window.
                     with db_conn.cursor() as cur:
-                        cur.execute(
+                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                             """
                             UPDATE staged_facts
                             SET hit_count   = %s,
@@ -2596,19 +3229,22 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
         if schema_name:
             try:
                 with db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}")
+                    cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                 db_conn.commit()
             except Exception as e:
                 log.warning(f"re_embedder.class_c_promote_search_path_failed schema={schema_name}: {e}")
                 # Continue with current search_path
 
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT id, subject_id, object_id, rel_type, provenance,
                        COALESCE(fact_provenance, 'llm_inferred'),
                        confidence, hit_count, rel_type_definition,
-                       temporal_status, event_date, event_date_granularity, source_ref
+                       temporal_status, event_date, event_date_granularity, source_ref,
+                       COALESCE(is_hierarchy_rel, false)
                 FROM staged_facts
                 WHERE fact_class = 'C'
                   AND hit_count >= %s
@@ -2619,12 +3255,37 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                 (hit_threshold, limit)
             )
             candidates = cur.fetchall()
+        # READ BARRIER: the loop below calls the tenant brain
+        # (_query_llm_for_rel_type_metadata) per candidate.
+        release_read_transaction(db_conn, context="re_embedder.promote_class_c_hits.fetch")
 
         if not candidates:
             return promoted
 
         for row in candidates:
-            sid, subject, obj, rel_type, prov, fact_prov, conf, hits, rel_def, temporal_status, event_date, event_date_granularity, source_ref = row
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.promote_class_c_hits.iteration")
+            sid, subject, obj, rel_type, prov, fact_prov, conf, hits, rel_def, temporal_status, event_date, event_date_granularity, source_ref, is_hierarchy_rel = row
+            # ASYNC-WRITE GUARD (see promote_staged_facts): a C→B hit promotion is also a COPY
+            # that never re-validates — reject a hierarchy self-loop and tombstone the staged row.
+            if _reflexive_hierarchy_blocked(subject, obj, is_hierarchy_rel):
+                log.warning("re_embedder.reflexive_hierarchy_promotion_rejected",
+                            extra={"staged_id": sid, "rel_type": rel_type,
+                                   "entity_id": str(subject)[:16]})
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE staged_facts SET promoted_at = now() WHERE id = %s", (sid,))
+                    db_conn.commit()
+                except Exception:  # noqa: BLE001 — fail-safe: leave the row, never break the loop
+                    try:
+                        db_conn.rollback()
+                    except Exception:
+                        pass
+                continue
             required_classification = False
             try:
                 # ── Default B-2: classify rough/unclassified memory before promotion ──
@@ -2640,6 +3301,13 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                     obj_disp = resolved.get("object_display", obj)
                     snippet = (rel_def or prov or f"{subj_disp} {obj_disp}").strip()
                     candidate_rel = "related_to"  # rough seed; LLM infers the real rel_type metadata
+                    # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                    # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                    # transaction after it, and that read then rides across this hop. Measured live on the
+                    # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                    # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                    # seconds later.
+                    release_read_transaction(db_conn, context="re_embedder.promote_class_c_hits.pre_blocking_call")
                     llm_md = _query_llm_for_rel_type_metadata(
                         candidate_rel, "unknown", "unknown", snippet, qwen_api_url
                     )
@@ -2649,6 +3317,29 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                             f"re_embedder.class_c_promote_classify_failed staged_id={sid} "
                             f"hit_count={hits} reason=no_llm_metadata — left as Class C"
                         )
+                        # R8 GROWTH WORKSTACK: this is the promotion lane's precise
+                        # deferral point — a document-derived staged row that EARNED
+                        # its promotion (hit_count >= 3) but could not be structured
+                        # because the brain would not answer. Record it as a durable
+                        # breadcrumb (target = the staged row) so the drain-on-recovery
+                        # re-runs the classify-before-promote pass for it, priority 2
+                        # (promotion is recall-visible). Fail-safe: a queue failure
+                        # never breaks the promotion loop.
+                        #
+                        # SEAM CONTRACT (transaction ownership): record_deferred
+                        # COMMITS on the caller's connection. That is safe HERE and
+                        # ONLY here-shaped seams: release_read_transaction directly
+                        # above refused-if-a-write-was-pending, and this branch runs
+                        # BEFORE any write of this row's iteration — so the commit
+                        # persists the queue row alone. If code is ever added ABOVE
+                        # this branch that leaves writes pending, move this record to
+                        # its own short-lived connection (conn=None) instead.
+                        try:
+                            growth_work_queue.record_deferred(
+                                schema_name or "", "promotion", target_id=str(sid),
+                                user_id=str(user_id or ""), conn=db_conn)
+                        except Exception:  # noqa: BLE001 — breadcrumb must never break promotion
+                            pass
                         continue
 
                     # Register the inferred rel_type into rel_types so the structured fact has
@@ -2704,10 +3395,19 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                         "INSERT INTO facts"
                         " (subject_id, object_id, rel_type, provenance,"
                         "  confidence, fact_class, fact_provenance, qdrant_synced,"
-                        "  temporal_status, event_date, event_date_granularity, source_ref)"
+                        "  temporal_status, event_date, event_date_granularity, source_ref,"
+                        # STRUCTURAL FLAG PASSTHROUGH (mirrors promote_staged_facts): promote
+                        # the staged row's own is_hierarchy_rel — set at ingest from the
+                        # rel_types metadata, the SAME authoritative source store.py writes
+                        # into facts — instead of taking the column DEFAULT false. A promoted
+                        # hierarchy rung must land is_hierarchy_rel=true, a relational one
+                        # false. (In the rel-typed-here branch the rel_type is minted as the
+                        # non-hierarchy seed 'related_to', so the stored false flag stays
+                        # correct.) Subject-agnostic; ON CONFLICT keeps the existing value.
+                        "  is_hierarchy_rel)"
                         " VALUES (%s, %s, %s, %s, %s, 'B', %s, false,"
-                        "  COALESCE(%s, 'now'), %s, %s, %s)"
-                        " ON CONFLICT (subject_id, object_id, rel_type)"
+                        "  COALESCE(%s, 'now'), %s, %s, %s, %s)"
+                        " ON CONFLICT (subject_id, object_id, rel_type) WHERE superseded_at IS NULL"
                         " DO UPDATE SET"
                         "   confirmed_count = facts.confirmed_count + 1,"
                         "   last_seen_at    = now(),"
@@ -2723,7 +3423,8 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                         # citation into facts; a citation-less promotion never nulls one.
                         "   source_ref = COALESCE(EXCLUDED.source_ref, facts.source_ref)",
                         (subject, obj, rel_type, prov, promote_conf, fact_prov,
-                         temporal_status, event_date, event_date_granularity, source_ref)
+                         temporal_status, event_date, event_date_granularity, source_ref,
+                         is_hierarchy_rel)
                     )
                     cur.execute(
                         "UPDATE staged_facts SET fact_class = 'B', promoted_at = now() WHERE id = %s",
@@ -2736,12 +3437,7 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
                 # (match promote_staged_facts cleanup pattern). New facts-table point is
                 # re-synced next cycle via qdrant_synced=false above.
                 try:
-                    collection = derive_collection(user_id)
-                    httpx.post(
-                        f"{qdrant_url}/collections/{collection}/points/delete",
-                        json={"points": [derive_qdrant_point_id("staged_facts", sid)]},
-                        timeout=5.0
-                    )
+                    _qdrant_delete_fact_point(qdrant_url, user_id, "staged_facts", sid, timeout=5.0)
                 except Exception as e:
                     log.warning(f"re_embedder.class_c_promote_qdrant_delete_failed staged_id={sid}: {e}")
 
@@ -2773,8 +3469,127 @@ def promote_class_c_hits(db_conn, qdrant_url: str, qwen_api_url: str, user_id: s
 _episodic_log_missing_schemas: set = set()
 
 
+# === FLAG: REEXTRACT_PRESERVE_PROVENANCE (default ON) ========================
+#
+# THE DEFECT IT FIXES. `reextract_episodic` re-mines a retained turn and re-ingests it
+# with `source="reextract"`, which falls through the /ingest provenance router's
+# else-branch to `fact_provenance="llm_inferred"` (`main.py` — `llm_learn` → llm_learned,
+# `mcp`/`assistant` → user_stated, ELSE → llm_inferred). `_reextract_row_edges`
+# additionally FORCED llm_inferred onto every edge. So a fact the USER STATED came back
+# DEMOTED to Class B/C instead of the Class A it earned the first time.
+#
+# OWNER RULING (binding, a founding principle): "Re-stated should be able to go from B→A.
+# User is truth should be respected." A fact does not become less true because OUR
+# pipeline had to read it twice.
+#
+# ⛔ THIS OVERRULES the note under REEXTRACT_BACKLOG_DRAIN below ("`source='reextract'` →
+# llm_inferred stays exactly as it is … a re-derivation lacks the live turn's context, so
+# it genuinely IS inference"). That reasoning CONFLATED EXTRACTION QUALITY WITH
+# PROVENANCE, and that conflation is the whole bug. A weaker re-derivation may produce a
+# WORSE READING of the user's words — that is a confidence/extraction concern, already
+# handled by the low-confidence filter and `_assess_statement_directness`. It does not
+# change WHO SAID IT. The text in `episodic_log` is the user's verbatim turn either way;
+# re-reading our own record of their words is not the engine inventing something.
+#
+# WHY PROVENANCE-CORRECT RE-INGEST AND *NOT* A B→A PROMOTION JOB. Promotion today is a
+# C-tier mechanism (C→B at confirmed_count >= 3) and `promote_staged_facts` writes
+# fact_class='B'; A/B never promote. A genuine B→A promotion keyed on REPETITION would let
+# the engine promote its OWN inferred content to sacred simply by re-deriving it — the
+# exact inversion the tier model exists to prevent, and catastrophic. Repetition is not
+# testimony. So there is NO new promotion path here and no new authority mechanism: the
+# fact was never legitimately B, it was an A misfiled as B by a router that had LOST the
+# turn's origin. Restoring the origin makes it land through the SAME
+# `assign_class_and_confidence` the live path uses — Class A when the rel's defined class
+# is A, else Class B, exactly as first time. B→A then happens as a CONSEQUENCE of the
+# corrected write, not as a rule anything can game (and the staged upsert's provenance
+# ladder is already upgrade-only: `main.py` — only an incoming user_stated may raise the
+# stored value).
+#
+# THE SAFETY PROPERTY — PRESERVING, NEVER ELEVATING.
+# We re-ingest under the ORIGINAL INGEST SOURCE, so /ingest's own router does the mapping
+# and there is no second copy of the provenance rules to drift. A row whose origin lane is
+# NOT known to have been user-stated keeps the legacy `source="reextract"` → llm_inferred
+# path. Unknown origin is NEVER guessed: guessing would FABRICATE AUTHORITY, which is the
+# precise opposite of user-is-truth. Fail-safe direction is "stay at the lower tier".
+#
+# WHAT `episodic_log.source` ACTUALLY RECORDS (verified against every writer, 2026-08-01):
+#   'mcp'                     — `_episodic_capture` (`src/mcp/server.py`), the chat turn as
+#                               handed to remember_facts. The LIVE path ingests this same
+#                               text with source="mcp" → user_stated. PRESERVING.
+#   'document'                — the document lane (`src/mcp/server.py`, and
+#                               `_process_document_chunk` below). Its LIVE ingest is
+#                               `_extract_and_ingest(chunk, "document")` (owner ruling
+#                               2026-08-21: machine-extracted document facts tier at
+#                               staged B) and the router maps it to llm_inferred —
+#                               re-mining the chunk under "document" reproduces the
+#                               live class outcome. TIER-PRESERVING (was "mcp"/PRESERVING
+#                               before the ruling).
+#   'store_context_deferred'  — `_defer_context_to_episodic` (`main.py`): Class-C residue
+#                               that never produced a typed triple. NOT elevatable.
+#   NULL / anything else      — origin unknown. NOT elevatable.
+# Measured on the local stack: 1678 rows across 79 tenant schemas, all source='mcp', no
+# NULLs. The signal is present and populated — no new column is needed, and adding one
+# would create a SECOND source of truth for the same fact (this project has already paid
+# for that once with three drifting copies of the tool descriptions).
+#
+# ⚠️ CONTRACT FOR FUTURE WRITERS: `episodic_log.source` is now LOAD-BEARING for provenance.
+# A new writer MUST set it honestly. Note the footgun: `EpisodicAppendRequest.source`
+# defaults to "mcp" (`src/api/models.py`), so a caller that simply OMITS the field is
+# recorded as a user turn. All three current writers set it explicitly. Migration 206
+# records this contract as a COMMENT ON COLUMN.
+#
+# FLAG OFF → byte-for-byte the legacy behaviour (source="reextract" + forced llm_inferred
+# on every edge, for every row). Pinned by test.
+REEXTRACT_PRESERVE_PROVENANCE = os.getenv(
+    "REEXTRACT_PRESERVE_PROVENANCE", "true").strip().lower() in ("true", "1", "yes", "on")
+
+# episodic_log.source  →  the /ingest `source` to re-mine it under.
+# ONLY origin lanes whose LIVE ingest provably routed to user_stated appear here; the
+# value is an EXISTING live source string (never a new one) so every downstream seam
+# keyed on it — the provenance router, the user-is-truth retype exemption, the
+# commit() provenance derivation — behaves exactly as it did on the live path.
+# Absent from this map == not elevatable == legacy "reextract" lane.
+#
+# DOWN-ROUTING ENTRIES (authorship-honesty, 2026-08-15) — unlike the preserving entries
+# above, these route an origin that was NEVER attested to the explicit "unattested"
+# ingest lane, where the /ingest provenance router forces llm_inferred and the class
+# force lands staged Class B (never A, never the C 30-day clock):
+#   • "store_context_deferred" — the store_context lane's residue/verbatim (the
+#     dispatchable store_context TOOL and the internal remainder captures). Its text
+#     never produced an attested triple; without this entry the legacy re-mine lane
+#     could land a defined-A rel at facts Class A off a machine side-effect.
+#   • "unattested" — a recall divert's verbatim, captured by _episodic_capture with
+#     source="unattested" (attested=False). Without this entry the re-mine would take
+#     the legacy lane and could re-elevate the demoted capture.
+_EPISODIC_ORIGIN_INGEST_SOURCE: dict = {
+    "mcp": "mcp",
+    # DOCUMENT re-mines reproduce the document tier (owner direction 2026-08-21): a re-mined
+    # document chunk re-ingests under source="document" → staged B, exactly as the fresh
+    # drain would. The previous "mcp" mapping re-elevated re-mined document facts to
+    # user_stated/Class A — the exact defect class the unattested down-routes below close.
+    "document": "document",
+    "store_context_deferred": "unattested",
+    "unattested": "unattested",
+}
+
+
+def _reextract_ingest_source(episodic_source) -> str | None:
+    """The /ingest `source` that PRESERVES this retained turn's original provenance.
+
+    Returns None when the origin lane is unknown or is not known to have been
+    user-stated — the caller then uses the legacy `source="reextract"` lane and keeps
+    forcing llm_inferred. Never guesses: an unknown origin stays at the lower tier.
+    """
+    if not REEXTRACT_PRESERVE_PROVENANCE:
+        return None
+    if not isinstance(episodic_source, str):
+        return None
+    return _EPISODIC_ORIGIN_INGEST_SOURCE.get(episodic_source.strip().lower())
+
+
 def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
-                         statement_route: str) -> list:
+                         statement_route: str,
+                         preserve_source: str | None = None) -> list:
     """Extract edges for ONE episodic_log row through the normal front door.
 
     Mirrors the document lane's route-once-then-per-row pattern (server.py
@@ -2785,12 +3600,20 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
     — byte-identical to the plain backfill. Low-confidence edges are dropped
     (same filter the MCP applies before /ingest).
 
-    PROVENANCE HARD RULE: every returned edge has fact_provenance FORCED to
-    'llm_inferred'. Spine edges arrive stamped user_stated (the live path IS the
-    user speaking) — but here the LLM/deriver is re-reading OLD text, not the user
-    restating it, and the /ingest provenance router preserves a canonical
-    fact_provenance carried on the edge. Without this override a backfilled spine
-    edge would land user_stated → Class A. source="reextract" alone is not enough.
+    PROVENANCE HARD RULE (legacy lane, `preserve_source is None`): every returned edge
+    has fact_provenance FORCED to 'llm_inferred'. Spine edges arrive stamped user_stated
+    and the /ingest provenance router PRESERVES a canonical fact_provenance carried on
+    the edge, so `source="reextract"` alone is not enough to hold a row down — without
+    this override a backfilled spine edge would sneak in at user_stated → Class A. This
+    force is what makes "not elevatable" actually mean it, and it stays exactly as-is for
+    every row whose origin lane is unknown or non-user-stated.
+
+    PROVENANCE PRESERVATION (`preserve_source` set — REEXTRACT_PRESERVE_PROVENANCE):
+    the row's origin lane IS known to have been user-stated, so the edges are left
+    UNSTAMPED and the caller re-ingests under that original source; /ingest's own
+    provenance router then assigns exactly what it assigned the first time. We do not
+    stamp user_stated ourselves — the router owns that decision, here as on the live
+    path, so there is no second copy of the rule. See the flag block above.
     """
     edges: list = []
     if statement_route == "spine":
@@ -2798,7 +3621,12 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
             resp = httpx.post(
                 f"{backend_url}/harvest-spans",
                 json={"text": raw_text, "user_id": user_id},
-                timeout=60.0,
+                headers=_BACKEND_LANE_HEADERS,
+                # NOT a bare literal. Prod diagnosis 2026-07-31: the reextract path is the lane
+                # that actually times out (183 stall minutes overlapped 98.4% with
+                # `reextract_*: timed out`), and it still carried 60.0 while the DOC lane was
+                # raised to 180. Same env knob so both move together.
+                timeout=_DOC_INGEST_HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             _data = resp.json()
@@ -2808,8 +3636,39 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
             # be a silent loss. Raise → the row stays NULL and retries next cycle.
             if _data.get("status") == "ingest_disabled":
                 raise RuntimeError("backend ingest disabled (knowledge-store mode)")
-            edges = [e for e in (_data.get("edges", []) or [])
-                     if not e.get("low_confidence", False)]
+            # Same class of silent loss, different cause: with NO tenant brain bound the
+            # backend fails closed and answers HTTP 200 with zero edges. That reads as
+            # "successfully uncastable" and stamps reextracted_at, and since eligibility
+            # is `reextracted_at IS NULL` the turn is frozen out FOREVER. Raise → the row
+            # stays NULL and is re-mined on the first cycle after an endpoint is bound.
+            if _data.get("extraction_degraded") or _data.get("status") == "degraded":
+                # Same reason-carry as the rewrite route (critic pass 5 hardening): the
+                # pacer's defer token must survive the envelope or the poison guard
+                # upstream cannot tell a paced day from a genuine outage.
+                _swhy = (_data.get("error")
+                         or _data.get("llm_first_unanswered_reason")
+                         or "unknown")
+                raise RuntimeError("extraction degraded (brain unavailable) — "
+                                   f"{_swhy}")
+            # POSITIVE-SUCCESS GATE for the spine seam (the re-mine truth rule). The
+            # named guards above were each added AFTER a specific 200-shaped failure
+            # lied in production; a failure shape they do not name would slip through
+            # the same way — its edges (or its empty edge list) trusted as a real
+            # harvest. /harvest-spans success bodies carry NO status key at all (unlike
+            # /extract/rewrite, whose success says status="success"), so the positive
+            # set here is "no status", plus the explicit success tokens in case the
+            # endpoint ever grows one. An UNRECOGNIZED status is not trusted: the
+            # harvest result is discarded and the row falls through to /extract/rewrite,
+            # whose own positive gate decides the row's fate — a stamp can never rest on
+            # a spine body that did not affirmatively succeed.
+            if _data.get("status") not in (None, "", "success", "ok"):
+                log.warning(f"re_embedder.reextract_spine_unrecognized_status "
+                            f"user_id={user_id[:8]} "
+                            f"status={_data.get('status')!r} "
+                            f"(edges discarded, falling back to /extract/rewrite)")
+            else:
+                edges = [e for e in (_data.get("edges", []) or [])
+                         if not e.get("low_confidence", False)]
         except RuntimeError:
             raise
         except Exception as e:
@@ -2821,18 +3680,516 @@ def _reextract_row_edges(raw_text: str, user_id: str, backend_url: str,
         resp = httpx.post(
             f"{backend_url}/extract/rewrite",
             json={"text": raw_text, "user_id": user_id},
-            timeout=60.0,
+            headers=_BACKEND_LANE_HEADERS,
+            timeout=_DOC_INGEST_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         _data = resp.json()
-        # Same split-brain guard as the spine branch above.
-        if _data.get("status") == "ingest_disabled":
-            raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+        # POSITIVE-SUCCESS GATE (the re-mine truth rule). /extract/rewrite answers
+        # SEVERAL failures as HTTP 200 with a status-bearing body: ingest_disabled
+        # (frozen store), degraded + extraction_degraded (no brain / every chunk
+        # failed) — and at least two more the old named guards never knew:
+        # status="error" (the handler's broad except) and status="processing"
+        # (idempotency lock held by another request — that body has NO edges key at
+        # all, so it read as "zero edges = successfully uncastable" and STAMPED the
+        # row). Each guard below was added one name at a time after a specific
+        # failure shape lied; a shape that does not exist yet would lie the same way.
+        # So this gate is the POSITIVE set: only a body that affirmatively says
+        # status="success" (the ONLY status /extract/rewrite returns on success,
+        # including idempotency cache hits, which cache success only) may yield
+        # edges. Anything else raises → the row stays NULL → re-mined next cycle.
+        # raise_for_status() cannot help: none of these failures is an HTTP error.
+        if _data.get("status") != "success":
+            # Carry the REASON (critic pass 4, preserved): the pacer's defer envelope
+            # is {"error": "rate_deferred"} — losing it here made a merely-paced day
+            # read as "unknown" upstream, where the poison-row guard stamped user
+            # turns terminally skipped for a request that never reached the provider.
+            _why = (_data.get("error")
+                    or _data.get("llm_first_unanswered_reason")
+                    or f"status={_data.get('status')!r}")
+            raise RuntimeError(f"extraction did not confirm success ({_why})")
         edges = [e for e in (_data.get("edges", []) or [])
                  if not e.get("low_confidence", False)]
-    for e in edges:
-        e["fact_provenance"] = "llm_inferred"
+    if preserve_source is None:
+        # Legacy / not-elevatable lane — hold every edge down to llm_inferred.
+        for e in edges:
+            e["fact_provenance"] = "llm_inferred"
     return edges
+
+
+# === FLAG: REEXTRACT_BACKLOG_DRAIN (CTIER increment 1, default OFF) ===========
+#
+# WHAT IT GATES. Three knobs on the episodic re-extraction backfill, ALL inert when the
+# flag is OFF (flag-OFF is byte-for-byte the shipped behaviour: LIMIT REEXTRACT_BATCH_SIZE,
+# a literal `INTERVAL '1 hour'` age gate, and no early batch abort):
+#   1. AGE GATE          — `REEXTRACT_MIN_AGE_MINUTES` replaces the hardcoded 1 hour.
+#   2. BACKLOG-PROPORTIONAL BATCH — a tenant that is BEHIND drains faster, bounded hard by
+#      `REEXTRACT_MAX_BATCH`; a tenant that is caught up still drains at the base size.
+#   3. CONSECUTIVE-FAILURE ABORT — the storm bound (see below), `REEXTRACT_FAIL_ABORT`.
+#
+# WHY THE RATE MATTERS (measured 2026-07-31 on pre-prod, 34 tenants).
+# The retained-turn tier is the ONLY home for a turn the ontology could not cast, and
+# `episodic_log` has exactly ONE consumer: this drain. Nothing reads it at query time.
+# So the drain rate IS the tier's usefulness. Measured: `REEMBED_INTERVAL=300` but the
+# OBSERVED per-tenant cycle interval was ~11.5-15.0 min (13:22:24 → 13:37:22 → 13:49:59 →
+# 14:01:30 for one tenant) — the loop's own work across 34 tenants dominates the configured
+# sleep, so the effective rate was 5 rows / ~13 min ≈ 23 rows/hour/tenant. The worst tenant
+# carried 358 eligible rows → ~15.5 h to catch up. That gap is EMERGENT and grows linearly
+# with tenant count: at the SaaS per-account grain the cycle stretches and a fixed
+# 5-rows-per-cycle becomes decorative. Hence a backlog-proportional batch rather than a
+# bigger constant — it spends the extra budget only where there IS a backlog.
+#
+# ⚠️ STORM CASE (why the abort exists, and why the ceiling is low).
+# Every row costs at least one extraction LLM call plus an /ingest that does its own LLM
+# work in the gate. A sick brain does NOT fail fast: the observed failure mode is
+# `reextract_row_failed: timed out` against a 60 s httpx timeout. So `batch_size` sick rows
+# cost `batch_size × 60 s` PER TENANT PER CYCLE — the cycle stretches, which stretches every
+# other tenant's interval, which grows every backlog, which is self-feeding. Raising the
+# batch without a failure bound multiplies exactly that. The abort stops a tenant's batch
+# after N CONSECUTIVE row failures, so a dead brain costs N timeouts per tenant per cycle
+# instead of `batch_size` of them, and the loop keeps its cadence. It also protects the
+# per-ACCOUNT circuit breaker (`LLM_CIRCUIT_BREAKER_THRESHOLD`, default 5, shared by every
+# seat under one account — `src/api/llm_calls.py:891`/`:904`): burning 25 doomed calls per
+# tenant is how one backlogged seat trips the breaker for its co-tenants' LIVE traffic.
+# The retained turn is NOT lost by aborting — an un-stamped row is retried next cycle by
+# construction; aborting only declines to pay for calls we have evidence will fail.
+#
+# ⚠️ MONEY. On a metered brain the ceiling is the bill. Ceiling 25 × 34 tenants × ~5
+# cycles/h ≈ 4 250 extractions/hour worst case, vs ~850 today. That is why the flag is OFF
+# by default and the ceiling is deliberately modest — turn it on per-deploy, measure, raise.
+#
+# ⚠️ SUPERSEDED 2026-08-01 by REEXTRACT_PRESERVE_PROVENANCE (see the flag block above).
+# This used to read: "NOT CHANGED: `source='reextract'` → `llm_inferred` stays exactly as it
+# is. A re-derivation lacks the live turn's context, so it genuinely IS inference, not user
+# testimony." The OWNER OVERRULED that ("Re-stated should be able to go from B→A. User is
+# truth should be respected."), and the reasoning was wrong on its own terms: it conflated
+# EXTRACTION QUALITY with PROVENANCE. Re-reading our own verbatim record of the user's words
+# does not change who said them.
+# What DOES survive from that note, and is still binding: DRAINING FASTER MUST NOT LAUNDER
+# PROVENANCE. Rate and authority stay orthogonal — the drain knobs below decide HOW MANY rows
+# are re-mined, never WHAT AUTHORITY they come back with. Authority is decided solely by the
+# row's recorded origin lane, and an origin that cannot be established is never elevated.
+REEXTRACT_BACKLOG_DRAIN = os.getenv(
+    "REEXTRACT_BACKLOG_DRAIN", "false").strip().lower() in ("true", "1", "yes", "on")
+
+# Age gate in MINUTES (flag ON only). Default 60 == today's `INTERVAL '1 hour'`.
+_REEXTRACT_MIN_AGE_MINUTES = max(0, int(os.getenv("REEXTRACT_MIN_AGE_MINUTES", "60")))
+# Hard ceiling on the backlog-proportional batch (flag ON only).
+_REEXTRACT_MAX_BATCH = max(1, int(os.getenv("REEXTRACT_MAX_BATCH", "25")))
+# Fraction of a tenant's eligible backlog to attempt per cycle (flag ON only).
+_REEXTRACT_DRAIN_FRACTION = max(0.0, float(os.getenv("REEXTRACT_DRAIN_FRACTION", "0.10")))
+# Consecutive per-row failures that abort this tenant's batch (flag ON only). 0 disables.
+_REEXTRACT_FAIL_ABORT = max(0, int(os.getenv("REEXTRACT_FAIL_ABORT", "3")))
+
+
+# === THE PREDECESSOR BUDGET (unflagged; `=0` on either knob is the legacy behaviour) =====
+#
+# WHAT WENT WRONG, MEASURED ON THIS BOX 2026-08-27 (container up 02:46, one cycle observed):
+# `reextract_episodic` spent 403.4 SECONDS on ONE tenant (`e9bf22d4`) — 45% of the entire
+# elapsed PHASE-2b pass — while the other 1,212 tenants in the same pass cost a MEDIAN of
+# 0.03 s each. The whole 403 s is two serial LLM timeouts on a SINGLE row:
+#     02:58:01  llm_call_async.attempt_start operation=REFRAME timeout_seconds=180.0
+#     03:01:01  reextract_spine_failed  (falling back to /extract/rewrite): timed out
+#     03:04:01  reextract_row_failed episodic_id=1: timed out
+# The spine path times out at 180 s, the fail-safe /extract/rewrite times out at 180 s again,
+# and the batch then keeps going and pays it per row. THE PER-ROW COST IS UNBOUNDED, and the
+# thing it starves is everything after it — for this tenant (document drain, Class-C promotion
+# and decay, the strike evaluator all sit BELOW reextract in the same per-tenant block) and for
+# every tenant behind it in the serial pass, including the ontology-growth sweeps that only
+# begin once the whole pass is done.
+#
+# ⛔ WHY THE EXISTING STORM BOUND DOES NOT COVER THIS — AND WHY IT USED TO.
+# `REEXTRACT_FAIL_ABORT` was built (63cdd1cf) for EXACTLY this shape; its own comment names it:
+# "a sick brain fails SLOW … so `batch_size` sick rows cost `batch_size × 60 s` PER TENANT PER
+# CYCLE". It arms off `consecutive_failures`. Then 28215456 — correctly, fixing a real data-loss
+# bug where a lane outage stamped `reextracted_at` and froze turns out of eligibility FOREVER —
+# introduced `_exempt` and wired it to that SAME counter: `if not _exempt: consecutive_failures
+# += 1`. A timeout is an `httpx.TransportError` and a 500 is an `HTTPStatusError >= 500`, so both
+# set `_backend_down` → `_exempt` → the counter never moves. The abort's DESIGNED TRIGGER BECAME
+# ITS EXCLUSION. The live log says so in as many words: "not stamped, not counted toward the
+# storm bound". Flipping `REEXTRACT_BACKLOG_DRAIN=true` does not restore it — the flag arms a
+# counter that no longer counts, and its backlog-proportional batch (ceiling 25) would multiply
+# the 403 s by five.
+#
+# THE SPLIT THIS RESTORES: the exemption is a STAMPING decision (do not burn a row's one
+# best-effort pass on an outage that was not its fault) and it stays exactly as it is. Aborting
+# is a SCHEDULING decision (do not pay a 360 s timeout again for a lane we have just proven is
+# down). They were conflated because they shared one counter; they are now separate, and the
+# scheduling half is unflagged because the storm defence it restores has been dark since it
+# shipped and the wedge is live.
+#
+# WHY WALL-CLOCK AND NOT A ROW COUNT. Both existing bounds count ROWS. Rows are not the quantity
+# that starves anyone — seconds are, and the per-row cost varies by four orders of magnitude
+# here (0.03 s to 360 s). A budget in seconds bounds the predecessor's contribution to cycle
+# time regardless of per-row latency, which a row count cannot do.
+#
+# NOT A DRAIN THROTTLE. Neither knob reduces the steady-state drain rate on a HEALTHY brain: a
+# tenant that drains its batch inside the budget is untouched, and the budget is only consulted
+# BETWEEN rows, never mid-row. What they remove is the ability of one tenant, or one sick brain,
+# to consume the cycle.
+#
+# Per-tenant wall-clock budget for the episodic drain, checked BETWEEN rows. 0 disables (legacy).
+# R13 (critic RG-Z-2) AGE POLICY for the episodic reextract drain: a retained turn older
+# than this re-ingests as RECONCILE (the X-FL-Backlog-Reconcile header), never as a blind
+# overwrite. The R12b wound: R1-era turns (~15h old) re-mined during a flap and filed as
+# LIVE current facts (rosalind spouse + verrone residence at 16:59:21) - the replay marker
+# only freezes RETIRED rows; the reconcile marker is what arbitrates single-current slots.
+_REEXTRACT_MAX_AGE_S = min(max(float(os.getenv("REEXTRACT_MAX_AGE_S", "3600") or 3600), 60.0), 604800.0)
+_reextract_reconcile_stats = {"ancient": 0, "quarantined_cycles": 0}
+
+
+def _seat_lane_degraded(user_id) -> bool:
+    """R13 flap-quarantine probe: TRUE when the seat's write lane is degraded/flapping (the
+    same brain-health advisory the MCP drain keys on). Fail-safe False: open-core (no
+    saas/), probe error, or a healthy seat => the drain proceeds (quarantine must never
+    eat data - an un-stamped row retries by construction, a skipped one never returns)."""
+    try:
+        from saas import brain_health
+        return bool(brain_health.degradation_notice(user_id))
+    except Exception:  # noqa: BLE001 - observer must never break the drain
+        return False
+
+
+_REEXTRACT_TENANT_BUDGET_S = max(0.0, float(os.getenv("REEXTRACT_TENANT_BUDGET_S", "90")))
+# Cycle-wide wall-clock budget for the episodic drain ACROSS all tenants. 0 disables (legacy).
+# Bounds the aggregate: per-tenant bounding alone still permits N_tenants × tenant_budget.
+_REEXTRACT_CYCLE_BUDGET_S = max(0.0, float(os.getenv("REEXTRACT_CYCLE_BUDGET_S", "600")))
+
+
+def _reextract_cycle_gate(armed: bool, cursor, user_id, spent: float, budget: float):
+    """The rotation + cycle-budget decision for ONE tenant. Pure — no clock, no DB, no I/O.
+
+    Extracted from the loop deliberately: this is the term whose FAILURE MODE is a silent
+    starvation (deny everyone forever), and a decision buried in a 1,700-line cycle body is a
+    decision nobody can ablate. Here it can be, row by row.
+
+    Returns ``(armed, may_drain)``.
+
+      * ``armed`` — has the rotation cursor been reached? Until it has, this cycle deliberately
+        declines to spend budget, so the seats the LAST cycle never got to are served first.
+        ``cursor is None`` means "start from the top" and arms immediately.
+      * ``may_drain`` — armed AND the cycle budget is not yet spent. ``budget == 0`` disables
+        the cap entirely (legacy behaviour: every armed tenant drains).
+
+    The budget is compared with ``<``, so a cycle that has spent EXACTLY its budget stops. The
+    comparison is against spend ALREADY BOOKED, never a prediction — the loop cannot know what
+    the next tenant will cost, and guessing would either over-admit (no bound) or under-admit
+    (starve a cheap tenant behind an expensive one).
+    """
+    if not armed and (cursor is None or str(user_id) == cursor):
+        armed = True
+    may_drain = armed and (not budget or spent < budget)
+    return armed, may_drain
+
+
+# === THE CORTEX-SWEEP BUDGET (unflagged; `=0` is the byte-for-byte legacy behaviour) =====
+#
+# WHAT WENT WRONG, MEASURED ON THIS BOX 2026-08-27. The agent-cortex sweep iterates
+# `ready_schemas` with NO ledger claim, NO budget and NO gate, and its per-seat cost is not
+# small: from the container's own log, 826 seats swept in 1,332 s — a MEDIAN of 2.0 s per seat
+# (825 inter-seat gaps; mean 1.61 s, p90 2.0 s). Against the 1,392 live tenants that same cycle
+# enumerated, that is 1392 x 2.0 s = ~46 MINUTES for the cortex phase alone, against a 30 s
+# poll interval — a ~93x overrun. It never finished: the pass was 826/1,392 (59%) when the
+# process restarted.
+#
+# WHERE THE TIME GOES, AND WHY IT IS ALSO A QDRANT PROBLEM. The cost is the RECONCILE lane in
+# `cortex.sweep_lifecycle_for_user`: per seat it calls `_ensure_cortex_collection` (CREATING
+# the per-seat `flagent-<uuid>` collection if it is absent) and then CPU-embeds every drift row
+# on the fastembed path — measured `embedded=10` on essentially every seat. So the phase is
+# simultaneously the largest CPU consumer in the cycle (pid 1464 State=R, +1,762 utime jiffies
+# in 6 wall-seconds = 2.95 cores) AND a collection MINTER: local Qdrant went 819 -> 957
+# collections during observation, 0.45/s sustained, against the ~1,000-collection soft cap that
+# `DEV`/CLAUDE.md documents. That is minutes of headroom, not months.
+#
+# ⛔ THE BOUND IS A BUDGET, **NOT** AN ORPHAN/GHOST TEST — AND THAT IS A MEASURED CHOICE, NOT A
+# FIREWALL DODGE. The obvious fix is "skip a cortex seat whose tenant no longer exists". Two
+# independent reasons it is the wrong shape here:
+#
+#   1. IT IS ALREADY DONE, ONE LAYER UP. This loop does not enumerate cortex schemas. It
+#      iterates `ready_schemas`, which is `public.user_provisioning WHERE status='ready'` AFTER
+#      the GHOST-TENANT HEALTH SKIP has dropped every seat whose `faultline_<uuid>` schema is
+#      absent (`tenant_schema_is_live`, a `to_regclass` probe). A seat with no tenant is
+#      therefore ALREADY unreachable from here, structurally. Verified on this box: 1,632
+#      `flagent_` schemas exist, `ready_schemas_found count=24` -> `live=7`, and the sweep
+#      touched SEVEN. The 1,624 orphan cortex schemas are dead inventory that this loop cannot
+#      reach — they are a RECLAMATION problem (`tools/cortex_orphan_reaper.py`), not a
+#      scheduling one. An orphan test added here would be dead code.
+#   2. THE WORKLOAD THAT ACTUALLY BURNED THE CYCLE WAS LEGITIMATE. The 1,392 seats swept were
+#      LIVE tenants, not ghosts. No existence test would have skipped even one of them. What
+#      needs bounding is the phase's claim on a 30 s cycle, and that is a quantity in SECONDS.
+#
+# So the coupling `sweep_ledger.EXCLUDED["cortex_sweep"]` forbids — the user path deriving the
+# cortex seat — is not needed and is not introduced: a wall-clock budget and a rotation cursor
+# know nothing about tenants, schemas or seats beyond the id they were handed. The firewall is
+# untouched, and no ledger claim is taken (the ledger excludes this lane on its own terms:
+# TIME-BASED, and firewalled).
+#
+# WHY WALL-CLOCK AND NOT A SEAT COUNT. Same reason as the reextract budget directly above: the
+# starving quantity is seconds, not items. A seat's cost is dominated by how many rows drift
+# and whether Qdrant answers, which a count cannot see.
+#
+# NOT A THROTTLE ON SMALL DEPLOYMENTS. A cycle whose whole cortex phase fits inside the budget
+# is untouched, and the budget is consulted only BETWEEN seats, never mid-seat. What it removes
+# is the phase's ability to consume the cycle — and, with the rotation cursor, its ability to
+# starve the tail: without rotation a budget serves the same head-of-list seats every cycle
+# forever and the seats behind them are never swept at all.
+#
+# Cycle-wide wall-clock budget for the cortex sweep ACROSS all seats. 0 disables (legacy).
+_CORTEX_SWEEP_CYCLE_BUDGET_S = max(0.0, float(os.getenv("CORTEX_SWEEP_CYCLE_BUDGET_S", "120")))
+
+
+def _cortex_sweep_cycle_gate(armed: bool, cursor, user_id, spent: float, budget: float):
+    """The rotation + cycle-budget decision for ONE cortex seat. Pure — no clock, no DB, no I/O.
+
+    Same SHAPE as ``_reextract_cycle_gate`` and deliberately a SEPARATE function rather than a
+    shared one: these are two different lanes with two different budgets, and a shared helper
+    would mean an ablation of one lane's gate silently moves the other's. Kept pure and
+    extracted for exactly the reason its sibling was — a scheduling decision buried inside a
+    1,700-line cycle body is a decision nobody can ablate.
+
+    Returns ``(armed, may_sweep)``.
+
+      * ``armed`` — has the rotation cursor been reached? Until it has, this cycle declines to
+        spend budget, so the seats the LAST cycle ran out of budget before reaching are served
+        FIRST. ``cursor is None`` means "start from the top" and arms immediately.
+      * ``may_sweep`` — armed AND the cycle budget is not yet spent. ``budget == 0`` disables
+        the cap entirely (legacy behaviour: every armed seat is swept).
+
+    The budget is compared with ``<``, so a cycle that has spent EXACTLY its budget stops. The
+    comparison is against spend ALREADY BOOKED, never a prediction — the loop cannot know what
+    the next seat will cost, and guessing would either over-admit (no bound) or under-admit
+    (starve a cheap seat queued behind an expensive one).
+    """
+    if not armed and (cursor is None or str(user_id) == cursor):
+        armed = True
+    may_sweep = armed and (not budget or spent < budget)
+    return armed, may_sweep
+
+
+# === FLAG: REEXTRACT_ONTOLOGY_REGROWTH (CTIER increment 2, default OFF) ======
+#
+# THE GAP. The retained-turn tier's entire advantage over an embedding is that a turn can
+# be RE-READ against a GROWN ontology — /expand adds a place, and a turn that was
+# untypeable last month becomes typeable now. That is the growth engine running BACKWARDS
+# over history. It does not currently run backwards: a turn that yields zero edges is
+# stamped `reextracted_at = now(), extracted_fact_count = 0`, and the eligibility scan is
+# `WHERE reextracted_at IS NULL`, so it is frozen out PERMANENTLY however much the ontology
+# grows afterwards. MEASURED (pre-prod 2026-07-31, 34 tenants): 102 of 542 drained turns
+# (18.8%) are stamped zero-edge. Those 102 are the tier's whole reason to exist and not one
+# of them will ever be looked at again.
+#
+# WHAT THIS FLAG DOES. Re-opens a zero-edge turn — but ONLY on evidence that the tenant
+# gained somewhere to file it, and only a bounded number of times:
+#     eligible again  ⇔  extracted_fact_count = 0
+#                        AND reextract_attempts < REEXTRACT_MAX_ATTEMPTS
+#                        AND walkable_places_now >= mark_at_last_attempt + MIN_GROWTH
+# The existing "retry every cycle forever is waste" objection is correct and is preserved:
+# without growth there is no retry.
+#
+# ⚠️ WHY THE MARK COUNTS *WALKABLE* PLACES — this is the VERIFY-THE-READ half.
+# `_tenant_walkable_place_count` counts rel_types whose category is NOT 'pending_placement',
+# plus entity_taxonomies rows. A novel rel minted in-flow lands `category='pending_placement'`
+# and is NEVER appended to `entity_taxonomies.rel_types_defining_group` (src/api/main.py:5502),
+# so the query path's `rel_type = ANY(allowed_rels)` projection can never admit it and a fact
+# filed under it does NOT come back from a scoped recall. It becomes retrievable only after
+# `drain_pending_placement_by_morphology` (below, :6701) folds it onto a seeded canonical,
+# where it adopts a real category and enters a taxonomy. Marking on WALKABLE places means a
+# turn is re-mined when there is somewhere RETRIEVABLE to put it — never merely somewhere to
+# write it. Re-mining into a pending rel would be a write with no reader.
+#
+# ⚠️ PRIMARY-SOURCE WARNING THAT SHAPED THIS DESIGN. Zhang et al., "Useful Memories Become
+# Faulty When Continuously Updated by LLMs" (arXiv 2605.12978), report that agents preserving
+# raw episodes roughly DOUBLED the accuracy of forced-consolidation counterparts, and
+# recommend treating raw episodes as first-class evidence and GATING CONSOLIDATION EXPLICITLY.
+# Unbounded re-mining is precisely the continuous-update failure they measure. Hence: an
+# explicit growth gate (not a timer), a hard attempt bound, and — untouched — the
+# `llm_inferred` provenance on every re-mined edge, which keeps a re-derivation from ever
+# overwriting user testimony. The raw turn itself is never mutated or deleted.
+#
+# DETERMINISTIC: two integer counts and a comparison. No cosine, no embedding, no LLM in the
+# eligibility decision. Subject-agnostic: it COUNTS places, it never names one.
+#
+# Requires migration 197 (episodic_log.reextract_ontology_mark / .reextract_attempts).
+# Fail-safe: if those columns are absent the lane self-disables for that tenant and the job
+# runs exactly as it does today.
+REEXTRACT_ONTOLOGY_REGROWTH = os.getenv(
+    "REEXTRACT_ONTOLOGY_REGROWTH", "false").strip().lower() in ("true", "1", "yes", "on")
+
+# How many NEW walkable places must appear before a zero-edge turn is retried.
+_REEXTRACT_MIN_GROWTH = max(1, int(os.getenv("REEXTRACT_MIN_GROWTH", "5")))
+# Hard bound on re-mining passes for one turn (the consolidation-churn bound).
+_REEXTRACT_MAX_ATTEMPTS = max(1, int(os.getenv("REEXTRACT_MAX_ATTEMPTS", "5")))
+
+# Tenants already found to lack migration 197 — log once, then self-disable the lane.
+_regrowth_columns_missing_schemas: set = set()
+
+
+# === FLAG: DOC_REMINE_ENABLED (gauntlet R2, default OFF) — the DOCUMENT-lane re-mine =====
+#
+# The migration-197 analog for the `documents` table. The episodic lane re-mines retained
+# TURNS against a grown ontology; this pass re-mines DOCUMENTS whose chunks produced ZERO
+# committed edges, or that terminated 'partial' — the cohort the litmus re-eval measured
+# frozen forever (prod 2026-10-21: 11 research papers, ~29h, facts_committed=0 on every
+# one; "terminal `partial` documents are never auto-re-mined — retry_document exists but
+# nothing drives it", DEV/RESEARCH/doc-ingestion-litmus-reeval-20261021.md §5.5).
+#
+# MECHANISM (selector+stamper, NOT a second extraction pipeline): the pass re-queues an
+# eligible document into the NORMAL drain (status='pending', started_at=NULL, attempts
+# reset — byte-for-byte the POST /documents/retry transition) after re-opening exactly the
+# zero-edge/failed chunks in chunk_state. The ordinary drain then re-reads them, so the
+# re-mine inherits EVERY bound the drain already enforces: the atomic claim, the
+# DOC_RETRY_BACKOFF reclaim gate (a rate_deferred re-mine reschedules at the paced 60s
+# cadence instead of hammering — the shared-backoff requirement), the lease reclaim, the
+# brain bind, and the chunk queue. The only new write surface is the flip itself.
+#
+# REPLAY CONTRACT: a re-mined document is BY CONSTRUCTION a re-send of already-attempted
+# content (its live ingest ran when it was first enqueued), so the drain tags the /ingest
+# POSTs with X-FL-Deferred-Replay: 1 + X-FL-Replay-Lane: reextract whenever the row's
+# reextract_attempts > 0 — the retired-value freeze in main.py::ingest MUST engage. The
+# marker is header-only (the idempotency key hashes edges); a first drain
+# (reextract_attempts = 0) never carries it. Provenance is NEVER elevated: the chunk path
+# already ingests source="document" → llm_inferred / staged B, and the replay marker does
+# not change that — it only keeps a retired value retired.
+#
+# BUDGET (the GraphRAG warning + BUG-005, industrialized-corpus-scale guard): max
+# DOC_REMINE_BATCH documents per pass (default 2), at most ONE per tenant per pass,
+# round-robin across tenants via a rotation cursor, and the pass itself runs at most once
+# per DOC_REMINE_INTERVAL_SECONDS (default 900s) no matter how often the caller ticks.
+# Every selected document must also be older than DOC_REMINE_MIN_AGE_HOURS (default 24)
+# since its last terminal state and hold reextract_attempts < DOC_REMINE_MAX_ATTEMPTS
+# (default 3) — a document uncastable in any ontology cannot bill forever.
+#
+# OFF BY DEFAULT: applying migration 298 changes nothing; the owner flips
+# DOC_REMINE_ENABLED=true after deploy (runbook in the lane report).
+DOC_REMINE_ENABLED = os.getenv(
+    "DOC_REMINE_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
+_DOC_REMINE_BATCH = max(1, int(os.getenv("DOC_REMINE_BATCH", "2")))
+_DOC_REMINE_MAX_ATTEMPTS = max(1, int(os.getenv("DOC_REMINE_MAX_ATTEMPTS", "3")))
+_DOC_REMINE_MIN_AGE_HOURS = max(0.0, float(os.getenv("DOC_REMINE_MIN_AGE_HOURS", "24")))
+_DOC_REMINE_INTERVAL_S = max(60, int(os.getenv("DOC_REMINE_INTERVAL_SECONDS", "900")))
+
+# Tenants already found to lack migration 298 — log once, then self-disable the lane
+# (the same fail-safe shape as _regrowth_columns_missing_schemas above: the flag must
+# never be able to STOP the drain that already works).
+_remine_columns_missing_schemas: set = set()
+
+# Module-local pass cadence + rotation cursor. Single-element lists so the call sites can
+# stay stateless (the standalone doc-drain daemon and the main loop's phase 2a both call
+# remine_documents_prepass; the pacing inside the prepass is the ONE source of truth).
+_DOC_REMINE_LAST_RUN = [0.0]
+_DOC_REMINE_CURSOR = [None]
+
+
+
+def _tenant_walkable_place_count(db_conn, schema_name: str = None) -> Optional[int]:
+    """Count this tenant's WALKABLE places — the ontology-growth mark.
+
+    walkable places = rel_types with a real (non-'pending_placement') category
+                    + entity_taxonomies rows
+
+    Deterministic, subject-agnostic, two counts. Returns None on any failure, which the
+    caller treats as "no growth evidence" → today's behaviour (never a spurious retry).
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                """
+                SELECT (SELECT count(*) FROM rel_types
+                          WHERE category IS DISTINCT FROM %s)
+                     + (SELECT count(*) FROM entity_taxonomies)
+                """,
+                (_CATEGORY_PENDING_RE,),
+            )
+            return int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        log.warning(f"re_embedder.reextract_place_count_failed schema={schema_name}: {e}")
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        return None
+
+
+def _regrowth_predicate_sql(place_mark: Optional[int]) -> tuple[str, tuple]:
+    """Return (sql_fragment, params) for the episodic eligibility predicate.
+
+    Flag OFF (or no usable mark) → the shipped `reextracted_at IS NULL`, byte-identical.
+    Flag ON → that, OR a zero-edge turn whose tenant has grown enough walkable places
+    since its last attempt and which has attempts left.
+    """
+    if not REEXTRACT_ONTOLOGY_REGROWTH or place_mark is None:
+        return "reextracted_at IS NULL", ()
+    return (
+        "(reextracted_at IS NULL"
+        " OR (extracted_fact_count = 0"
+        "     AND reextract_attempts < %s"
+        "     AND (reextract_ontology_mark IS NULL"
+        "          OR %s >= reextract_ontology_mark + %s)))",
+        (_REEXTRACT_MAX_ATTEMPTS, place_mark, _REEXTRACT_MIN_GROWTH),
+    )
+
+
+def _reextract_age_interval_sql() -> tuple[str, tuple]:
+    """Return (sql_fragment, params) for the eligibility age gate.
+
+    Flag OFF → the literal `INTERVAL '1 hour'` this job has always used (byte-identical).
+    Flag ON  → a parameterised minute interval so the gate is tunable per deploy.
+
+    WHY THE GATE EXISTS AT ALL (checked before touching it — the stated reason and the
+    unstated one are different, and only one of them is now covered elsewhere):
+      • STATED (docstring below): "re-mining text the live pipeline just processed with the
+        SAME ontology has no value; the value comes from ontology growth in between." That
+        reason STANDS and is not covered by anything else — it is an economics argument, and
+        it is why the default stays 60 rather than dropping to 0. Below a few minutes the
+        drain is pure spend against an ontology that has not moved.
+      • UNSTATED, and the one worth naming: the gate also kept the backfill off a turn whose
+        LIVE ingest was still in flight or transiently failing. Re-mining THAT turn is worse
+        than wasteful — the live path would have stored it `user_stated` (Class A/B) while
+        the backfill stores it `llm_inferred` (Class B/C), i.e. a PROVENANCE DOWNGRADE won by
+        whichever raced first. `_ingest_with_retry` (`src/mcp/server.py`, shipped 00e69b5e)
+        now retries transient live-path failures IN-BAND at the correct provenance, so this
+        second job is largely covered — which is what makes the gate safe to shorten. It is
+        not a reason to remove it: the deferred-drain arm of that retry can still be in
+        flight, so the floor should stay comfortably above the retry budget, not at zero.
+    CONCLUSION: make it tunable, keep the default at today's 60 minutes, and do not
+    recommend going below single-digit minutes.
+    """
+    if not REEXTRACT_BACKLOG_DRAIN:
+        return "created_at < now() - INTERVAL '1 hour'", ()
+    return "created_at < now() - (%s * INTERVAL '1 minute')", (_REEXTRACT_MIN_AGE_MINUTES,)
+
+
+def _reextract_effective_batch(db_conn, base_batch: int, age_sql: str, age_params: tuple) -> int:
+    """Backlog-proportional batch size (flag ON only); `base_batch` verbatim when OFF.
+
+    A tenant that is caught up keeps today's modest batch. A tenant that is BEHIND gets
+    `ceil(backlog × REEXTRACT_DRAIN_FRACTION)` rows, clamped to [base, REEXTRACT_MAX_BATCH].
+    Proportional rather than constant so the extra LLM spend lands only where there is a
+    backlog to clear, and CLAMPED so a huge backlog cannot convert one cycle into an
+    unbounded bill (see the storm note on the flag).
+
+    Fail-safe: any failure counting the backlog returns `base_batch` — never a bigger one.
+    """
+    if not REEXTRACT_BACKLOG_DRAIN:
+        return base_batch
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                f"SELECT count(*) FROM episodic_log "
+                f"WHERE reextracted_at IS NULL AND {age_sql}",
+                age_params,
+            )
+            backlog = int(cur.fetchone()[0] or 0)
+        db_conn.commit()
+    except Exception as e:
+        log.warning(f"re_embedder.reextract_backlog_count_failed (using base batch): {e}")
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return base_batch
+    if backlog <= base_batch:
+        return base_batch
+    proportional = int(math.ceil(backlog * _REEXTRACT_DRAIN_FRACTION))
+    return max(base_batch, min(proportional, _REEXTRACT_MAX_BATCH))
 
 
 def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str = None,
@@ -2853,10 +4210,19 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
     re-mining text the live pipeline just processed with the SAME ontology has no
     value; the value comes from ontology growth in between.
 
+    Under REEXTRACT_BACKLOG_DRAIN (default OFF) both of those become tunable and a
+    consecutive-failure abort bounds the storm case — see the flag block above
+    (`_reextract_age_interval_sql` / `_reextract_effective_batch`). Flag OFF is
+    byte-for-byte the behaviour described in this docstring.
+
     Row outcomes:
       • intent RETRACTION/CORRECTION → stamped WITHOUT re-ingest (re-ingesting a
         retraction as a statement would resurrect the retracted fact).
-      • extract + ingest 2xx        → stamped, extracted_fact_count recorded.
+      • extract + ingest CONFIRM success → stamped, extracted_fact_count recorded.
+        "Confirm" is the POSITIVE success set, not HTTP 2xx: /ingest must answer
+        status="valid" and the extractor status="success" (harvest-spans: no
+        status key). A 200 carrying any other status — known failure or a shape
+        not yet invented — is NOT a success and leaves the row unstamped.
       • zero non-low-confidence edges → stamped as SUCCESS with count 0: the
         ontology still can't cast it. The raw text stays in episodic_log forever
         (raw substrate is never deleted); a future "re-mine all" admin action can
@@ -2865,13 +4231,18 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
         EXCEPT rows older than 30 days, which get stamped after this one
         best-effort pass so a poison row cannot clog the LIMIT-N batch forever.
 
-    Provenance: source="reextract" falls through the /ingest provenance router to
-    fact_provenance="llm_inferred" (NOT user_stated Class A) — the LLM is re-reading
-    old text, not the user restating it. _reextract_row_edges additionally FORCES
-    llm_inferred on every edge (spine edges arrive stamped user_stated and a
-    canonical carried provenance is preserved by the router). The cast always pays
-    the validation toll: this function never touches the WGM gate, class
-    assignment, or query code.
+    Provenance (REEXTRACT_PRESERVE_PROVENANCE, default ON — see the flag block above):
+    a retained turn is re-ingested under its ORIGINAL ingest source, so a user-stated
+    turn comes back user_stated and lands Class A exactly as it would have first time.
+    Only rows whose origin lane is KNOWN to have been user-stated ('mcp', 'document')
+    are preserved; an unknown or non-user-stated origin (NULL, 'store_context_deferred')
+    keeps the legacy source="reextract" → llm_inferred lane, with _reextract_row_edges
+    still FORCING llm_inferred on every edge so a spine edge stamped user_stated cannot
+    sneak through. PRESERVING, NEVER ELEVATING — an origin we cannot establish is left
+    at its lower tier rather than guessed, because guessing fabricates authority.
+    Flag OFF → every row takes the legacy lane, byte-for-byte.
+    The cast always pays the validation toll: this function never touches the WGM gate,
+    class assignment, or query code.
 
     Facts are NOT forced to be user-tied: raw_text passes through untouched
     (e.g. network diagrams describe machines, not the user).
@@ -2900,31 +4271,86 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
         if schema_name:
             try:
                 with db_conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}")
+                    cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                 db_conn.commit()
             except Exception as e:
                 log.warning(f"re_embedder.reextract_search_path_failed schema={schema_name}: {e}")
                 # Continue with current search_path
 
+        # Eligibility age gate + batch size. Flag OFF (default) → the literal
+        # `INTERVAL '1 hour'` and the caller's batch_size, byte-identical to the shipped
+        # behaviour. Flag ON → REEXTRACT_MIN_AGE_MINUTES and a backlog-proportional batch.
+        _age_sql, _age_params = _reextract_age_interval_sql()
+        _effective_batch = batch_size
+
+        # Increment 2: ontology-regrowth re-eligibility. Resolve the tenant's walkable-place
+        # mark ONCE per cycle; None (flag OFF, count failed, or migration 197 absent) keeps
+        # the shipped `reextracted_at IS NULL` predicate exactly.
+        _place_mark = None
+        if (REEXTRACT_ONTOLOGY_REGROWTH
+                and (schema_name or user_id) not in _regrowth_columns_missing_schemas):
+            _place_mark = _tenant_walkable_place_count(db_conn, schema_name)
+        _elig_sql, _elig_params = _regrowth_predicate_sql(_place_mark)
+
         try:
             with db_conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, raw_text, source_ref, intent, created_at
+                if REEXTRACT_BACKLOG_DRAIN:
+                    _effective_batch = _reextract_effective_batch(
+                        db_conn, batch_size, _age_sql, _age_params)
+                    if _effective_batch != batch_size:
+                        log.info(f"re_embedder.reextract_backlog_drain user_id={user_id[:8]} "
+                                 f"batch={_effective_batch} (base={batch_size})")
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                    f"""
+                    SELECT id, raw_text, source_ref, intent, created_at, source
                     FROM episodic_log
-                    WHERE reextracted_at IS NULL
-                      AND created_at < now() - INTERVAL '1 hour'
+                    WHERE {_elig_sql}
+                      AND {_age_sql}
                     ORDER BY created_at ASC
                     LIMIT %s
                     """,
-                    (batch_size,)
+                    _elig_params + _age_params + (_effective_batch,)
                 )
                 rows = cur.fetchall()
+            # READ BARRIER — THE PRIMARY WOUND. The loop below calls
+            # _reextract_row_edges (a backend /harvest-spans or /extract/rewrite hop that
+            # has been measured at 180s on the background lane) once per row, on THIS
+            # connection. The batch SELECT's transaction was held across all of it.
+            #
+            # Releasing costs nothing in claim safety: this SELECT takes no row locks
+            # (no FOR UPDATE) and the session is READ COMMITTED, so the open transaction
+            # never reserved these rows from another worker in the first place. Every
+            # per-row write below is idempotent and id-addressed, so a row another cycle
+            # already stamped is simply re-stamped, never double-applied.
+            release_read_transaction(
+                db_conn, context=f"re_embedder.reextract_episodic.fetch schema={schema_name}")
         except psycopg2.Error as e:
             # Older schemas may predate migration 127 — not an error, just skip.
             # Roll back + re-apply the tenant search_path so the aborted txn cannot
             # poison the rest of this tenant's cycle (per-tenant isolation, f4839d4).
             _rollback_and_reapply_search_path(db_conn, schema_name)
+            if getattr(e, "pgcode", None) == "42703" and _place_mark is not None:
+                # undefined_column — migration 197 not applied on this tenant. Self-disable
+                # the regrowth lane for this schema (log ONCE) and fall back to the shipped
+                # predicate rather than skipping the tenant's drain entirely. The flag must
+                # never be able to STOP the drain that already works.
+                _key = schema_name or user_id
+                if _key not in _regrowth_columns_missing_schemas:
+                    _regrowth_columns_missing_schemas.add(_key)
+                    log.warning(
+                        f"re_embedder.reextract_regrowth_columns_missing schema={schema_name} "
+                        f"(migration 197 not applied — regrowth lane disabled for this tenant)")
+                # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                # transaction after it, and that read then rides across this hop. Measured live on the
+                # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                # seconds later.
+                release_read_transaction(db_conn, context="re_embedder.reextract_episodic.pre_blocking_call")
+                return reextract_episodic(db_conn, backend_url, user_id, schema_name,
+                                          batch_size, statement_route)
             if getattr(e, "pgcode", None) == "42P01":  # undefined_table
                 key = schema_name or user_id
                 if key not in _episodic_log_missing_schemas:
@@ -2937,7 +4363,45 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
         if not rows:
             return 0
 
-        for row_id, raw_text, source_ref, intent, created_at in rows:
+        # STORM BOUND (flag ON only): consecutive row failures abort this tenant's batch.
+        # A sick brain fails SLOW (observed: `reextract_row_failed: timed out` against a 60 s
+        # httpx timeout), so a doomed batch costs batch_size × 60 s per tenant per cycle and
+        # stretches the cycle for every OTHER tenant — the self-feeding case. Bail after N in
+        # a row rather than paying for calls we have evidence will fail, and stop feeding the
+        # shared per-ACCOUNT circuit breaker (threshold 5, shared across seats) with doomed
+        # backfill calls that would fail-fast the account's LIVE traffic. Nothing is lost: an
+        # un-stamped row is retried next cycle by construction.
+        consecutive_failures = 0
+        # PER-TENANT WALL-CLOCK BUDGET (see "THE PREDECESSOR BUDGET" block above). Checked
+        # BETWEEN rows only — a row already in flight always finishes, so this can never
+        # truncate a write or leave a half-applied ingest. Un-attempted rows keep
+        # `reextracted_at IS NULL` and are re-selected next cycle by construction, so the
+        # budget defers work, never drops it.
+        _rx_t0 = time.monotonic()
+        _rx_attempted = 0
+
+        for row_id, raw_text, source_ref, intent, created_at, ep_source in rows:
+            # `_rx_attempted` gates the check so EVERY tenant always attempts at least one
+            # row: a budget that can deny a tenant its first row would let a slow neighbour
+            # starve it outright, which is the failure this whole block exists to prevent.
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.reextract_episodic.iteration")
+            if _REEXTRACT_TENANT_BUDGET_S and _rx_attempted:
+                _rx_elapsed = time.monotonic() - _rx_t0
+                if _rx_elapsed >= _REEXTRACT_TENANT_BUDGET_S:
+                    log.warning(
+                        f"re_embedder.reextract_tenant_budget_exhausted user_id={user_id[:8]} "
+                        f"schema={schema_name} elapsed={_rx_elapsed:.1f}s "
+                        f"budget={_REEXTRACT_TENANT_BUDGET_S:.0f}s processed={processed} "
+                        f"deferred={len(rows) - processed} "
+                        f"(un-stamped rows retry next cycle; the rest of this tenant's "
+                        f"lifecycle and every tenant behind it get their turn)"
+                    )
+                    break
+            _rx_attempted += 1
             # RETRACTION/CORRECTION rows must NOT be re-ingested as statements —
             # that would resurrect the very facts they retracted. Stamp and skip.
             if (intent or "").upper() in ("RETRACTION", "CORRECTION"):
@@ -2952,33 +4416,127 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                          f"user_id={user_id[:8]} intent={intent} (stamped without re-ingest)")
                 continue
 
+            # R13 (critic RG-Z-2) FLAP QUARANTINE: a degraded/flapping write lane PARKS the
+            # batch (rows stay un-stamped and retry next cycle by construction) instead of
+            # re-mining ancient turns INTO the flap - the exact motion that filed the R12b
+            # zombies (rosalind/verrone, R1-era, live at 16:59:21 mid-flap). Park, never eat:
+            # nothing is stamped, nothing is lost.
+            if _seat_lane_degraded(user_id):
+                _reextract_reconcile_stats["quarantined_cycles"] += 1
+                log.warning(
+                    f"re_embedder.reextract_quarantined_degraded episodic_id={row_id} "
+                    f"user_id={user_id[:8]} (write lane degraded/flapping - batch PARKED "
+                    f"un-stamped; retried when health returns)")
+                break
+
             # QUERY / STATEMENT / NULL intents are fair game — queries often carry
             # embedded facts and were misrouted; that's part of why we captured them.
             try:
-                edges = _reextract_row_edges(raw_text, user_id, backend_url, statement_route)
+                # PROVENANCE PRESERVATION (REEXTRACT_PRESERVE_PROVENANCE, default ON).
+                # Resolve the ORIGINAL ingest source for this retained turn. A known
+                # user-stated origin lane ('mcp'/'document') re-ingests under that same
+                # live source string, so /ingest's router assigns the provenance it
+                # assigned first time and assign_class_and_confidence lands Class A when
+                # the rel's defined class is A. An unknown origin (NULL, anything new)
+                # returns None and keeps the legacy "reextract" → llm_inferred lane
+                # UNCHANGED. Preserving, never elevating: an origin we cannot establish
+                # is never guessed. The DOWN-ROUTING entries ('store_context_deferred',
+                # 'unattested') return the explicit "unattested" lane instead — the
+                # router forces llm_inferred there and the class force lands staged B.
+                _preserve_source = _reextract_ingest_source(ep_source)
+                _ingest_source = _preserve_source or "reextract"
+
+                edges = _reextract_row_edges(raw_text, user_id, backend_url,
+                                             statement_route, _preserve_source)
 
                 if edges:
+                    # R13 (critic RG-Z-2) AGE POLICY: a retained turn older than the policy
+                    # age re-ingests as RECONCILE - the same header contract the MCP deferred
+                    # drain uses (header-only; byte-identity untouched). The backend's
+                    # single-current arbitration then drops the ancient edge when a fresher
+                    # current row holds the slot, instead of planting a second live row.
+                    try:
+                        _row_age_s = max(0.0, time.time() - created_at.timestamp())
+                    except Exception:
+                        _row_age_s = 0.0
+                    _rx_headers = {
+                        **_BACKEND_LANE_HEADERS,
+                        _ingest_transport.REPLAY_MARKER_HEADER:
+                            _ingest_transport.REPLAY_MARKER_VALUE,
+                        _ingest_transport.REPLAY_LANE_HEADER:
+                            _ingest_transport.REPLAY_LANE_REEXTRACT,
+                    }
+                    if _row_age_s > _REEXTRACT_MAX_AGE_S:
+                        _rx_headers[_ingest_transport.BACKLOG_RECONCILE_HEADER] = \
+                            _ingest_transport.BACKLOG_RECONCILE_VALUE
+                        _rx_headers[_ingest_transport.BACKLOG_AGE_HEADER] = str(int(_row_age_s))
+                        _reextract_reconcile_stats["ancient"] += 1
+                        log.info(
+                            f"re_embedder.reextract_ancient_reconcile episodic_id={row_id} "
+                            f"user_id={user_id[:8]} age_s={_row_age_s:.0f} "
+                            f"policy={_REEXTRACT_MAX_AGE_S:.0f} (reconcile-not-overwrite: "
+                            f"the backend arbitrates single-current slots)")
                     ingest_resp = httpx.post(
                         f"{backend_url}/ingest",
                         json={
                             "text": raw_text,
                             "user_id": user_id,
                             "edges": edges,
-                            # source="reextract" → provenance router else-branch →
-                            # llm_inferred (never user_stated Class A).
-                            "source": "reextract",
+                            # Preserved origin source (user-stated lane) or the legacy
+                            # "reextract" → provenance router else-branch → llm_inferred.
+                            "source": _ingest_source,
                             # Citable provenance rides along (migration 128).
                             "source_ref": source_ref,
                         },
+                        # Lane header so /ingest's own LLM-fallback self-call (GLiNER2
+                        # empty/miss) stays in the BACKGROUND lane end-to-end.
+                        #
+                        # REPLAY MARKER (gauntlet reextract-replay-resurrection): a re-mined
+                        # episodic row is BY CONSTRUCTION a replay — the turn's live ingest
+                        # already ran when the row was captured. Without the marker this POST
+                        # arrived at /ingest indistinguishable from a FRESH user statement
+                        # (source preserved 'mcp' -> user_stated rank 3, tie passes the SS5
+                        # gate), so a value /retract/correct had retired in the interleaving
+                        # RESURRECTED: superseded_at -> NULL, history 'ingest_restate'
+                        # (live wound 2026-09-04 22:04:49, seat b3f8a2c4). The marker extends
+                        # the shipped replay-transport contract to this third writer: the
+                        # backend's retired-value freeze treats this POST as the re-send it is.
+                        # The lane hint header names the sender for attribution/logging; it is
+                        # informational only (ingest_transport.py). Header-only, never the
+                        # body — the idempotency key hashes edges and must stay byte-identical
+                        # to any live ingest of the same turn.
+                        headers=_rx_headers,
                         timeout=30.0,
                     )
                     ingest_resp.raise_for_status()
-                    # Split-brain guard (same as _reextract_row_edges): a frozen backend
-                    # returns 200-shaped ingest_disabled — nothing stored → do NOT stamp.
-                    if ingest_resp.json().get("status") == "ingest_disabled":
-                        raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+                    # POSITIVE-SUCCESS GATE — the re-mine's core honesty rule. /ingest
+                    # answers some failures as HTTP 200 with a status-bearing body:
+                    # ingest_disabled (frozen store) AND status="error" (provisioning /
+                    # schema-context failure — nothing stored). The old guard checked the
+                    # ONE named failure, so an "error" body fell through to the stamp
+                    # below with extracted_fact_count = len(edges) > 0 — and the only
+                    # predicate that ever re-opens a stamped row (REEXTRACT_ONTOLOGY_
+                    # REGROWTH) requires extracted_fact_count = 0, so the turn was
+                    # closed PERMANENTLY as "successfully processed" with nothing stored.
+                    # Gate on the ONE success status instead: /ingest returns
+                    # status="valid" on its only success path (and on idempotency cache
+                    # hits, which cache success only). Any other body — a known failure
+                    # or a shape that does not exist yet — raises, the stamp never runs,
+                    # and the row is re-mined next cycle. raise_for_status() cannot
+                    # help: none of these failures is an HTTP error.
+                    _ingest_body = ingest_resp.json()
+                    if _ingest_body.get("status") != "valid":
+                        _iwhy = (_ingest_body.get("error")
+                                 or f"status={_ingest_body.get('status')!r}")
+                        raise RuntimeError(
+                            f"ingest did not confirm storage ({_iwhy}) — not stamping")
+                    # `ingest_source` is the greppable evidence of which lane a row took:
+                    # "mcp" == provenance PRESERVED (origin was user-stated), "reextract"
+                    # == held at llm_inferred. Without it a demotion is invisible again.
                     log.info(f"re_embedder.reextract_ingested episodic_id={row_id} "
-                             f"user_id={user_id[:8]} edges={len(edges)} route={statement_route}")
+                             f"user_id={user_id[:8]} edges={len(edges)} route={statement_route} "
+                             f"origin={ep_source} ingest_source={_ingest_source} "
+                             f"provenance_preserved={_preserve_source is not None}")
                 else:
                     # Zero-edge = SUCCESS: the ontology still can't cast it. Stamp it
                     # (raw text is retained forever; bulk re-mine can reset the stamp).
@@ -2986,36 +4544,191 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
                              f"user_id={user_id[:8]} (stamped — still uncastable)")
 
                 with db_conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE episodic_log SET reextracted_at = now(), extracted_fact_count = %s WHERE id = %s",
-                        (len(edges), row_id)
-                    )
+                    if _place_mark is not None:
+                        # Increment 2: record the walkable-place mark at THIS attempt and
+                        # bump the attempt counter, so a zero-edge turn re-opens only once
+                        # the tenant has gained MIN_GROWTH more places — and only
+                        # MAX_ATTEMPTS times ever. A turn that DID cast (len(edges) > 0) is
+                        # terminal exactly as before: the predicate only re-opens
+                        # extracted_fact_count = 0.
+                        cur.execute(
+                            "UPDATE episodic_log SET reextracted_at = now(), "
+                            "extracted_fact_count = %s, reextract_ontology_mark = %s, "
+                            "reextract_attempts = reextract_attempts + 1 WHERE id = %s",
+                            (len(edges), _place_mark, row_id)
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE episodic_log SET reextracted_at = now(), extracted_fact_count = %s WHERE id = %s",
+                            (len(edges), row_id)
+                        )
                 db_conn.commit()
                 processed += 1
+                consecutive_failures = 0
 
             except Exception as e:
                 log.error(f"re_embedder.reextract_row_failed episodic_id={row_id} user_id={user_id[:8]}: {e}")
                 _rollback_and_reapply_search_path(db_conn, schema_name)
+                # PACED ≠ FAILED (critic pass 4): a rate_deferred defer never reached the
+                # provider — the turn is merely waiting out the daily budget window. It
+                # must NOT count toward the failure storm bound, and the poison-row guard
+                # below must NOT stamp it: pre-diff this lane rode interactive and never
+                # deferred; post-diff a spent day is a DAILY CERTAINTY on free tiers, and
+                # stamping terminally skips retained user turns (>30d) for a pace, not an
+                # outage. Younger rows already stay NULL and retry; now paced ones do too.
+                # ⚠️ AN ABSENT BRAIN IS NOT A POISON ROW EITHER, and it is the case that
+                # actually bites. The guard below permanently retires any row older than 30
+                # days that fails — and `reextracted_at IS NULL` is the eligibility
+                # predicate, so a stamped row is frozen out FOREVER. A tenant whose
+                # credential will not decrypt fails EVERY row for as long as the condition
+                # lasts; three accounts were measured sitting in exactly that state, and the
+                # console gave them no way to know. Thirty days of that and their retained
+                # history is silently discarded — by a guard whose entire purpose is to stop
+                # ONE bad row clogging the batch, applied to a fault that affects ALL rows.
+                #
+                # The distinction the guard needs is "did this row fail, or did the whole
+                # lane never run": a no-brain / degraded raise is the second, exactly as
+                # `rate_deferred` is. Nothing is being made unstampable — a row that genuinely
+                # fails extraction against a WORKING brain still gets its one pass and its
+                # stamp. This matters more now that the harvest withholds degraded edges: it
+                # is what makes "retained for re-extraction" true rather than "retained for up
+                # to 30 days".
+                #
+                # ONE PREDICATE WAS DOING TWO JOBS, and it graded on the wrong thing.
+                # "extraction degraded (brain unavailable) - " is the CONSTANT PREFIX every
+                # degraded raise carries (see the two raise sites above); only the suffix
+                # after the dash names the cause. So matching the prefix matched EVERY
+                # failure, including a genuine per-row one, and the poison guard stopped
+                # firing at all. It also silently disarmed the control arm of
+                # test_paced_reextract_does_not_stamp_poison_rows, whose two arms differ
+                # only in that suffix - the test could no longer tell the two apart either.
+                #
+                # So classify on the REASON, and keep the two conditions SEPARATE because
+                # they are different facts about the world:
+                #   * PACED     - pacing deferred us; the request never reached the provider.
+                #   * LANE DOWN - the brain was unusable for EVERY row, not just this one.
+                # They share one consequence (neither is this row's fault, so neither may
+                # burn its single best-effort pass) and that shared consequence is exactly
+                # what the previous widening was reaching for - it is preserved here. What
+                # is restored is the third case: a row that genuinely fails against a
+                # WORKING brain still gets stamped and still counts toward the storm bound.
+                _err = str(e)
+                _reason = (_err.rsplit("—", 1)[-1].strip().lower()
+                           if "—" in _err else _err.lower())
+                # WHAT EARNS THE EXEMPTION IS THE ENVELOPE, NOT THE REASON WORD.
+                # "extraction degraded (brain unavailable)" is raised ONLY when the LLM lane
+                # failed to answer — every reason that rides it (rate_deferred,
+                # saas_no_brain_failclosed, circuit_breaker_open, tenant_egress_blocked,
+                # all_retries_exhausted:*, and the bare "unknown" default) describes the LANE,
+                # never this row. A row's OWN fault surfaces as a different exception entirely,
+                # and that is the only thing the poison guard should ever stamp.
+                #
+                # Enumerating reason words instead was my error: it stamped every lane failure
+                # whose word was not on the list, and `or "unknown"` is the DEFAULT at the two
+                # raise sites — so an outage carrying no reason burned the row's single pass and
+                # froze it out of `reextracted_at IS NULL` forever. That is the exact silent
+                # loss the block comment above exists to prevent, re-opened from the other side.
+                # Default-safe is the only correct bias here: an unattributable failure must
+                # never cost a tenant their retained history.
+                _degraded_lane = "extraction degraded" in _err or "brain unavailable" in _err
+                _paced = "rate_deferred" in _reason
+                # THE BACKEND IS A LANE TOO, and it is not on the degraded envelope.
+                # `backend ingest disabled` is raised with the comment "nothing stored ->
+                # do NOT stamp" a few hundred lines above, and the guard was stamping it
+                # anyway: a frozen backend answers that for EVERY row, so one freeze burned
+                # the single best-effort pass of every >30d row in the seat. Transport
+                # failures and 5xx are the same fault -- lane-wide, nothing to do with this
+                # row's content. A 4xx is left to stamp: that IS a per-row rejection.
+                _backend_down = "backend ingest disabled" in _err
+                try:
+                    # httpx.TransportError is the COMMON BASE of all thirteen transport
+                    # failures. Enumerating five of them missed WriteTimeout, ReadError,
+                    # WriteError, LocalProtocolError, ProxyError and UnsupportedProtocol --
+                    # and a stalled backend produces ReadTimeout or WriteTimeout/ReadError
+                    # depending purely on where in the exchange it stalls, so the same
+                    # outage was exempt or row-fatal by coin flip.
+                    if isinstance(e, httpx.TransportError):
+                        _backend_down = True
+                    elif (isinstance(e, httpx.HTTPStatusError)
+                          and getattr(e, "response", None) is not None
+                          and e.response.status_code >= 500):
+                        _backend_down = True
+                except Exception:  # noqa: BLE001 - classification must never raise
+                    pass
+                _lane_down = (_degraded_lane or _backend_down) and not _paced
+                _exempt = _degraded_lane or _paced or _backend_down
+                if not _exempt:
+                    consecutive_failures += 1
                 # Poison-row guard: rows > 30 days old get exactly one best-effort
                 # pass — stamp on failure so they can't clog the LIMIT-N batch
                 # forever. Younger rows stay NULL and retry next cycle.
-                try:
-                    with db_conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE episodic_log SET reextracted_at = now()
-                            WHERE id = %s AND created_at < now() - INTERVAL '30 days'
-                            """,
-                            (row_id,)
-                        )
-                        stamped_old = cur.rowcount
-                    db_conn.commit()
-                    if stamped_old:
-                        log.warning(f"re_embedder.reextract_poison_row_stamped episodic_id={row_id} "
-                                    f"user_id={user_id[:8]} (>30d old, one best-effort pass done)")
-                except Exception as guard_err:
-                    log.error(f"re_embedder.reextract_poison_guard_failed episodic_id={row_id}: {guard_err}")
-                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                if not _exempt:
+                    try:
+                        with db_conn.cursor() as cur:
+                            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                                """
+                                UPDATE episodic_log SET reextracted_at = now()
+                                WHERE id = %s AND created_at < now() - INTERVAL '30 days'
+                                """,
+                                (row_id,)
+                            )
+                            stamped_old = cur.rowcount
+                        db_conn.commit()
+                        if stamped_old:
+                            log.warning(f"re_embedder.reextract_poison_row_stamped episodic_id={row_id} "
+                                        f"user_id={user_id[:8]} (>30d old, one best-effort pass done)")
+                    except Exception as guard_err:
+                        log.error(f"re_embedder.reextract_poison_guard_failed episodic_id={row_id}: {guard_err}")
+                        _rollback_and_reapply_search_path(db_conn, schema_name)
+                else:
+                    # Log the two apart - an operator needs to know whether they are waiting
+                    # out a pace or looking at an outage; the consequence is identical but
+                    # the thing to go and fix is not.
+                    _kind = "paced" if _paced else "lane_down"
+                    _note = ("waiting out the daily budget window" if _paced
+                             else "brain unusable for the whole lane")
+                    log.info(f"re_embedder.reextract_row_{_kind} episodic_id={row_id} "
+                             f"user_id={user_id[:8]} reason={_reason} note={_note}; "
+                             f"not stamped, not counted toward the storm bound")
+                # ── LANE-DOWN ABORT (unflagged; the scheduling half of `_exempt`) ──────────
+                # `_lane_down` is, by its own definition above, the statement "the brain was
+                # unusable for EVERY row, not just this one". Having established that, paying
+                # the next row's full timeout is buying the same answer again — 360 s a row on
+                # the measured shape (180 s spine + 180 s rewrite fail-safe). Stop the batch.
+                #
+                # This does NOT touch the stamping decision: `_exempt` still holds, the row is
+                # still un-stamped, and every un-attempted row keeps `reextracted_at IS NULL`,
+                # so the whole batch is re-selected on the first cycle after a brain returns.
+                # Nothing is lost; the only thing declined is spend on calls we have evidence
+                # will fail — which is verbatim the justification the storm bound shipped with
+                # (63cdd1cf), for the case its own exemption later removed from it.
+                #
+                # `_paced` is deliberately NOT a trigger: pacing is a deferral we are already
+                # observing correctly, and treating it as an outage would abort a healthy lane.
+                if _lane_down:
+                    _doc_log_crit(
+                        "re_embedder.reextract_lane_down_abort",
+                        user_id=user_id[:8], schema=schema_name,
+                        episodic_id=row_id, reason=_reason[:160],
+                        processed=processed, remaining=max(0, len(rows) - processed),
+                        note="brain/backend unusable for the whole lane — batch stopped; "
+                             "no row stamped, all retried next cycle",
+                    )
+                    break
+                # Storm bound — flag ON only. FAIL LOUD: a batch we declined to finish is a
+                # visible CRITICAL, never a success-shaped short count.
+                if (REEXTRACT_BACKLOG_DRAIN and _REEXTRACT_FAIL_ABORT
+                        and consecutive_failures >= _REEXTRACT_FAIL_ABORT):
+                    _doc_log_crit(
+                        "re_embedder.reextract_batch_aborted",
+                        user_id=user_id[:8], schema=schema_name,
+                        consecutive_failures=consecutive_failures,
+                        batch=_effective_batch, processed=processed,
+                        remaining=max(0, len(rows) - processed),
+                        reason="brain_unhealthy_backing_off",
+                    )
+                    break
                 continue
 
     except Exception as e:
@@ -3025,14 +4738,3170 @@ def reextract_episodic(db_conn, backend_url: str, user_id: str, schema_name: str
     return processed
 
 
+# ── Async document-ingestion worker (documents registry, migration 183) ───────
+
+# How many pending documents to drain per tenant per cycle. Each document can be
+# many chunks (each an LLM extraction) — keep it modest so one big corpus dump
+# does not starve the rest of the loop.
+# SCHEDULER DEFAULTS (litmus fix L5, 2026-11-03): ticket 06 measured the drain starved
+# at batch=2/concurrency=6 against a 254-chunk backlog (101s inter-chunk gap). Env
+# overrides always win — these are only the values when nobody sets them.
+# NOTE the ticket says "DOC_CHUNK_CONCURRENCY 4->8": 4 was the DEPLOYED env value; the
+# CODE default was 6. The code default moves to 8; deployed boxes still need the env
+# bump (owner action, listed in the ticket).
+_DOC_DRAIN_BATCH = int(os.getenv("DOC_DRAIN_BATCH", "4"))
+# Chunks within ONE document are INDEPENDENT (each → its own /extract/rewrite + /ingest;
+# the worker's db_conn is untouched until the per-doc finalize UPDATE), so draining them
+# concurrently turns a serial ~N*Xs pass into ~N/W. W is the fan-out; the LLM-bound
+# /extract/rewrite dominates, and the tenant BYO brain (cloud) serves concurrent calls.
+# 1 = strictly serial (legacy behavior). Env-tunable per deploy.
+_DOC_CHUNK_CONCURRENCY = max(1, int(os.getenv("DOC_CHUNK_CONCURRENCY", "8")))
+
+# === FLAG: DOC_CHUNK_FAILURE_LOUD (DOCLOSS-B, default ON) =====================
+# ON  → a chunk whose extraction was REJECTED (open circuit breaker), blocked, or
+#       answered unparseably is treated as a FAILURE, not as "a chunk with no facts":
+#         • brain-level unavailability (breaker open / transport dead) RE-PENDS the whole
+#           document, reusing the existing backend-freeze deferral (at-least-once
+#           redelivery), bounded by `attempts`;
+#         • any other per-chunk failure increments chunks_failed and the document
+#           terminates as 'partial' (never 'ready') with a log_crit.
+# OFF → byte-identical legacy behaviour: every failure collapses to [] edges, the chunk
+#       is counted as a clean success, and the document finalizes 'ready' with
+#       chunks_failed=0 — i.e. silent loss (the defect).
+DOC_CHUNK_FAILURE_LOUD = os.getenv(
+    "DOC_CHUNK_FAILURE_LOUD", "true").strip().lower() not in ("false", "0", "no", "off")
+
+# How many times one document may be re-pended after a brain-level outage before it is
+# terminated as 'error' (its verbatim chunks are retained for a later re-mine). Bounds the
+# at-least-once redelivery so a permanently-sick document cannot spin the drain forever.
+#
+# ⚠️ LEGACY-ONLY TERMINATOR (see _DOC_BRAIN_DEFER_MAX_AGE below). A COUNT of claims is a
+# proxy for outage DURATION sized by the drain interval: at one claim per cycle, 5 attempts
+# = ~5 minutes at REEMBED_INTERVAL=60 — and 95fb517b measured brains unavailable for HOURS
+# (saas_no_brain_failclosed across several seats, all day). The count bound therefore
+# terminated not-their-fault uploads ~5 minutes into an outage. On migrated
+# schemas the wall-clock bound below decides; this count remains the guard only where the
+# brain_deferred_since column does not exist yet (pre-migration-264).
+_DOC_MAX_ATTEMPTS = max(1, int(os.getenv("DOC_MAX_ATTEMPTS", "5")))
+
+# === ZOMBIE QUARANTINE (BUG: doc-drain FIFO starvation, 2026-10-26) ====================
+#
+# The 30-day wall clock is deliberately outage-sized, but it left a second injustice the
+# pre-prod critic measured live: two brain-deferred documents at attempts=104 and 72 sat
+# at the HEAD of the FIFO claim order and monopolized BOTH DOC_DRAIN_BATCH slots every
+# cycle, so a NEW ingest (attempts=0, enqueued 18:59) was never claimed in 34+ minutes.
+#
+# THE BOUND IS TWO-KEYED, AND THE SECOND KEY EXISTS BECAUSE A COUNT ALONE IS THE
+# 95fb517b DEFECT (gauntlet round 1, fresh-critic). A plain brain-down defer does NOT
+# refund its claim (only rate_deferred / backend-frozen do) and re-pends with
+# started_at = NULL — instantly reclaimable on a drain that ticks every few seconds.
+# A fresh, innocent document therefore reaches ANY fixed attempt count MINUTES into an
+# hours-to-all-day outage (95fb517b's own measurement, the reason migration 264 retired
+# count bounds on defer-clock schemas). Count-alone quarantining terminalizes exactly
+# those documents. So a zombie is quarantined only when BOTH keys turn:
+#   1. lifetime attempts >= DOC_DRAIN_HARD_CEILING (default DOC_REMINE_MAX_ATTEMPTS × 3
+#      = 9: three full re-mine budgets of claims); AND
+#   2. a CONTINUOUS unproductive episode (brain_deferred_since) at least
+#      DOC_DRAIN_ZOMBIE_MIN_AGE old (default "24 hours" — one full pacing window,
+#      above every short outage class measured (deploys: minutes; stalls: ~21 min),
+#      meeting the largest observed class (all-day) only at its boundary, and far
+#      below the 30-day wall; the bug file's own fix direction prescribes "hours, not
+#      days" for zombie treatment).
+# With the attempt-weighted claim order in place an unquarantined zombie starves
+# nobody (fresh docs outrank it and are guaranteed a slot), so the age floor can be
+# conservative — the quarantine exists to stop DEAD WEIGHT from burning spare batch
+# slots and brain budget for up to 30 days, not to police attempt counts.
+# A NULL clock (no episode — lifetime attempts earned through healthy-but-slow
+# requeues, or the doc simply has not deferred yet) is NOT a zombie: the wall clock
+# owns that document. Paced (rate_deferred) parks additionally stay below the ceiling
+# by the claim refund, so a designed park is never quarantined.
+# Recovery doors (deliberately plural): the user-facing POST /documents/retry and the
+# re-mine pass BOTH reset attempts and clear the clock — a quarantined document is
+# re-openable through either once conditions change.
+_DOC_DRAIN_HARD_CEILING_RAW = os.getenv(
+    "DOC_DRAIN_HARD_CEILING", str(_DOC_REMINE_MAX_ATTEMPTS * 3))
+try:
+    _DOC_DRAIN_HARD_CEILING = int(_DOC_DRAIN_HARD_CEILING_RAW)
+    if _DOC_DRAIN_HARD_CEILING < 1:
+        raise ValueError("non-positive")
+except ValueError as _ceiling_err:
+    raise RuntimeError(
+        f"DOC_DRAIN_HARD_CEILING={_DOC_DRAIN_HARD_CEILING_RAW!r} is not a positive "
+        f"integer — refusing to guess a zombie-quarantine ceiling"
+    ) from _ceiling_err
+# the episode-age floor parses BELOW, beside the wall clock it scales against —
+# _parse_interval_env is defined there.
+
+
+def _parse_interval_env(value: str) -> float:
+    """Parse "<N> <unit>" interval env strings into SECONDS. Strict, never invents a value.
+
+    Understands exactly the units this module's interval envs already use
+    (DOC_CLAIM_LEASE "30 minutes", this bound's "30 days"): seconds, minutes, hours, days.
+    Anything else raises — a bound nobody can parse must fail loudly at import, not
+    silently become a different number than the operator wrote.
+    """
+    parts = str(value or "").strip().lower().split()
+    if len(parts) != 2:
+        raise ValueError(f"interval must be '<N> <unit>': {value!r}")
+    n = float(parts[0])
+    unit = parts[1]
+    mult = {"second": 1.0, "seconds": 1.0, "minute": 60.0, "minutes": 60.0,
+            "hour": 3600.0, "hours": 3600.0, "day": 86400.0, "days": 86400.0}.get(unit)
+    if mult is None or n < 0:
+        raise ValueError(f"unknown unit or negative count: {value!r}")
+    return n * mult
+
+
+# === THE WALL-CLOCK ANSWER to a question 95fb517b deliberately deferred ================
+#
+#   "How long may a document sit unprocessable (brain unavailable, deferral after deferral)
+#    before it is genuinely the DOCUMENT's problem and terminates 'error'?"
+#
+# The answer is a DURATION, not a count, because every cause of "unprocessable" the system
+# has actually observed is a duration:
+#   • deploy/restart unavailability: minutes (6377e7c1: 1153/1166 chunk failures in a 6h
+#     window were the worker beating on its own not-yet-listening backend);
+#   • event-loop stalls: ≤ ~21 minutes measured (e3584a30; 32.4% of minutes had ZERO
+#     health completions during that incident);
+#   • daily-budget pacing: ≤ 24h per rolling window BY DESIGN — and deliberately FREE
+#     (rate_deferred defers are refunded and never touch this clock; a user's upload must
+#     not terminally fail behind a spent day);
+#   • breaker-open / no-brain provider outages: the comment on _DOC_MAX_ATTEMPTS sized
+#     them at MINUTES; the logs measured HOURS to ALL DAY.
+#
+# MAGNITUDE, DERIVED — not a round number that looked reasonable. The system has already
+# reasoned, elsewhere, about how long USER CONTENT may sit unprocessed: the Class-C staged
+# clock is 30 days (staged_facts.expires_at = now()+30d, migration 012's original intent)
+# and the episodic re-mine poison-stamps retained turns older than 30 days. 30 days is the
+# one constant this codebase has decided means "past this, unprocessed content is no longer
+# 'in flight'". Aligning the document lane's deferral horizon with it means:
+#   • it strictly exceeds EVERY observed deferral cause — including the worst ever seen
+#     (an all-day brain outage) by a factor of ~30 — so a document blocked through no
+#     fault of its own always outlives the outage that blocked it, drains when the brain
+#     returns, and can never be terminated by an outage this system has actually seen;
+#   • the silent-forever-pending failure the guard exists to close still closes, in the
+#     same horizon the system already promised its users for unprocessed content.
+# The clock measures the CURRENT CONTINUOUS no-progress episode: set (COALESCE) on the
+# first non-paced brain-unavailable defer AND on an unproductive deadline requeue;
+# cleared only when the document makes PROGRESS — a terminal finalize or a PRODUCTIVE
+# deadline requeue (one whose owed-chunk count actually decreased). A CLAIM deliberately
+# does not clear it (a claim is a pure DB write that succeeds mid-outage), so two short
+# outages weeks apart, with no progress between them, still never exceed one episode —
+# but any real progress resets the clock honestly. Both bounded lanes (brain-unavailable
+# defer, owed-chunks deadline) measure the SAME thing: how long since this document
+# last demonstrably moved.
+_DOC_BRAIN_DEFER_MAX_AGE = os.getenv("DOC_BRAIN_DEFER_MAX_AGE", "30 days")
+try:
+    _DOC_BRAIN_DEFER_MAX_AGE_S = _parse_interval_env(_DOC_BRAIN_DEFER_MAX_AGE)
+except ValueError as _iv:
+    raise RuntimeError(
+        f"DOC_BRAIN_DEFER_MAX_AGE={_DOC_BRAIN_DEFER_MAX_AGE!r} is not a parseable "
+        f"<N> <unit> interval (e.g. '30 days') — refusing to guess a document-lifetime bound"
+    ) from _iv
+
+# The zombie quarantine's SECOND key (see the two-key rationale at
+# _DOC_DRAIN_HARD_CEILING above): a CONTINUOUS unproductive episode must be at least
+# this old before the count key may terminalize. Sized between the outage classes
+# (largest observed short class ~21 min; pacing window 24h) and the 30-day wall.
+_DOC_DRAIN_ZOMBIE_MIN_AGE = os.getenv("DOC_DRAIN_ZOMBIE_MIN_AGE", "24 hours")
+try:
+    _DOC_DRAIN_ZOMBIE_MIN_AGE_S = _parse_interval_env(_DOC_DRAIN_ZOMBIE_MIN_AGE)
+except ValueError as _zage_err:
+    raise RuntimeError(
+        f"DOC_DRAIN_ZOMBIE_MIN_AGE={_DOC_DRAIN_ZOMBIE_MIN_AGE!r} is not a parseable "
+        f"<N> <unit> interval (e.g. '24 hours') — refusing to guess a zombie "
+        f"episode-age floor"
+    ) from _zage_err
+
+# How long a 'processing' claim may be held before another worker may RECLAIM it.
+# Must comfortably exceed the worst-case drain of one document (chunks / concurrency ×
+# per-chunk timeout) so a healthy slow document is never stolen mid-flight; 30 minutes is
+# ~10x the observed worst case for a 200-chunk segment. Env-tunable, never hardcoded inline.
+_DOC_CLAIM_LEASE = os.getenv("DOC_CLAIM_LEASE", "30 minutes")
+
+# === RATE_DEFERRED RETRY BACKOFF (BUG-005, the wedge mechanism itself) =================
+# When a document is re-pended because the brain said rate_deferred (the tenant's OWN
+# daily/RPM budget refused the call), the re-pend used to be immediately claimable — so
+# on a 4s tick the drain re-claimed it, burned a full harvest-turn timeout ladder
+# (measured ~4 minutes of wall per chunk against a 40 RPM budget on prod 2026-10-20),
+# got rate_deferred again, and re-pended: the retry ladder itself consumed the budget
+# that would have served the next window. Retrying a SELF-INFLICTED pace sooner only
+# starves the budget further, so the re-pend now stamps a backoff and the claim refuses
+# pending rows younger than it.
+#
+# THE STAMP RIDES `documents.started_at` — no migration, by design. On a PENDING row
+# started_at has exactly one prior meaning (NULL: "never claimed"; the reclaim predicate
+# reads it only under status='processing'), so "pending + started_at=<past timestamp>"
+# is unambiguous new state: not claimable before this instant. It self-expires by
+# comparison alone — nothing has to clear it, and an operator's manual
+# `SET status='pending'` (the doc-#10 flip) leaves a stale started_at and is therefore
+# claimable immediately, which is what an explicit human flip means.
+# 0 disables the backoff (every stamp is instantly older than a zero-second window).
+_DOC_RETRY_BACKOFF_S_RAW = os.getenv("DOC_RETRY_BACKOFF_SECONDS", "60")
+try:
+    _DOC_RETRY_BACKOFF_S = float(_DOC_RETRY_BACKOFF_S_RAW)
+    if _DOC_RETRY_BACKOFF_S < 0:
+        raise ValueError("negative")
+except ValueError as _iv:
+    raise RuntimeError(
+        f"DOC_RETRY_BACKOFF_SECONDS={_DOC_RETRY_BACKOFF_S_RAW!r} is not a non-negative "
+        f"number of seconds — refusing to guess a retry cadence"
+    ) from _iv
+
+# HTTP timeout for one doc chunk's /extract/rewrite call. Must sit ABOVE the backend's own
+# worst case for a single chunk (REFRAME + retrying EXTRACT sub-chunks + post-passes), or a
+# healthy-but-slow chunk is aborted client-side and recorded as a failure. Kept well under the
+# claim lease so a stuck chunk still surfaces long before the document is reclaimed.
+_DOC_CHUNK_HTTP_TIMEOUT = float(os.getenv("DOC_CHUNK_HTTP_TIMEOUT", "180"))
+
+# HTTP timeout for one doc chunk's /ingest call. SAME RULE AS ABOVE, and it was violated:
+# this was a bare `timeout=30.0` literal at both /ingest call sites while the endpoint's own
+# worst case is far higher — /ingest runs the WGM gate, entity resolution, the occurrence
+# classifier (an LLM op whose own budget is 45s) and the L4 build-out, all under the
+# document lane's own chunk concurrency.
+#
+# MEASURED 2026-07-31 (DOCDRAIN, seat 8162c435, doc_id=9, two chunks): chunk 1 answered
+# inside the window and reported committed=4; chunk 0's POST /ingest was aborted CLIENT-SIDE
+# at 30s and the chunk was recorded failed — yet its six facts (fraggle/instance_of/beagle,
+# diane/sibling_of, lives_in/toronto, works_for/shopify, …) landed in `facts` 30s later.
+# So the work SUCCEEDED and we recorded a failure: facts_committed under-counted 4 vs 10 and
+# the document terminated 'partial' (a TERMINAL status) with every fact actually in memory.
+# A client timeout below the server's worst case does not prevent loss — it manufactures a
+# phantom one and poisons the accounting the whole lane is judged by.
+# Env-tunable, never a bare literal.
+_DOC_INGEST_HTTP_TIMEOUT = float(os.getenv("DOC_INGEST_HTTP_TIMEOUT", "180"))
+
+# Cheap liveness probe of the BACKEND (not the brain) before a document is claimed.
+# See _backend_is_reachable / DOC_BACKEND_READY_PROBE below.
+_DOC_BACKEND_PROBE_TIMEOUT = float(os.getenv("DOC_BACKEND_PROBE_TIMEOUT", "5"))
+
+# === FLAG: DOC_BACKEND_READY_PROBE (DOCDRAIN, default ON) =====================
+# ON  → the drain probes GET {backend}/health before claiming ANY document, and skips the
+#       whole tenant for this cycle when the backend is not answering. Nothing is claimed,
+#       no `attempts` are burned, no chunk is recorded failed: the documents stay 'pending'
+#       and are drained on a later tick.
+# OFF → legacy: claim first, discover the outage one chunk at a time.
+#
+# WHY IT DEFAULTS ON — this is the single biggest silent-loss source measured in this lane.
+# The re_embedder runs INSIDE the API container, so on every deploy/restart its poll loop
+# comes up BEFORE uvicorn is serving. Measured 2026-07-31 over one 6h window: 1153 of 1166
+# chunk failures were `ConnectError: [Errno 111] Connection refused` — i.e. 99% of all
+# document-lane chunk loss was the worker talking to its own not-yet-listening backend.
+# Live proof of the damage (seat 2295c6ce, docs 1 and 2): claimed at 01:03:16.9, finalized
+# 'partial' at 01:03:18.4 — 400 chunks "processed" in 1.5 SECONDS, chunks_failed=400,
+# facts_committed=0, status TERMINAL. Two whole documents destroyed by a container restart,
+# with a healthy-looking API and one log line. Skipping a cycle costs one poll interval;
+# not skipping costs the user's corpus.
+DOC_BACKEND_READY_PROBE = os.getenv(
+    "DOC_BACKEND_READY_PROBE", "true").strip().lower() not in ("false", "0", "no", "off")
+
+# === STARTUP GATE for the standalone doc-drain daemon (BUG-005, symptom b) =============
+# The daemon is started by main() BEFORE the API's uvicorn server binds its port, so on
+# every container restart there is a window (measured ~60s on prod 2026-10-20) during
+# which the per-claim DOC_BACKEND_READY_PROBE correctly refuses to claim — but does so
+# once per tenant per 4s tick, spamming document_drain_backend_unreachable WARN lines
+# across the whole startup window. The probe already prevents the LOSS; the gate removes
+# the SPAM and makes the intent legible: do not even ENTER the tick loop until the
+# backend has answered /health once, or until this bounded budget expires.
+#
+# BOUNDED, NEVER FOREVER — a hang at boot would be strictly worse than the spam: the
+# drain would silently never start and every document would sit pending with no log
+# line at all (the exact silent-strand class this lane keeps re-learning). On expiry the
+# daemon proceeds ANYWAY with one loud CRIT line; the per-claim probe (default ON) still
+# guards every cycle, so expiring costs nothing but the log line.
+_DOC_DRAIN_STARTUP_GATE_TIMEOUT_S = os.getenv("DOC_DRAIN_STARTUP_GATE_TIMEOUT", "120")
+try:
+    _DOC_DRAIN_STARTUP_GATE_TIMEOUT = float(_DOC_DRAIN_STARTUP_GATE_TIMEOUT_S)
+except ValueError as _iv:
+    raise RuntimeError(
+        f"DOC_DRAIN_STARTUP_GATE_TIMEOUT={_DOC_DRAIN_STARTUP_GATE_TIMEOUT_S!r} is not a "
+        f"number of seconds — refusing to guess a boot-hang bound"
+    ) from _iv
+# Fixed re-probe cadence while waiting (not env-tunable: it only shapes how fast the gate
+# NOTICES a healthy backend, 2s is far under the observed ~60s bind window, and every
+# added knob is a second thing to misconfigure on a box that is already down).
+_DOC_DRAIN_STARTUP_GATE_POLL_S = 2.0
+
+
+# Bound to the REAL exception classes at import, not looked up through the module attribute
+# on every call: the drain's own test doubles replace `emb.httpx` wholesale, and a classifier
+# that resolves its types through that attribute would raise AttributeError inside the very
+# error path it exists to classify. The types themselves never change at runtime.
+_UNREACHABLE_EXC_TYPES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_HTTPX_ERROR_TYPE = httpx.HTTPError
+
+
+def _is_backend_unreachable(exc: BaseException) -> bool:
+    """Did this exception mean WE NEVER REACHED THE BACKEND AT ALL?
+
+    The distinction is the whole ballgame for this lane's failure accounting:
+
+      • connect-level (refused / DNS / connect timeout / pool exhaustion) → the request was
+        never delivered. NOTHING was read, so this is not a property of the chunk — the same
+        chunk will fail identically for every OTHER chunk in the document. Treating it as a
+        per-chunk failure burns the entire document in one pass and terminates it 'partial'.
+        The correct response is the deferral this lane already implements (Nygard,
+        *Release It!* 2nd ed., "Circuit Breaker": while the remote end is unavailable the
+        work is RETRIED after it recovers, not discarded).
+
+      • read-level (the backend accepted the request and then didn't answer in time) → the
+        request WAS delivered and may well have completed server-side. That stays a
+        chunk-scoped, uncertain outcome and is handled where it is raised.
+
+    Deterministic type/errno inspection — no string sniffing of a message that can change."""
+    if isinstance(exc, _UNREACHABLE_EXC_TYPES):
+        return True
+    # A bare OSError can surface when the transport fails below httpx (e.g. a socket refused
+    # while the event loop is tearing down). ECONNREFUSED/EHOSTUNREACH/ENETUNREACH/ENOTCONN.
+    if isinstance(exc, (ConnectionRefusedError, ConnectionError)) and not isinstance(
+            exc, _HTTPX_ERROR_TYPE):
+        return True
+    return False
+
+
+# Backend states the pre-claim probe can distinguish. A boolean cannot express the difference
+# between "the process is gone" and "the process is alive but its event loop is blocked", and on
+# 2026-07-31 that conflation is exactly what let a production stall run 13 days unnoticed: DOWN and
+# STALLED looked identical in the logs.
+BACKEND_DOWN = "down"        # connect refused/unroutable -> nothing was delivered; defer is right
+BACKEND_STALLED = "stalled"  # TCP connect SUCCEEDED, HTTP read timed out -> alive, loop blocked
+BACKEND_READY = "ready"
+
+
+def _backend_state(backend_url: str) -> str:
+    """Three-state probe: DOWN / STALLED / READY. Deterministic, type-based, no string sniffing.
+
+    WHY THREE STATES. The first cut of this returned a bool and caught `except Exception: return
+    False`, collapsing connect-refused with read-timeout — even though `_is_backend_unreachable`
+    THREE FUNCTIONS ABOVE draws exactly that distinction on a cited Nygard rationale. The probe did
+    not use its own sibling. Measured consequence on prod: `/health` answers in 0.001s during ~67%
+    of minutes and stalls for the rest (32.4% of minutes had ZERO health completions; queued probes
+    released 42-at-once). A boolean read that as "unreachable" and could not say why.
+
+    A TCP CONNECT THAT SUCCEEDS WHILE THE HTTP READ TIMES OUT IS POSITIVE PROOF the process is alive
+    and its event loop is blocked — the cheapest exact signal we have for that condition, and one a
+    boolean structurally cannot carry."""
+    try:
+        # Split the budget so the two failures are distinguishable at all: a short connect proves
+        # reachability; the read is what a blocked loop starves.
+        r = httpx.get(f"{backend_url}/health",
+                      timeout=httpx.Timeout(connect=2.0, read=_DOC_BACKEND_PROBE_TIMEOUT,
+                                            write=2.0, pool=2.0))
+        return BACKEND_READY if 200 <= r.status_code < 300 else BACKEND_STALLED
+    except Exception as exc:  # noqa: BLE001 — classified below, never swallowed silently
+        if _is_backend_unreachable(exc):
+            return BACKEND_DOWN
+        # Connected, then no answer in time: alive but not serving.
+        if isinstance(exc, (httpx.ReadTimeout, httpx.PoolTimeout)):
+            # `_doc_log_crit(event, **fields)` takes KEYWORD fields only — this call used to pass
+            # the message POSITIONALLY and raised TypeError on the very stall it was reporting
+            # (gauntlet ingest-replay-loop-deadlock, 2026-09-15): the loud path was itself broken,
+            # so a blocked backend loop surfaced as a probe crash, not a CRIT line. Pinned by
+            # tests/test_doc_log_crit_loud_path.py.
+            _doc_log_crit("doc_drain.backend_stalled",
+                          probe_timeout_s=_DOC_BACKEND_PROBE_TIMEOUT,
+                          note="backend accepted the connection but did not answer in time "
+                               "- event loop likely blocked; deferring rather than burning chunks")
+            return BACKEND_STALLED
+        return BACKEND_DOWN
+
+
+def _backend_is_reachable(backend_url: str) -> bool:
+    """Boolean wrapper kept for existing call sites: READY is reachable, DOWN/STALLED are not.
+
+    Deferring on STALLED is CORRECT — the re_embedder's own 60s timeouts during those windows prove
+    the backend genuinely cannot serve then. ⚠️ KNOWN LIMIT, do not oversell this gate: the probe is
+    a POINT-IN-TIME sample and measured stalls run up to ~21 minutes, far past the chunk timeout, so
+    a document claimed in a healthy window can still burn chunks mid-flight. This mitigates; it does
+    not make the doc lane safe against a blocked loop."""
+    return _backend_state(backend_url) == BACKEND_READY
+
+
+def _doc_drain_startup_gate(backend_url: str) -> None:
+    """Block the standalone doc-drain daemon's FIRST tick until the backend answers
+    /health once — or until the bounded budget expires, then proceed anyway (BUG-005
+    symptom b). NEVER hangs: an unstarted drain is silent loss, which is strictly worse
+    than the startup log spam this gate exists to remove.
+
+    Runs BEFORE the tick loop, so the healthy-boot case costs exactly one INFO line and
+    the broken-backend case costs one CRIT — instead of a `document_drain_backend_unreachable`
+    WARN per tenant per 4s tick for the whole ~60s uvicorn-bind window. Skipped entirely
+    when DOC_BACKEND_READY_PROBE is OFF: an operator who disabled the probe asked for
+    claim-anyway semantics, and a gate keyed on the same probe must not silently
+    reinstate them."""
+    if not DOC_BACKEND_READY_PROBE:
+        return
+    _t0 = time.monotonic()
+    _deadline = _t0 + _DOC_DRAIN_STARTUP_GATE_TIMEOUT
+    while True:
+        if _backend_state(backend_url) == BACKEND_READY:
+            log.info(f"re_embedder.doc_drain_startup_gate_passed "
+                     f"waited_s={time.monotonic() - _t0:.1f} backend={backend_url}")
+            return
+        if time.monotonic() >= _deadline:
+            _doc_log_crit(
+                "re_embedder.doc_drain_startup_gate_expired",
+                waited_s=round(time.monotonic() - _t0, 1),
+                timeout_s=_DOC_DRAIN_STARTUP_GATE_TIMEOUT,
+                backend=backend_url,
+                note="proceeding anyway — the per-claim DOC_BACKEND_READY_PROBE still "
+                     "guards every cycle; never hang the drain at boot")
+            return
+        time.sleep(_DOC_DRAIN_STARTUP_GATE_POLL_S)
+
+
+def _backend_is_reachable_legacy(backend_url: str) -> bool:
+    """Superseded by _backend_state; retained only so the old shape is greppable."""
+    try:
+        r = httpx.get(f"{backend_url}/health", timeout=_DOC_BACKEND_PROBE_TIMEOUT)
+        return 200 <= r.status_code < 300
+    except Exception:
+        return False
+
+
+_BH_SINK_MISSING = False
+
+
+def _bh_note_doc_chunks(user_id: str, total: int, failed: int,
+                        doc_id: object = None) -> None:
+    """Tee the document lane's outcome to the per-seat health surfaces. Never raises.
+
+    TWO SINKS, two questions — the same split brain_health draws everywhere:
+      • ``record()``      → rolling counts → ``chunk_failure_rate`` (trend: "how much of my
+        corpus is landing"). This was one of the two slots brain_health could not instrument
+        because this file was out of its scope.
+      • ``probe_event()`` → the alarm stream (state: "is it broken right now"), last write
+        wins. ⚠️ THE CLEAN CASE MUST EMIT TOO — ``outcome=ok`` on a fully-read document is what
+        lets a recovered lane go quiet without a TTL or a decay job.
+    """
+    global _BH_SINK_MISSING
+    if _BH_SINK_MISSING:
+        return
+    try:
+        from saas import brain_health
+        for _ in range(max(0, int(total))):
+            brain_health.record(user_id, brain_health.M_DOC_CHUNK, operation="DOC")
+        for _ in range(max(0, int(failed))):
+            brain_health.record(user_id, brain_health.M_DOC_CHUNK_FAILED, operation="DOC")
+        brain_health.probe_event(
+            user_id, brain_health.LANE_DOC_CHUNK,
+            brain_health.OUTCOME_FAIL if failed > 0 else brain_health.OUTCOME_OK,
+            operation="DOC",
+            reason=("chunks_unread" if failed > 0 else None),
+            detail=(f"{failed} of {total} sections of document {doc_id} could not be read"
+                    if failed > 0 else None))
+    except ImportError:
+        _BH_SINK_MISSING = True          # open-core deployment, no saas/ — stop trying
+    except Exception:  # noqa: BLE001 — an observer must never break its host
+        pass
+
+
+def _doc_log_crit(event: str, **fields) -> None:
+    """FAIL LOUD for the document lane — a CRITICAL, greppable one-liner.
+
+    `log` here is a STDLIB logger (not structlog), so src.api.logging_config.log_crit's
+    kwargs-passthrough shape would raise TypeError; this renders the same structured
+    key=value payload at CRITICAL through the logger the rest of this module uses."""
+    _payload = " ".join(f"{k}={v}" for k, v in fields.items())
+    log.critical(f"CRITICAL {event} log_level=CRIT {_payload}")
+
+
+class DocumentBrainUnavailable(_errors.PublicRefusal, RuntimeError):
+    """The tenant's extraction brain REJECTED the call (breaker open / endpoint dead).
+
+    A RuntimeError subclass ON PURPOSE: the document worker already treats RuntimeError as
+    "defer this whole document back to pending and stop the cycle" (the backend-freeze
+    path), which is exactly the correct response to a tripped breaker — Nygard,
+    *Release It!* (2nd ed.), "Circuit Breaker": while the breaker is open the caller must
+    take the fallback path, and work must be retried after the breaker's reset timeout, not
+    discarded. Reusing that existing deferral is deliberate: there is exactly ONE
+    retry/deferral mechanism in this lane, not a second hand-rolled one."""
+
+
+class DocumentChunkExtractionFailed(_errors.PublicRefusal):
+    """This ONE chunk's extraction failed (transport error / degraded extractor response).
+
+    Distinct from DocumentBrainUnavailable: the brain is up, this chunk did not come back.
+    The chunk is counted failed (→ terminal status 'partial'), and its verbatim text stays
+    in documents.chunks AND the episodic log for a later re-mine. It is never counted as a
+    successfully-read chunk with no facts.
+
+    `partial_edges` carries any edges that DID extract before the failure, so the caller can
+    still commit them: dropping successfully-extracted facts in order to report a failure
+    would be a second silent loss. Empty unless the extractor answered in part."""
+
+    partial_edges: list = []
+
+# ── Assistant-turn capture: THE INPUT LANE IS THE USER'S ──────────────────────
+# When a document is a CONVERSATION transcript, its turns are role-prefixed
+# ("user: ...", "assistant: ..."). BOTH the user's turns and the assistant's turns
+# are the user's grounded session (owner-ratified correction of the earlier R3
+# firewall): assistant content is user_stated too, correctable like any user fact.
+# When this flag is ON, the document worker PARTITIONS each chunk by speaker role
+# (so the assistant lane still inherits the shared date header for grounding) and
+# ingests BOTH lanes as user_stated:
+#   • user / unprefixed / header lines  → source="mcp"       → user_stated
+#   • assistant lines                   → source="assistant" → user_stated (router
+#     maps source="assistant" → user_stated, equal authority to the user's turns)
+# When OFF (default) the chunk is ingested WHOLE with source="mcp" exactly as before
+# (byte-identical legacy behavior; the measurement run flips this ON). A plain
+# (non-conversational) document has no "assistant:" lines, so the partition is a
+# no-op and its whole text still rides the user_stated lane whether the flag is on
+# or off. Deterministic role split — no LLM, subject-agnostic. The TRUST FIREWALL
+# (_decide_supersede_or_coexist) is UNCHANGED and still guards the ENGINE'S OWN
+# growth (llm_learned/llm_inferred) — NOT chat content — from overriding user facts.
+INGEST_ASSISTANT_TURNS = os.getenv(
+    "INGEST_ASSISTANT_TURNS", "false").strip().lower() not in ("false", "0", "no", "off")
+
+# The two structural line shapes — a turn line ("user: …"/"assistant: …") and a bracketed
+# header line ("[Date: 2023-05-01]"). Defined ONCE in src/ingest/document_structure.py and
+# imported here so the worker and the MCP chunker cannot drift apart (they previously held
+# private copies of the same two regexes). Header lines are shared context, prepended to
+# BOTH sub-extractions so assistant facts get dated too.
+_ROLE_LINE_RE = _docstruct.ROLE_LINE_RE
+_DOC_HEADER_RE = _docstruct.DOC_HEADER_RE
+
+# ── DOC LANE: a lane that carries ONLY structural scaffolding is not text to extract ──────────
+#
+# `_partition_chunk_by_role` prepends the SHARED header lines ("[Date: 2023/05/22 (Mon) 18:21]")
+# to BOTH lanes so assistant facts get dated too. For a chunk that happens to contain lines from
+# only ONE speaker — which is the COMMON case, because the chunker splits on size, not on turn
+# boundaries — the other lane comes back as the bare header and nothing else.
+#
+# MEASURED on the product's own chunks (2026-07-31, real 200-chunk document, seat 04658f0e):
+#   381 non-empty extraction lanes, of which **172 (45.1%) were header-only** — the literal
+#   30-character string "[Date: 2023/05/22 (Mon) 18:21]".
+# Every one of those 172 lanes then: called /harvest-spans (0 edges, by construction), logged
+# `document_chunk_spine_empty`, and fell through to a full /extract/rewrite LLM call on a bare
+# date. That is ~45% of this lane's extractor traffic spent on text containing no assertion —
+# and under DOC_CHUNK_FAILURE_LOUD a timeout on one of those pointless calls is charged to the
+# CHUNK, so a content-free lane could fail a chunk that had nothing to fail at.
+#
+# Nothing is lost by skipping it: the header is CONTEXT, and it is still prepended to the lane
+# that does carry content (see `_partition_chunk_by_role`), so the date still reaches the facts.
+# Deterministic (`DOC_HEADER_RE`, a whole line inside square brackets), subject-agnostic, no LLM.
+# Rollback: DOC_CHUNK_SKIP_CONTENTLESS=false restores the byte-for-byte legacy behaviour.
+DOC_CHUNK_SKIP_CONTENTLESS = os.getenv(
+    "DOC_CHUNK_SKIP_CONTENTLESS", "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+# CITE-DENSE SKIP (litmus fix L4, 2026-11-03): a chunk of a reference section (or an
+# affiliation front-matter block) has NO assertions in it - the extraction ladder over
+# such a chunk yields citation junk or a timed-out nothing, and on prod 179/254 chunks
+# burned the full ladder this way (70% of one document's wall time). The verdict is the
+# CORPUS-MEASURED pure gate in src/ingest/document_structure.py (175/534 arXiv chunks
+# flagged, 0/137 controls, measured before shipping - the 60%-false-veto precedent
+# demands a measured gate, and this one measured zero false vetoes). Skipping is a SKIP,
+# never a deletion: the verbatim text is retained (episodic append above) and the R2
+# re-mine lane can still re-read it under a grown ontology. Rollback: DOC_CITE_DENSE_SKIP=false.
+DOC_CITE_DENSE_SKIP = os.getenv("DOC_CITE_DENSE_SKIP", "true").strip().lower() \
+    not in ("false", "0", "no")
+from src.ingest.document_structure import citation_density_verdict as _citation_density_verdict
+from src.ingest.document_structure import _cite_env_int as _cite_env_int
+
+
+# L1 DETERMINISTIC-FIRST (litmus fix L2, 2026-11-03): when the tenant's brain is measured
+# SLOW right now (rolling p95 >= DOC_L1_BRAIN_P95_SKIP_MS, or its saved profile is already
+# local/slow), the chunk's edges are derived by the IN-PROCESS deterministic lane and
+# committed NOW; the LLM's richer read is DEFERRED to the R2 remine lane (which already
+# exists and re-reads with headroom + a grown ontology) instead of spending the 40-RPM
+# budget on a 28.5s-p95 brain. Measured shape on prod: glm-4.5-air p95=28.5s vs the
+# nemotron candidate p95=1.26s — a slow brain turned every chunk into a pacing victim.
+# A deterministic ZERO (or a layer-down None) falls through to today's ladder: the skip
+# lane only ever REPLACES a brain read it believes would be slow, never a capture it
+# believes is impossible. Rollback: DOC_L1_DETERMINISTIC_FIRST=false.
+DOC_L1_DETERMINISTIC_FIRST = os.getenv("DOC_L1_DETERMINISTIC_FIRST", "true").strip().lower() \
+    not in ("false", "0", "no")
+_DOC_L1_BRAIN_P95_SKIP_MS = int(os.getenv("DOC_L1_BRAIN_P95_SKIP_MS", "8000"))
+
+
+# DOC-LANE SCHEMA-GUIDED SECOND PASS (DESIGN-document-extraction-sota.md §4/§8.2 — the
+# EDC refinement): after a chunk's primary extraction returns edges, the worker makes AT
+# MOST ONE bounded re-ask per chunk against the backend door /extract/schema-second-pass.
+# The door consults the seat's OWN ontology (per-tenant rel_types overlay + taxonomies,
+# Postgres metadata — never GLiNER2 label phrasing, Pitfall 11) and re-asks for MISSED
+# TYPED relations using ONLY that candidate menu. EDC measured +4.9 F1 for the
+# schema-guided refinement (~85% of the gain from the schema, not the re-read); it
+# saturates at one pass, so this is ONE call, never a loop. The conversational spine is
+# untouched: this code runs ONLY in the document worker. Skips: the L1
+# deterministic-first lane (its LLM read is deliberately DEFERRED to the R2 remine — an
+# extra LLM call here would violate that contract) and any chunk with zero pass-1 edges
+# (the ladder's own rewrite fallback already owns that shape). Fail-safe: ANY failure
+# (transport, status, timeout) keeps the pass-1 edges unaided — the enrichment can never
+# fail a chunk. Rollback: DOC_SCHEMA_SECOND_PASS=false (default ON per the design
+# brief; measured both arms in benchmarks/doc-ingest-litmus/schema_pass_ab.py).
+DOC_SCHEMA_SECOND_PASS = os.getenv("DOC_SCHEMA_SECOND_PASS", "true").strip().lower() not in ("false", "0", "no")
+
+
+def _schema_second_pass_edges(chunk_text: str, user_id: str, backend_url: str,
+                              prior_edges: list) -> list:
+    """ONE bounded schema-guided second-pass re-ask for this chunk (or [] on any failure).
+
+    Rides the DOC LANE only: called from _extract_and_ingest after the chunk's primary
+    extraction produced edges. The door does the schema selection, the LLM re-ask and the
+    validation (menu-only rel_types, junk-ruler shape rules, dedupe vs prior); the worker
+    only merges. A non-success door status is treated like any other enrichment failure:
+    logged loud, edges dropped, the chunk proceeds with pass-1 edges unaided."""
+    try:
+        _t0 = time.monotonic()
+        resp = httpx.post(
+            backend_url.rstrip("/") + "/extract/schema-second-pass",
+            json={"text": chunk_text, "user_id": user_id, "prior_edges": prior_edges},
+            headers=_BACKEND_LANE_HEADERS,
+            timeout=_DOC_CHUNK_HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        if status not in (None, "success"):
+            log.warning("re_embedder.document_schema_second_pass_refused "
+                        "user_id=%s status=%s", user_id[:8], status)
+            return []
+        extra = [e for e in (data.get("edges", []) or [])
+                 if not e.get("low_confidence", False)]
+        log.info("re_embedder.document_schema_second_pass user_id=%s prior=%s added=%s "
+                 "candidates=%s wall_ms=%s", user_id[:8], len(prior_edges), len(extra),
+                 len(data.get("schema_candidates") or []),
+                 int((time.monotonic() - _t0) * 1000))
+        return extra
+    except Exception as e:  # noqa: BLE001 — the enrichment never fails the chunk
+        log.warning("re_embedder.document_schema_second_pass_failed "
+                    "user_id=%s: %s", user_id[:8], e)
+        return []
+
+
+def _brain_lane_slow(user_id: str):
+    """WHY the tenant brain is considered slow right now (a string), or None.
+
+    Two independent signals, checked in order: the brain row's SAVED latency profile
+    (hosted-fast/local/slow — a persisted verdict needs no fresh samples), then the
+    in-process rolling window's p95 (brain_autocalibrate.rolling_p95_for; requires
+    _MIN_SAMPLES so an under-observed brain carries no verdict). None means no signal —
+    the caller keeps today's brain-first ladder. Never raises.
+    """
+    try:
+        from saas.llm_context import current_llm_config
+        cfg = current_llm_config() or {}
+    except Exception:  # noqa: BLE001 - no config = no signal
+        cfg = {}
+    profile = str(cfg.get("latency_profile")
+                  or cfg.get("brain_latency_profile") or "").strip().lower()
+    if profile in ("local", "slow"):
+        return f"profile:{profile}"
+    try:
+        from saas import brain_autocalibrate as _ba
+        p95 = _ba.rolling_p95_for(user_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if p95 is not None and p95 >= _DOC_L1_BRAIN_P95_SKIP_MS:
+        return f"p95:{p95}ms>=skipt:{_DOC_L1_BRAIN_P95_SKIP_MS}ms"
+    return None
+
+# DOC LANE: pin the spine's DETERMINISTIC segmenter for a document chunk (per-REQUEST, via
+# RewriteRequest.deterministic_segmentation) instead of the LLM atomizer.
+#
+# WHY the shape boundary is real: `reframe_to_atomic` is prompted for "one chat message" and
+# budgeted as one — LLMMaxTokens REFRAME=256, LLMTimeouts REFRAME=6.0s. A document chunk is
+# multi-sentence expository prose, 300-1500 chars, and its atom JSON does not fit in 256 tokens.
+# Document prose is ALSO the better fit for the deterministic decomposer: it is well-formed and
+# punctuated, with none of the disfluency the atomizer exists to absorb.
+# Rollback: DOC_CHUNK_SPINE_DETSEG=false → the field is never sent → the backend's process-wide
+# SPINE_DETERMINISTIC_SEGMENTATION decides, exactly as today.
+DOC_CHUNK_SPINE_DETSEG = os.getenv(
+    "DOC_CHUNK_SPINE_DETSEG", "true").strip().lower() not in ("false", "0", "no", "off")
+
+# DOC LANE: split the spaCy PARSE model for document chunks (per-REQUEST, via
+# RewriteRequest.parse_model on /harvest-spans). EMPTY/ABSENT (the default) -> the field is
+# never sent -> this lane parses with the same model as conversation: byte-identical legacy.
+# Set DOC_SPACY_MODEL=en_core_web_trf (the wheel is BAKED into the image additively; the
+# Dockerfile build fails loudly if it is not) -> every /harvest-spans call from THIS lane
+# pins the doc-lane parse model; the backend validates it against the env, lazy-loads the
+# second pipeline ONCE and caches it. Conversation turns NEVER send the field, so the
+# conversational spine stays on SPACY_MODEL exactly as today. GLiNER2 entity typing is
+# untouched (only the spaCy parse model splits). WHY a per-request field and not a process
+# flag: the SAME backend serves both lanes — the split belongs to the SHAPE of the text
+# (dense document prose), not to the process.
+# Rollout: DOC_SPACY_MODEL=en_core_web_trf (or any baked model). Rollback: unset/empty.
+DOC_SPACY_MODEL = (os.getenv("DOC_SPACY_MODEL") or "").strip()
+
+# BUG-04 (adversarial bench 20261024): DOC_CHUNK_DETERMINISTIC_RESCUE — the spine
+# ALWAYS runs, the brain enriches on top (the R9 owner ruling, applied to the
+# CHUNK drain). When the brain is merely PACED (a rate_deferred harvest envelope
+# — the backend's degrade-withhold returns edges=[] and DISCARDS the 11-14
+# deterministic edges it already derived per chunk) or the extract ladder died
+# to a transport failure (ReadTimeout against a slow NIM brain), the chunk's
+# deterministic extraction runs IN-PROCESS (spine + GLiNER2, zero brain) and its
+# edges return through the normal path so the caller commits them via /ingest.
+# Only a ZERO-edge deterministic pass on real content keeps today's semantics
+# (defer/fail — the chunk was not fully read and must not be counted empty).
+# Rollback: DOC_CHUNK_DETERMINISTIC_RESCUE=false restores the byte-for-byte
+# brain-gated behaviour.
+DOC_CHUNK_DETERMINISTIC_RESCUE = os.getenv(
+    "DOC_CHUNK_DETERMINISTIC_RESCUE", "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+def _deterministic_rescue_edges(chunk: str, user_id: str, cause: str):
+    """BUG-04: the in-process deterministic rescue for ONE brain-paced chunk.
+
+    Returns the rescued edge list (truthy) when the deterministic layer derived
+    ≥1 edge from the chunk, else None (caller keeps today's defer/fail
+    semantics). Fail-safe: flag off, layer down (None), zero edges ([]), or any
+    fault → None — a rescue NEVER masks the underlying brain verdict, and never
+    raises. The rescued edges commit through the SAME /ingest door the caller
+    already uses (source="document" → staged B, WGM gate); the brain's richer
+    re-read arrives later via the R2 remine lane when headroom exists."""
+    if not DOC_CHUNK_DETERMINISTIC_RESCUE:
+        return None
+    try:
+        edges = _deterministic_chunk_edges(chunk)
+    except Exception as e:  # noqa: BLE001 — a rescue fault keeps the brain verdict
+        log.debug(f"re_embedder.document_chunk_rescue_failed user_id={user_id[:8]} "
+                  f"cause={cause}: {type(e).__name__}: {str(e)[:120]}")
+        return None
+    if not edges:
+        return None
+    log.info(
+        f"re_embedder.document_chunk_deterministic_rescue user_id={user_id[:8]} "
+        f"cause={cause} edges={len(edges)} "
+        "(in-process spine+GLiNER2; committed via the normal /ingest door — "
+        "brain enrichment later via the R2 remine lane)"
+    )
+    return edges
+
+# === FLAG: DOC_CHUNK_QUEUE (PARALLEL, default OFF) ============================
+# ON  → a document's chunks become CLAIMED WORK ITEMS on a Redis queue
+#       (src/ingest/chunk_queue.py) instead of a fire-and-wait ThreadPoolExecutor fan-out,
+#       and three things become true that are not true today:
+#         • a crashed/overrunning worker's chunk RETURNS TO THE QUEUE (visibility-timeout
+#           lease + reap) instead of vanishing with the worker;
+#         • a chunk's terminal state is RECORDED per chunk (documents.chunk_state,
+#           migration 205), so a reclaim re-runs ONLY what is still owed — and a failed
+#           chunk is RE-MINABLE instead of burned into a terminal 'partial';
+#         • concurrency is resolved PER TENANT from that tenant's own measured endpoint
+#           latency + rate limit, not from one global constant.
+# OFF → byte-identical legacy behaviour: the ThreadPoolExecutor path below, one global
+#       _DOC_CHUNK_CONCURRENCY, chunk_state never read or written.
+#
+# WHY IT IS OFF BY DEFAULT: this is a WRITE path, and the lane it accelerates is the first
+# thing a new account does. It ships dark and is turned on per-deploy after measurement.
+#
+# DEGRADATION IS NOT OPTIONAL: if Redis is unreachable the flag is a no-op — chunk_queue
+# .available() returns False and the legacy pool runs. A memory engine must never be harder
+# to run than the accelerator bolted to it.
+DOC_CHUNK_QUEUE = os.getenv(
+    "DOC_CHUNK_QUEUE", "false").strip().lower() not in ("false", "0", "no", "off")
+
+# === FLAG: DOC_TEXT_LANE_BACKPRESSURE (wound-map round 5, default ON) ===========
+# ON  → the legacy text-lane chunk drain runs under a PER-SEAT, PER-PASS chunk
+#       budget (DOC_SEAT_CHUNK_BUDGET, defaulting to the corpus uplift cap
+#       CORPUS_UPLIFT_QUEUE_CAP=200 — one number, one doctrine):
+#         • a document owing more chunks than the budget admits is drained in
+#           PASSES: at most `budget` chunks are scheduled per claim, the rest
+#           stay owed in the chunk_state ledger, and the document re-pends —
+#           DEFER, NEVER REFUSE (the same envelope as uplift_admission). The
+#           wound this kills: a ~1MB ingest_document → ~3.6k chunks ALL
+#           enqueued/claimed at once, every one a brain extraction call on the
+#           event loop that serves live traffic (measured: healthcheck timeouts,
+#           doc_drain.backend_stalled, container restart — the clog litmus).
+#         • a HARD retry ceiling (DOC_TEXT_LANE_RETRY_CEILING, default 6
+#           UNPRODUCTIVE passes) terminates the re-pend loop with an honest
+#           terminal status — the 180s-timeout × fallback × re-pend tail can no
+#           longer run for the defer clock's full 30 days. A pass that reduces
+#           the owed count is PROGRESS and never counts toward the ceiling.
+# OFF → byte-identical legacy behaviour: every owed chunk scheduled in one pass,
+#       no ceiling beyond the existing defer-clock/attempts bounds.
+# (c) CHUNK BATCHING — deliberately NOT taken: chunk identity is load-bearing on
+#     this lane (episodic turn_key doc:<id>:chunk:<idx>, chunk_state indices,
+#     POST /documents/retry re-owes BY INDEX); merging chunks into larger
+#     extraction units would break the ledger/retry contract and change capture
+#     shape. Not cheap, so per the brief it is skipped. Call-count reduction
+#     already comes from the measured skips (cite-dense: 179/254 chunks of one
+#     prod doc; contentless lanes: 45.1% of extraction lanes).
+DOC_TEXT_LANE_BACKPRESSURE = os.getenv(
+    "DOC_TEXT_LANE_BACKPRESSURE", "true").strip().lower() not in ("false", "0", "no", "off")
+
+# How many chunk results are collected before `documents.chunk_state` is flushed to Postgres.
+# Bounds the re-work a hard process loss can cost: at 8, a crash re-runs at most 8 already-done
+# chunks instead of the whole document. Written on the MAIN thread only (a psycopg2 connection
+# is not thread-safe — the pre-existing comment in _process_one_chunk says so, and it is right).
+_DOC_CHUNK_STATE_FLUSH = max(1, int(os.getenv("DOC_CHUNK_STATE_FLUSH", "8")))
+
+
+def _lane_has_no_content(text: str) -> bool:
+    """True iff every non-blank line of `text` is a bracketed structural header.
+
+    Deterministic and content-free by construction: it asks only whether a line is
+    scaffolding, never what the line says."""
+    for line in (text or "").splitlines():
+        if line.strip() and not _DOC_HEADER_RE.match(line):
+            return False
+    return True
+
+
+def _partition_chunk_by_role(chunk: str) -> tuple[str, str]:
+    """Split a role-prefixed transcript chunk into (user_text, assistant_text).
+
+    Deterministic, no LLM. Each line is bucketed by its speaker prefix:
+      • "assistant: X"           → assistant bucket (content X, prefix stripped)
+      • "user: X"                → user bucket
+      • "[Date: ...]" / headers  → SHARED context (prepended to both buckets)
+      • unprefixed / continuation → follows the CURRENT speaker (default: user)
+
+    A plain document with no "assistant:" prefix yields (whole_text, "") so the
+    caller's user lane is byte-identical to the legacy whole-chunk behavior.
+    Shared header lines are prepended to the assistant text only when there IS
+    assistant content, so temporal (event_date) grounding still applies to the
+    assistant facts. Returns ("", "") only for an empty/whitespace chunk.
+    """
+    shared: list[str] = []
+    user_lines: list[str] = []
+    asst_lines: list[str] = []
+    current = "user"  # unprefixed content defaults to the user lane
+    for raw in (chunk or "").splitlines():
+        m = _ROLE_LINE_RE.match(raw)
+        if m:
+            current = "assistant" if m.group(1).lower() == "assistant" else "user"
+            content = m.group(2)
+            (asst_lines if current == "assistant" else user_lines).append(content)
+        elif _DOC_HEADER_RE.match(raw):
+            # A header (date) resets the speaker context and is shared by both lanes.
+            shared.append(raw.strip())
+            current = "user"
+        else:
+            (asst_lines if current == "assistant" else user_lines).append(raw)
+    user_text = "\n".join(shared + user_lines).strip()
+    asst_text = "\n".join(shared + asst_lines).strip() if asst_lines else ""
+    return user_text, asst_text
+
+
+def _envelope_rate_deferred(data) -> bool:
+    """True when a degraded-extraction envelope says the brain was MERELY PACED.
+
+    BUG-005 typed signal. A rate_deferred non-answer means the limiter never put the
+    request on the wire: no retry ladder can serve this turn now, and burning one only
+    consumes the very budget that would serve the next turn. Detection is first-class on
+    the typed field the backend stamps (``llm_rate_deferred``, via the LLM non-answer
+    ledger), with the substring fallback over ``llm_first_unanswered_reason`` /
+    ``llm_unanswered_operations`` / ``error`` — the reason rides both bare and
+    ``OP:reason``-prefixed, and an OLDER backend without the typed field still says
+    ``REFRAME:rate_deferred`` (same precedent as server.py's ``_result_is_paced_not_answered``).
+    Fail-safe: anything unrecognised → False → today's ladder."""
+    if not isinstance(data, dict):
+        return False
+    if not (data.get("extraction_degraded")
+            or data.get("status") in ("extraction_degraded", "degraded")):
+        return False
+    if data.get("llm_rate_deferred"):
+        return True
+    _hay = " ".join((
+        str(data.get("llm_first_unanswered_reason") or ""),
+        str(data.get("llm_unanswered_operations") or ""),
+        str(data.get("error") or ""),
+    ))
+    return "rate_deferred" in _hay
+
+
+def _document_chunk_edges(chunk: str, user_id: str, backend_url: str,
+                          statement_route: str, _meta: dict = None) -> list:
+    """LLM-PRIMARY extraction for ONE document chunk (the tenant's BYO brain).
+
+    Documents are dense DOMAIN prose that the deterministic spine SYSTEMATICALLY
+    mis-parses — and a mis-parse yields JUNK edges, not zero. That is exactly why the
+    old residual-only hybrid was broken for the case this lane exists to fix: a
+    mis-POS'd sentence produced non-zero junk, so it never fell into the residual set
+    and the LLM never re-covered it → the junk was kept while the real facts were LOST
+    (live proof: "Photosynthesis converts carbon dioxide and water into glucose and
+    oxygen" — the small parser mis-POS-tags "converts" as a noun and the spine emits
+    (dioxide, use, light energy) + (water, use, light energy); those are edges, so the
+    sentence is not residual → the LLM never fires → glucose/oxygen never captured).
+
+    ⚠️ THE TWO PARAGRAPHS ABOVE DESCRIBE A LANE THAT NO LONGER EXISTS — kept because the
+    Photosynthesis failure they record is real and still un-fixed, not because the ruling
+    they end in still holds. `DOC_CHUNK_SPINE_FIRST` (2026-07-31) made the deterministic
+    spine the FIRST extractor here, so "the spine is NOT trusted / LLM-only" is now false
+    of this function. Read the DOC_CHUNK_SPINE_FIRST block below for what actually runs;
+    the union objection is still the reason there is no UNION — spine edges win outright or
+    the rewrite runs alone, never both. `statement_route` is retained for caller/signature
+    stability, but the document lane's route is decided here, not by the brain's STATEMENT
+    route.
+
+    The tenant's BYO brain is honored automatically: /extract/rewrite is behind the
+    backend's global _saas_bind_tenant_brain dependency (keyed on the user_id in the
+    body), so under SAAS every LLM call binds the tenant's OWN configured brain and
+    FAILS CLOSED (safe empty edges, ZERO network) when the tenant has no brain — NEVER
+    a global/default model. A frozen backend (ingest_disabled) RAISES so the worker
+    defers the chunk instead of dropping it. Low-confidence edges are dropped (WGM-gate
+    hygiene, same filter the MCP applies). Provenance is left ALONE: document facts are
+    user-submitted, so /ingest source="mcp" → user_stated (durable Class A/B), unlike
+    the episodic-reextract backfill which forces llm_inferred.
+
+    DOCLOSS-B — A FAILED EXTRACTION IS NOT AN EMPTY ONE. This function used to swallow every
+    exception and return [], and /extract/rewrite answered 200 with edges=[] when its LLM call
+    was rejected by an OPEN circuit breaker. The two were therefore indistinguishable, so a
+    chunk the extractor NEVER READ was tallied as a clean chunk with no facts and the document
+    still finalized 'ready'. Under DOC_CHUNK_FAILURE_LOUD the failure is now raised:
+    DocumentBrainUnavailable for a brain-level outage (→ the whole document is re-pended and
+    retried, at-least-once) and DocumentChunkExtractionFailed for a single-chunk failure
+    (→ chunks_failed++, terminal status 'partial'). Nothing is EVER counted as read-and-empty
+    unless the extractor actually answered."""
+    # A lane that is nothing but structural scaffolding (a bare "[Date: …]" header) has no
+    # assertion in it. Skip BOTH extractors rather than burn an LLM call — and, more importantly,
+    # rather than let a timeout on that pointless call be charged to the chunk. See
+    # DOC_CHUNK_SKIP_CONTENTLESS. Returning [] here is a TRUE read-and-empty: we read the lane
+    # deterministically and there was nothing in it, which is exactly what [] means on this path.
+    if DOC_CHUNK_SKIP_CONTENTLESS and _lane_has_no_content(chunk):
+        log.debug(f"re_embedder.document_chunk_contentless user_id={user_id[:8]} "
+                  f"(header-only lane — no extractor call)")
+        return []
+    try:
+        # CLIENT TIMEOUT MUST EXCEED THE SERVER'S OWN WORST CASE, or we kill work that would
+        # have succeeded and record it as a chunk failure.
+        #
+        # One chunk costs, server-side: REFRAME (6s) + per-sub-chunk EXTRACT (30s) with up to
+        # 3 retries in call_llm_with_retry_async — ~90s+ for a single retrying sub-chunk,
+        # before the completeness pass, the GLiNER2 lanes and two synchronous psycopg2
+        # connects made from inside the endpoint. The old 60s was BELOW that floor, so a
+        # healthy-but-slow chunk was aborted client-side and counted as failed, even though
+        # the backend usually finished and CACHED the result moments later.
+        # Measured 2026-07-30: 30 ReadTimeouts in six minutes on a 128-chunk document while
+        # the provider itself answered in ~1s.
+        # Env-tunable, never a bare literal (the 60.0 above was exactly that).
+        # SPINE FIRST — the document lane was the ONLY ingest path that never tried the
+        # deterministic extractor. `_reextract_row_edges` (this same file, ~:1917) has done
+        # spine-then-rewrite since it shipped; the document chunk path went straight to the
+        # LLM. Consequence, measured 2026-07-31: with the bench in DOCUMENT mode, the whole
+        # benchmark exercised /extract/rewrite and NEVER the spine — so every spine capture
+        # lane (counts, durations, label-anaphora, temporal units) was invisible to it, and
+        # the run inherited the LLM's full cost, latency and run-to-run variance. 2205
+        # `document_rewrite_failed: timed out` in five minutes against a local brain.
+        # Same shape as the episodic path: try the spine, fall back on nothing/error. The
+        # provenance difference is deliberate and PRESERVED — document facts stay
+        # source="mcp" -> user_stated, unlike the episodic backfill which forces llm_inferred.
+        # Rollback: DOC_CHUNK_SPINE_FIRST=false restores the byte-for-byte legacy path.
+        _spine_first = os.getenv("DOC_CHUNK_SPINE_FIRST", "true").strip().lower() \
+            not in ("false", "0", "no")
+        # L1 DETERMINISTIC-FIRST (litmus fix L2): a measured-slow brain defers its OWN read.
+        # Deterministic edges commit NOW (same /ingest door, staged B); the R2 remine lane
+        # re-reads the chunk later with brain headroom. A deterministic zero/None keeps the
+        # ladder below — the skip lane replaces a SLOW read, never a CAPTURE.
+        if DOC_L1_DETERMINISTIC_FIRST:
+            _slow_why = _brain_lane_slow(user_id)
+            if _slow_why:
+                try:
+                    _d1_edges = _deterministic_chunk_edges(chunk)
+                except Exception as _d1e:  # noqa: BLE001 — deterministic layer fault: ladder
+                    log.info(f"re_embedder.document_chunk_l1_deterministic_error "
+                             f"user_id={user_id[:8]}: {type(_d1e).__name__}")
+                    _d1_edges = None
+                if _d1_edges:
+                    # GAUNTLET R6 F1: this module's logger is STDLIB — kwargs style
+                    # raises TypeError the moment INFO is enabled (basicConfig above
+                    # sets INFO by default). f-string style, like every sibling.
+                    log.info(f"re_embedder.document_chunk_l1_deterministic_first "
+                             f"user_id={user_id[:8]} edges={len(_d1_edges)} "
+                             f"slow_reason={_slow_why} "
+                             f"note=in-process spine+GLiNER2 committed now; LLM enrichment deferred to R2 remine")
+                    if _meta is not None:
+                        # GAUNTLET R1 FINDING 4: mark the capture lane so the ledger
+                        # records cls=l1_deterministic_first and the R2 remine can
+                        # RE-OWE this chunk (the deferred LLM read must be reachable).
+                        _meta["l1"] = True
+                    return _d1_edges
+                if _d1_edges is not None:
+                    log.info(f"re_embedder.document_chunk_l1_deterministic_zero "
+                             f"user_id={user_id[:8]} slow_reason={_slow_why} "
+                             f"note=deterministic found nothing; brain ladder proceeds")
+        if _spine_first:
+            try:
+                _sbody = {"text": chunk, "user_id": user_id}
+                if DOC_CHUNK_SPINE_DETSEG:
+                    # THE SHAPE BOUNDARY. The caller knows this text is a document chunk, not a
+                    # chat turn, so it pins the deterministic segmenter for THIS request. Flag
+                    # off → the field is absent → the backend's own flag decides (legacy).
+                    _sbody["deterministic_segmentation"] = True
+                if DOC_SPACY_MODEL:
+                    # THE PARSE-MODEL SPLIT (same shape boundary, one seam over): this chunk
+                    # is DOCUMENT prose, so pin the doc-lane PARSE model for THIS request.
+                    # The backend honors the field ONLY on /harvest-spans and only while the
+                    # env enables it; the second pipeline lazy-loads once, server-side. Empty
+                    # env → the field is absent → byte-identical legacy. Conversation turns
+                    # never send it; /extract/rewrite (the fallback below) never sees it.
+                    _sbody["parse_model"] = DOC_SPACY_MODEL
+                _sresp = httpx.post(
+                    f"{backend_url}/harvest-spans",
+                    json=_sbody,
+                    headers=_BACKEND_LANE_HEADERS,
+                    timeout=_DOC_CHUNK_HTTP_TIMEOUT,
+                )
+                _sresp.raise_for_status()
+                _sdata = _sresp.json()
+                # Same split-brain guard the episodic path uses: a FROZEN backend answers
+                # with zero edges, which must never be recorded as "read and empty".
+                if _sdata.get("status") == "ingest_disabled":
+                    raise DocumentBrainUnavailable(
+                        "backend ingest disabled (knowledge-store mode)")
+                if _sdata.get("status") == "doc_lane_paused":
+                    # Operator pause (the fairness knob): same class as a brain outage for
+                    # THIS lane — defer the document, burn nothing. Never charged to a chunk.
+                    raise DocumentBrainUnavailable(
+                        "document CPU lane paused by operator (doc_lane_paused)")
+                # BUG-005 RATE-DEFERRED FAST-FAIL. A degraded harvest whose reason is
+                # rate_deferred means the limiter never put the turn's LLM requests on the
+                # wire — the brain is merely PACED, not down. Retrying the ladder (spine
+                # again, then the /extract/rewrite fallback) cannot serve THIS chunk and
+                # only starves the 40-RPM budget that would serve the next turn: measured
+                # on prod, 129/133 chunks each paid the full ladder and died. Raise the
+                # PACED class instead: the caller re-pends the document WITHOUT consuming
+                # its attempt budget (the `_paced` refund in the RuntimeError handler) and
+                # the chunk stays pending for a later cycle. A NON-rate degraded envelope
+                # keeps today's exact ladder (fall through to /extract/rewrite below).
+                if _envelope_rate_deferred(_sdata):
+                    # BUG-04 (adversarial bench 20261024): the brain is MERELY
+                    # PACED, but the backend's degrade-withhold just DISCARDED
+                    # every edge this harvest derived (measured on prod:
+                    # edges_withheld=11-14 per chunk, repeatedly, for DAYS — the
+                    # 11 openalex papers sat at 0 facts since 2026-10-20). The
+                    # spine ALWAYS runs: extract deterministically IN-PROCESS
+                    # (zero brain) and hand the edges back through the normal
+                    # commit path. Only a zero-edge pass keeps the fast-fail
+                    # (the chunk is not fully read — never count it empty).
+                    _rescued = _deterministic_rescue_edges(
+                        chunk, user_id, "rate_deferred")
+                    if _rescued is not None:
+                        return _rescued
+                    log.warning(
+                        f"re_embedder.document_chunk_rate_deferred user_id={user_id[:8]} "
+                        f"first_reason={_sdata.get('llm_first_unanswered_reason')} "
+                        f"(fast-fail: no rewrite fallback, chunk stays requeueable)")
+                    raise DocumentBrainUnavailable(
+                        "rate_deferred: harvest turn paced by the rate limiter "
+                        f"(first_reason={_sdata.get('llm_first_unanswered_reason')}); "
+                        "document re-pended without burning the retry ladder")
+                _sedges = [e for e in (_sdata.get("edges", []) or [])
+                           if not e.get("low_confidence", False)]
+                if _sedges:
+                    return _sedges
+                log.info(f"re_embedder.document_chunk_spine_empty user_id={user_id[:8]} "
+                         f"(falling back to /extract/rewrite)")
+            except DocumentBrainUnavailable:
+                raise
+            except Exception as _se:  # noqa: BLE001 — fall back, never lose the chunk
+                # DOCDRAIN: a CONNECT-level failure is not a spine problem — the backend is
+                # not there. /extract/rewrite lives on the SAME host, so falling back only
+                # buys a second identical refusal and then charges it to the chunk. Defer the
+                # whole document instead (bounded at-least-once redelivery).
+                if _is_backend_unreachable(_se):
+                    raise DocumentBrainUnavailable(
+                        f"backend unreachable at {backend_url}: {type(_se).__name__}") from _se
+                log.warning(f"re_embedder.document_chunk_spine_failed user_id={user_id[:8]} "
+                            f"(falling back to /extract/rewrite): {_se!r}")
+        resp = httpx.post(
+            f"{backend_url}/extract/rewrite",
+            json={"text": chunk, "user_id": user_id, "force_relation_extraction": True},
+            headers=_BACKEND_LANE_HEADERS,
+            timeout=_DOC_CHUNK_HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        _data = resp.json()
+        if _data.get("status") == "ingest_disabled":
+            raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+        if _data.get("status") == "doc_lane_paused":
+            # Operator pause on the rewrite door too — defer, never a chunk failure.
+            raise DocumentBrainUnavailable(
+                "document CPU lane paused by operator (doc_lane_paused)")
+        if DOC_CHUNK_FAILURE_LOUD and _data.get("extraction_degraded"):
+            # The backend told us how much of THIS chunk it could not read (the
+            # EXTRACTION_FAILURE_SURFACED envelope). A breaker rejection is a brain-level
+            # outage → defer the document; anything else is a single-chunk failure.
+            _reason = str(_data.get("error") or "").strip() or str(
+                ((_data.get("failures") or [{}])[0] or {}).get("reason") or "extraction_degraded")
+            _n_failed = int(_data.get("chunks_failed") or 0)
+            _n_total = int(_data.get("chunks_total") or 0)
+            log.warning(f"re_embedder.document_extraction_degraded user_id={user_id[:8]} "
+                        f"failed={_n_failed}/{_n_total} reason={_reason}")
+            if "circuit_breaker_open" in _reason or "rate_deferred" in _reason:
+                # rate_deferred: the brain is MERELY PACED (background daily budget /
+                # minute tokens spent). This is not a chunk failure — the document goes
+                # back for bounded at-least-once redelivery instead of terminating
+                # 'partial' with zero facts on a day the pacer is deliberately parking
+                # background work (critic pass 2: a user's upload must never terminally
+                # fail behind a spent day).
+                raise DocumentBrainUnavailable(_reason)
+            # PARTIAL degradation: some sub-chunks answered. KEEP those edges — discarding
+            # successfully-extracted facts in order to report a failure would be a second,
+            # smaller silent loss. They ride ON the exception so the caller ingests them
+            # AND still counts the chunk failed.
+            _err = DocumentChunkExtractionFailed(
+                f"{_reason} ({_n_failed}/{_n_total} sub-chunks unread)")
+            _err.partial_edges = [e for e in (_data.get("edges", []) or [])
+                                  if not e.get("low_confidence", False)]
+            raise _err
+        # FAIL CLOSED on any non-success extractor status.
+        #
+        # /extract/rewrite has a second empty-shaped exit: its outer `except` returns
+        # {"status": "error", "edges": [], "error": ...} WITHOUT the extraction_degraded
+        # envelope. That matched neither branch above and fell through to "return the edges"
+        # → [] → the chunk was counted as a CLEAN SUCCESS, chunks_failed was not incremented,
+        # and the document finalized `ready` having stored nothing from it.
+        #
+        # Same class as the fenced-JSON breaker bug, one door over: the worker was taught
+        # about `extraction_degraded`, but the endpoint kept an error path that never sets it.
+        # Treat ANY unrecognized status as a failure rather than assuming success — an empty
+        # edge list is only trustworthy when the extractor says it succeeded.
+        _status = _data.get("status")
+        if DOC_CHUNK_FAILURE_LOUD and _status not in (None, "success"):
+            raise DocumentChunkExtractionFailed(
+                f"extractor_status={_status}: {str(_data.get('error') or '')[:160]}")
+        return [e for e in (_data.get("edges", []) or [])
+                if not e.get("low_confidence", False)]
+    except (DocumentChunkExtractionFailed, RuntimeError):
+        # RuntimeError covers the freeze signal AND DocumentBrainUnavailable (a subclass).
+        raise
+    except Exception as e:
+        log.warning(f"re_embedder.document_rewrite_failed user_id={user_id[:8]}: {e}")
+        # DOCDRAIN — WHO FAILED DECIDES WHAT WE DO. A connect-level error means the request
+        # was never delivered: it says nothing about THIS chunk and everything about the
+        # backend, so charging it to the chunk destroys the document one chunk at a time
+        # (measured: 400 chunks burned in 1.5s across two documents during a deploy restart).
+        # Defer the document instead — the same bounded redelivery the breaker path uses.
+        if _is_backend_unreachable(e):
+            # No URL in the sentence: this message is persisted into documents.error and rendered
+            # by GET /documents/status — topology goes to the seam's CRIT line under the ref.
+            raise DocumentBrainUnavailable(
+                "backend unreachable: " + _errors.public_detail(
+                    e, where="doc.chunk.backend_unreachable", what=type(e).__name__)) from e
+        if DOC_CHUNK_FAILURE_LOUD:
+            # BUG-04: both extract doors failed at the TRANSPORT level (backend
+            # alive, brain not answering inside the client budget — the
+            # ReadTimeout class measured 957×/6h on prod). Before charging the
+            # chunk as failed, run the deterministic pass IN-PROCESS: a chunk
+            # with deterministic-extractable content gets its edges committed
+            # even when the brain is completely unavailable. Zero edges keeps
+            # today's failure (the chunk was not fully read).
+            _rescued = _deterministic_rescue_edges(
+                chunk, user_id, f"{type(e).__name__}")
+            if _rescued is not None:
+                return _rescued
+            # Transport/HTTP failure: the chunk was NOT read. Never report it as empty.
+            raise DocumentChunkExtractionFailed(_errors.public_detail(
+                e, where="doc.chunk.transport", what=type(e).__name__)) from e
+        return []
+
+
+def _process_document_chunk(chunk, *, idx, doc_id, user_id: str, backend_url: str,
+                            source_ref, statement_route: str = "rewrite",
+                            replay: bool = False) -> tuple:
+    """Episodic-retain → extract → WGM-ingest ONE document chunk.
+
+    Returns ``(committed, staged, failed, reason[, cls])`` — ``reason`` is the REASON CODE for a
+    failed chunk (the DOCLOSS-B evidence this lane used to discard: extractor status, transport
+    error class, degraded-envelope reason), or ``None`` on success. The OPTIONAL 5th element
+    ``cls`` (gauntlet R1-F4/R5, and the cite-skip) carries the capture-lane/zero-yield
+    classification for the ledger (``l1_deterministic_first``, ``cite_dense_reference_block``);
+    BOTH call sites tolerate 4- and 5-tuples. It is persisted into
+    ``documents.chunk_state`` by BOTH lanes so a terminated-'partial' document can say WHY
+    each unread chunk failed and the retry lane can name what it re-owes.
+
+    REPLAY CONTRACT (gauntlet R2 document re-mine): ``replay=True`` marks this chunk as a
+    RE-SEND of already-attempted content — specifically a RE-MINE drain (the row's
+    reextract_attempts > 0, stamped by remine_documents_prepass; a manual /documents/retry
+    of a never-re-mined row keeps attempts = 0 and therefore drains unmarked, the
+    pre-existing lane). The /ingest POSTs then carry the
+    X-FL-Deferred-Replay marker + X-FL-Replay-Lane: reextract so the backend's
+    retired-value freeze engages: a value /retract/correct retired in the interleaving is
+    NEVER resurrected by the re-send (the wound class the episodic lane paid for
+    2026-09-04, seat b3f8a2c4). Header-only — the idempotency key hashes edges and must
+    stay byte-identical to any live ingest of the same chunk. A FIRST drain
+    (replay=False, the default) never carries the marker: a first attempt IS a genuine
+    write. The marker changes NOTHING about provenance — source stays "document" →
+    llm_inferred / staged B either way.
+
+    LIFTED VERBATIM out of the nested `_process_one_chunk` closure so that the SAME code runs
+    on both lanes — the legacy ThreadPoolExecutor fan-out and the queue worker. A second copy
+    would drift, and this lane has already paid for drift once (three copies of the tool
+    descriptions). Nothing about its behaviour changed in the lift.
+
+    RAISES RuntimeError (incl. DocumentBrainUnavailable) on a backend freeze / brain outage so
+    the caller aborts the whole document → re-pending. Thread-safe: no shared mutable state,
+    every network call is per-invocation, and the worker's db_conn is NOT touched here."""
+    if not isinstance(chunk, str) or not chunk.strip():
+        return (0, 0, 0, None)
+    # Replay header composition (header-only, never the body). Computed once per chunk;
+    # identical dict shape to the episodic lane's marker POST in reextract_episodic.
+    _ingest_headers = _BACKEND_LANE_HEADERS
+    if replay:
+        _ingest_headers = {
+            **_BACKEND_LANE_HEADERS,
+            _ingest_transport.REPLAY_MARKER_HEADER: _ingest_transport.REPLAY_MARKER_VALUE,
+            _ingest_transport.REPLAY_LANE_HEADER: _ingest_transport.REPLAY_LANE_REEXTRACT,
+        }
+    # Verbatim episodic retention BEFORE extraction (the safety net that
+    # feeds the reextract backfill for anything still uncastable). Non-fatal.
+    # turn_key (migration 274) makes this retention IDEMPOTENT per (doc, chunk): a
+    # re-mine drain (or retry_document) re-posts the SAME text ≥24h later — the 30s
+    # keyless content window cannot see that repeat, so unkeyed appends would insert a
+    # duplicate episodic row per re-read (re-seeding the episodic backfill with text it
+    # already retained). The partial UNIQUE index dedupes the repeat to the original
+    # row; a FIRST drain still inserts exactly as before.
+    try:
+        httpx.post(
+            f"{backend_url}/episodic/append",
+            json={"user_id": user_id, "raw_text": chunk,
+                  "source": "document", "source_ref": source_ref,
+                  "intent": None, "extracted_fact_count": None,
+                  "turn_key": f"doc:{doc_id}:chunk:{idx}"},
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
+    # CITE-DENSE SKIP (litmus fix L4): decided HERE - after the verbatim retention above
+    # (the chunk's text is already retained) and before ANY extractor call. The 5th return
+    # element carries the HONEST zero-yield classification (`cite_dense_reference_block`):
+    # neither a failure (nothing is re-owed, no attempt burned) nor a silent read-and-empty
+    # (document_status can name WHY the chunk contributes zero facts). Tables and
+    # citation-cluttered prose that share the lane are a documented tradeoff: verbatim
+    # retained + stub_tsv searchable + R2 re-mineable.
+    if DOC_CITE_DENSE_SKIP:
+        try:
+            _cv = _citation_density_verdict(chunk)
+        except Exception as _cve:  # noqa: BLE001 - a gate error must never fail a chunk
+            log.info(f"re_embedder.document_chunk_cite_gate_error doc_id={doc_id} "
+                     f"chunk={idx}: {type(_cve).__name__}")
+            _cv = None
+        # GAUNTLET R5 F-1: an affil_block verdict is honored only in the FRONT
+        # MATTER (contact blocks are front-matter by construction — the measured
+        # corpus TP sits at chunk pos 3). No chunk-granularity signal separates an
+        # authors-contact block from a staff roster WITH emails (critic-measured:
+        # both are name + dept + email), so the position is the discriminator:
+        # deeper affil verdicts run the ladder (throughput-only FN, direction-safe
+        # — ref_run/level verdicts still skip anywhere, unchanged).
+        if _cv and _cv.get("cite_dense") and (
+                _cv.get("reason") != "affil_block"
+                or idx <= _cite_env_int("DOC_CITE_AFFIL_FRONT_MATTER_MAX", "5")):
+            # GAUNTLET R6 F1 (RUNTIME BLOCKER found by the critic): this line used
+            # structlog-style kwargs on the STDLIB logger — Logger._log raised
+            # TypeError on the FIRST cite-dense chunk of any stock drain (INFO is
+            # the module default), the queue lane requeued, the crash repeated,
+            # the doc died 'partial' — the whole cite-skip was DEAD AT RUNTIME and
+            # the pytest battery masked it (pytest's root handlers make
+            # basicConfig no-op, so isEnabledFor(INFO) was False inside tests).
+            # f-string style, like every sibling call site.
+            log.info(f"re_embedder.document_chunk_zero_yield doc_id={doc_id} chunk={idx} "
+                     f"user_id={user_id[:8]} classification=cite_dense_reference_block "
+                     f"reason={_cv.get('reason')} ref_line_ratio={round(_cv.get('ref_line_ratio', 0.0), 2)} "
+                     f"marks={_cv.get('marks')} affil_lines={_cv.get('affil_lines')} "
+                     f"nonempty_lines={_cv.get('nonempty_lines')} "
+                     f"note=verbatim retained in episodic+chunks; ladder skipped; R2 remine may re-read")
+            return (0, 0, 0, None, "cite_dense_reference_block")
+
+    def _extract_and_ingest(text: str, source: str, _meta: dict = None) -> tuple:
+        """Extract edges from `text` and ingest them under `source`
+        (which the backend maps to fact_provenance). Returns
+        (committed, staged). RAISES RuntimeError on a backend freeze.
+        `_meta` (optional) receives the capture-lane annotation from the ladder."""
+        if not text or not text.strip():
+            return (0, 0)
+        try:
+            _edges = _document_chunk_edges(text, user_id, backend_url, statement_route,
+                                           _meta=_meta)
+        except DocumentChunkExtractionFailed as _cf:
+            # DOCLOSS-B: the chunk FAILED, but any edges that DID extract are still
+            # the user's facts — commit them, then re-raise so the chunk is counted
+            # failed and the document terminates 'partial'. Losing good edges to
+            # report a failure would just be a smaller silent loss.
+            _salvage = list(getattr(_cf, "partial_edges", None) or [])
+            if _salvage:
+                try:
+                    httpx.post(
+                        f"{backend_url}/ingest",
+                        json={"text": text, "user_id": user_id, "edges": _salvage,
+                              "source": source, "source_ref": source_ref},
+                        headers=_ingest_headers,
+                        timeout=_DOC_INGEST_HTTP_TIMEOUT,
+                    ).raise_for_status()
+                except Exception as _se:
+                    log.warning(f"re_embedder.document_salvage_ingest_failed "
+                                f"user_id={user_id[:8]}: {_se}")
+            raise
+        if not _edges:
+            return (0, 0)
+        # SCHEMA-GUIDED SECOND PASS (EDC refinement, DESIGN-document-extraction-sota.md
+        # §4/§8.2): ONE bounded re-ask per chunk, only when pass 1 produced edges, never on
+        # the L1 deterministic-first lane (its LLM read is deferred to the R2 remine).
+        # Fail-safe: any failure or empty answer leaves _edges exactly as pass 1 returned
+        # them — the enrichment can never fail a chunk, never empty it, never reorder it.
+        if DOC_SCHEMA_SECOND_PASS and not (_meta or {}).get("l1"):
+            _extra = _schema_second_pass_edges(text, user_id, backend_url, _edges)
+            if _extra:
+                _edges = _edges + _extra
+        try:
+            _resp = httpx.post(
+                f"{backend_url}/ingest",
+                json={"text": text, "user_id": user_id, "edges": _edges,
+                      "source": source, "source_ref": source_ref},
+                headers=_ingest_headers,
+                timeout=_DOC_INGEST_HTTP_TIMEOUT,
+            )
+        except Exception as _ie:
+            if _is_backend_unreachable(_ie):
+                raise DocumentBrainUnavailable(
+                    f"backend unreachable at {backend_url} during /ingest: "
+                    f"{type(_ie).__name__}") from _ie
+            # A READ timeout here is an UNCERTAIN outcome, NOT a clean failure:
+            # the edges were extracted AND delivered, and /ingest very often
+            # commits them anyway (proven — DOCDRAIN doc_id=9: aborted at 30s,
+            # six facts in `facts` 30s later). Say so LOUDLY and exactly, so the
+            # next reader does not re-derive it from a bare "timed out", and so
+            # nobody reads the resulting 'partial' as "nothing was stored".
+            _doc_log_crit(
+                "re_embedder.document_ingest_outcome_unknown",
+                user_id=user_id[:8], source=source, edges=len(_edges),
+                timeout_seconds=_DOC_INGEST_HTTP_TIMEOUT,
+                error=f"{type(_ie).__name__}: {str(_ie)[:120]}",
+                note="edges_were_DELIVERED-facts_may_have_committed_server_side"
+                     "-counted_failed_conservatively")
+            raise DocumentChunkExtractionFailed(
+                f"ingest outcome unknown ({type(_ie).__name__} after "
+                f"{_DOC_INGEST_HTTP_TIMEOUT}s)") from _ie
+        _resp.raise_for_status()
+        _j = _resp.json()
+        if _j.get("status") == "ingest_disabled":
+            raise RuntimeError("backend ingest disabled (knowledge-store mode)")
+        return (int(_j.get("committed", 0) or 0), int(_j.get("staged", 0) or 0))
+
+    try:
+        if INGEST_ASSISTANT_TURNS:
+            # Split by speaker. DOCUMENT-TIERED (owner direction 2026-08-21): BOTH partitions
+            # are machine readings of a user-supplied DOCUMENT, so both ingest under
+            # source="document" → provenance llm_inferred, staged Class B (never A — an
+            # uploaded file must not outrank the user's own conversational corrections;
+            # promotes on confirmation). The legacy "mcp"/"assistant" split presumed the
+            # document lane was conversational-attested; it is content-attested instead.
+            _user_text, _asst_text = _partition_chunk_by_role(chunk)
+            _meta = {}
+            _uc, _us = _extract_and_ingest(_user_text, "document", _meta=_meta)
+            _ac, _as = _extract_and_ingest(_asst_text, "document", _meta=_meta)
+            return (_uc + _ac, _us + _as, 0, None,
+                    "l1_deterministic_first" if _meta.get("l1") else None)
+        # Legacy (flag OFF): whole chunk → same document tier.
+        _meta = {}
+        _c, _s = _extract_and_ingest(chunk, "document", _meta=_meta)
+        # GAUNTLET R1 FINDING 4: the ledger records WHICH capture lane committed —
+        # l1_deterministic_first marks a deterministic-first capture whose LLM
+        # enrichment is DEFERRED, so the R2 remine can re-owe the chunk.
+        return (_c, _s, 0, None,
+                "l1_deterministic_first" if _meta.get("l1") else None)
+    except RuntimeError:
+        # Split-brain freeze: backend refused. Propagate → caller re-pends the doc.
+        raise
+    except DocumentChunkExtractionFailed as ce:
+        # THE REASON CODE ESCAPES HERE (was: collapsed into a bare `failed=1`). The drain's
+        # per-chunk ledger persists it so a partial document can name WHY each chunk failed
+        # (the Aug-8 docs 3/4/7 evidence loss — counts survived, reasons did not).
+        log.warning(f"re_embedder.document_chunk_failed doc_id={doc_id} "
+                    f"chunk={idx} user_id={user_id[:8]}: {str(ce)[:200]}")
+        # ``DocumentChunkExtractionFailed`` is a PublicRefusal: its sentence is authored (the
+        # reason CODE), so the seam passes it through; it is what document_status renders.
+        return (0, 0, 1, _errors.public_detail(ce, where="doc.chunk.failed"))
+    except Exception as ce:
+        log.warning(f"re_embedder.document_chunk_failed doc_id={doc_id} "
+                    f"chunk={idx} user_id={user_id[:8]} (non-fatal): {ce}")
+        return (0, 0, 1, _errors.public_detail(ce, where="doc.chunk.unexpected", what=type(ce).__name__))
+
+
+# ── PARALLEL: the queue lane ─────────────────────────────────────────────────
+#
+# The handler is MODULE-LEVEL and its item carries everything it needs (text, backend url,
+# user, source_ref). That is what makes a worker in ANOTHER PROCESS possible later without
+# restructuring anything: nothing here closes over the drain's local state.
+
+
+def _run_doc_chunk_item(item):
+    """chunk_queue handler for kind='doc_chunk'. Returns (committed, staged, failed).
+
+    Raises FatalBatchError for a brain-level outage so the batch STOPS and the item goes back
+    to the queue WITHOUT consuming an attempt — an outage is not a property of the chunk, and
+    charging it to the chunk is exactly how 400 chunks were burned in 1.5 seconds."""
+    from src.ingest.chunk_queue import FatalBatchError
+    p = item.payload or {}
+    try:
+        return _process_document_chunk(
+            p.get("text"), idx=p.get("idx"), doc_id=p.get("doc_id"),
+            user_id=p.get("user_id") or item.tenant,
+            backend_url=p.get("backend_url"), source_ref=p.get("source_ref"),
+            statement_route=p.get("statement_route") or "rewrite",
+            replay=bool(p.get("replay")))
+    except RuntimeError as fe:      # freeze / DocumentBrainUnavailable (a RuntimeError)
+        raise FatalBatchError(str(fe), cause=fe) from fe
+
+
+def _register_doc_chunk_handler() -> bool:
+    """Register the doc-chunk handler. False when src/ingest/chunk_queue.py is unavailable."""
+    try:
+        from src.ingest import chunk_queue as _cq
+        _cq.register_handler("doc_chunk", _run_doc_chunk_item)
+        return True
+    except Exception as e:  # noqa: BLE001 — the accelerator never breaks its host
+        log.info(f"re_embedder.chunk_queue_unavailable ({type(e).__name__}) — legacy pool")
+        return False
+
+
+def _read_chunk_state(db_conn, doc_id, schema_name) -> dict:
+    """The per-chunk terminal ledger for one document, or {}. Never raises.
+
+    Its own guarded SELECT rather than an extra RETURNING column on the claim: a tenant that
+    has not taken migration 205 yet must keep draining, and the claim UPDATE is the one
+    statement in this lane that absolutely must not acquire a new failure mode."""
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT chunk_state FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+        db_conn.commit()
+        val = row[0] if row else None
+        if isinstance(val, str):
+            val = json.loads(val)
+        return dict(val or {})
+    except Exception as e:  # noqa: BLE001 — pre-205 schema, or anything else: no ledger
+        log.info(f"re_embedder.chunk_state_unavailable doc_id={doc_id} "
+                 f"({type(e).__name__}) — every chunk is treated as owed")
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        return {}
+
+
+def _read_remine_attempts(db_conn, doc_id, schema_name) -> int:
+    """The row's re-mine attempt count (migration 298), or 0 when unavailable.
+
+    Its own guarded SELECT — the same contract as ``_read_chunk_state`` above: an extra
+    RETURNING column on the claim would fork the three-rung claim ladder, and the claim is
+    the one statement in this lane that must not acquire a new failure mode. 0 on ANY
+    failure (pre-298 schema, error) = "not a replay" = byte-for-byte the shipped
+    /ingest POST shape.
+    """
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT reextract_attempts FROM documents WHERE id = %s", (doc_id,))
+            row = cur.fetchone()
+        db_conn.commit()
+        return int(row[0] or 0) if row else 0
+    except Exception as e:  # noqa: BLE001 — pre-298 schema, or anything else: not a replay
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        return 0
+
+
+def _chunk_terminal_entry(s: str, c: int = 0, g: int = 0, cls=None,
+                          reason=None, attempts=None) -> dict:
+    """ONE builder for a per-chunk terminal ledger entry — BOTH drain lanes.
+
+    BUG-04 (document-status/retry accounting mismatch): entries are STAMPED with
+    the completion time (``t``, epoch seconds) at the moment a lane observes the
+    terminal outcome. The ``facts_staged`` / ``chunks_failed`` COLUMNS are only
+    written at finalize (``drain_pending_documents``), so during a long drain
+    they freeze while the ledger moves — the read side (``GET /documents/status``,
+    ``POST /documents/retry``) now computes kept/owed LIVE from this ledger, and
+    the ``t`` stamps are what make a MEASURED chunks/min ETA possible (the doc's
+    last N completions — ``main.py::_doc_ledger_rate_cpm``). Readers branch only
+    on s/c/g/e/cls/a, so the extra key is additive; JSONB normalises key order.
+    """
+    entry: dict = {"t": time.time()}
+    if s == "done":
+        entry["s"] = "done"
+        entry["c"] = int(c)
+        entry["g"] = int(g)
+        if cls:
+            entry["cls"] = cls
+    else:
+        entry["s"] = "failed"
+        if attempts is not None:
+            entry["a"] = int(attempts)
+        entry["e"] = str(reason or "unread")[:200]
+    return entry
+
+
+def _drain_document_via_queue(db_conn, doc_id, chunks, chunk_state: dict, *, user_id: str,
+                              backend_url: str, source_ref, statement_route: str,
+                              schema_name, replay: bool = False) -> tuple:
+    """Drain ONE document's still-owed chunks through the Redis work queue.
+
+    Returns ``(committed, staged, chunks_failed, state, fatal)`` where ``state`` is the merged
+    per-chunk ledger and ``fatal`` is a RuntimeError to re-raise (brain outage) or None.
+
+    ``replay`` rides the WorkItem payload verbatim into every chunk's /ingest POST (the
+    X-FL-Deferred-Replay marker for a re-mine drain — see _process_document_chunk).
+
+    THE TWO DURABILITY LAYERS, both live here:
+      • Postgres `chunk_state` says what is still OWED — so a reclaim re-runs only that, and a
+        chunk that failed is re-minable rather than burned.
+      • The Redis lease says what is IN FLIGHT — so a worker that dies mid-chunk has its work
+        returned to the queue rather than lost with it.
+    """
+    from src.ingest import chunk_queue as _cq
+
+    state = dict(chunk_state or {})
+    batch = f"doc:{doc_id}"
+    queue = _cq.RedisWorkQueue()
+    # A previous crashed run may have left residue for THIS batch. Purge before enqueueing so
+    # a stale item cannot be processed alongside the fresh one (the DOCUMENT claim already
+    # guarantees a single owner, so this is scoped and safe).
+    queue.purge(user_id, batch)
+
+    owed = [(i, c) for i, c in enumerate(chunks)
+            if (state.get(str(i)) or {}).get("s") not in ("done", "failed")]
+    if not owed:
+        return (0, 0, 0, state, None)
+
+    # ── ADMISSION CAP (round 5, DOC_TEXT_LANE_BACKPRESSURE) ─────────────────────
+    # The wound: this enqueue handed the brain EVERY owed chunk at once (measured
+    # ~3.6k queued brain chunks from ONE ~1MB document — the clog litmus). Under
+    # the flag, at most DOC_SEAT_CHUNK_BUDGET chunks ride per pass; the remainder
+    # stays owed in the ledger and the document re-pends (defer, never refuse —
+    # the caller's owed logic already handles exactly this shape for deadline
+    # requeues, progress-aware and bounded by the retry ceiling).
+    if DOC_TEXT_LANE_BACKPRESSURE:
+        from src.ingest import corpus_store as _cs
+        _adm = _cs.chunk_pass_admission(len(owed))
+        if _adm["deferred"] > 0:
+            log.info(
+                f"re_embedder.document_chunk_admission_deferred doc_id={doc_id} "
+                f"user_id={user_id[:8]} admitted={_adm['admit']} "
+                f"deferred={_adm['deferred']} cap={_adm['cap']} "
+                f"(per-pass chunk budget — the rest stay owed; document re-pends)")
+            owed = owed[:_adm["admit"]]
+            if not owed:
+                return (0, 0, 0, state, None)
+
+    queue.enqueue([
+        _cq.WorkItem(kind="doc_chunk", tenant=user_id, batch=batch, key=f"chunk:{i}",
+                     payload={"idx": i, "text": c, "doc_id": doc_id, "user_id": user_id,
+                              "backend_url": backend_url, "source_ref": source_ref,
+                              "statement_route": statement_route, "replay": bool(replay)})
+        for i, c in owed
+    ])
+
+    conc, reason = _cq.resolve_tenant_concurrency(user_id, _DOC_CHUNK_CONCURRENCY)
+    conc = min(conc, max(1, len(owed)))
+    log.info(f"re_embedder.document_queue_drain doc_id={doc_id} user_id={user_id[:8]} "
+             f"owed={len(owed)}/{len(chunks)} concurrency={conc} ({reason})")
+
+    tally = {"committed": 0, "staged": 0, "failed": 0, "since_flush": 0}
+
+    def _flush(force: bool = False) -> None:
+        """Persist the ledger. MAIN THREAD ONLY — psycopg2 connections are not thread-safe."""
+        if not force and tally["since_flush"] < _DOC_CHUNK_STATE_FLUSH:
+            return
+        tally["since_flush"] = 0
+        try:
+            with db_conn.cursor() as cur:
+                cur.execute("UPDATE documents SET chunk_state = %s::jsonb WHERE id = %s",
+                            (json.dumps(state), doc_id))
+            db_conn.commit()
+        except Exception as e:  # noqa: BLE001 — the ledger is an OPTIMISATION, never the truth
+            log.warning(f"re_embedder.chunk_state_flush_failed doc_id={doc_id}: {e}")
+            _rollback_and_reapply_search_path(db_conn, schema_name)
+
+    def _on_result(item, outcome, value):
+        idx = str((item.payload or {}).get("idx"))
+        if outcome == "ok":
+            # 4-tuple (committed, staged, failed, reason) since the reason-code persistence
+            # pass — tolerate the 3-tuple from an in-flight older worker for robustness.
+            _cls = None
+            if isinstance(value, tuple) and len(value) >= 5:
+                _cls = value[4]
+            if isinstance(value, tuple) and len(value) >= 4:
+                c, s, f = value[0], value[1], value[2]
+                _reason = value[3]
+            else:
+                c, s, f = value
+                _reason = None
+            tally["committed"] += c
+            tally["staged"] += s
+            tally["failed"] += f
+            # `f == 1` is a chunk the extractor could not read (it did not raise, it reported).
+            # Record it as FAILED-terminal WITH its reason code: it has already consumed its own
+            # retry budget inside _document_chunk_edges, and re-queueing it would spin.
+            _e_public = (_errors.public_detail(_reason, where="doc.chunk.reason", what=type(_reason).__name__)
+                         if isinstance(_reason, BaseException) else str(_reason or "unread")[:200])
+            state[idx] = (_chunk_terminal_entry("done", c=c, g=s, cls=_cls) if not f
+                          else _chunk_terminal_entry("failed", reason=_e_public,
+                                                     attempts=item.attempts + 1))
+        elif outcome == "dead":
+            tally["failed"] += 1
+            # ``value`` may be the exception OBJECT the queue handed back (chunk_queue._run_one)
+            # — this row is rendered by GET /documents/status, so it gets the public shape.
+            state[idx] = _chunk_terminal_entry(
+                "failed", attempts=item.attempts + 1,
+                reason=(_errors.public_detail(value, where="doc.chunk.dead", what=type(value).__name__)
+                        if isinstance(value, BaseException) else str(value)[:200]))
+            _doc_log_crit("re_embedder.chunk_dead_lettered", doc_id=doc_id,
+                          user_id=user_id[:8], chunk=idx, attempts=item.attempts + 1,
+                          error=str(value)[:200],
+                          note="verbatim_text_retained_in_documents.chunks+episodic_for_remine")
+        elif outcome == "failed":
+            # Requeued with attempts+1 — NOT terminal, NOT counted. This is the burned-chunk
+            # fix: the chunk is still owed and will be claimed again.
+            log.info(f"re_embedder.chunk_requeued doc_id={doc_id} chunk={idx} "
+                     f"attempt={item.attempts + 1}: {str(value)[:120]}")
+            return
+        elif outcome == "fatal":
+            return          # already back on the queue; the batch is stopping
+        else:               # nohandler — a registration bug, not a data problem
+            tally["failed"] += 1
+            state[idx] = _chunk_terminal_entry("failed", attempts=item.attempts + 1,
+                                               reason="no handler")
+        tally["since_flush"] += 1
+        _flush()
+
+    # READ BARRIER — THE DURATION-DEPENDENT WOUND (TX2). run_batch is the long pass: it
+    # can run for tens of minutes over a many-chunk document, and the incremental `_flush`
+    # below is what keeps the evidence ledger alive. If this connection enters run_batch
+    # inside a transaction, `idle_in_transaction_session_timeout` kills it mid-batch — every
+    # later flush AND the terminal finalize then fail on a dead connection, which is exactly
+    # how a long document is left stranded at status='processing' with chunk_state={} and
+    # chunks_failed=0 while its chunks demonstrably failed in the logs.
+    release_read_transaction(db_conn, context=f"re_embedder.document_queue_drain doc_id={doc_id}")
+    result = _cq.run_batch(queue, user_id, batch, conc, on_result=_on_result)
+    _flush(force=True)
+
+    fatal = None
+    if result.get("fatal"):
+        err = result.get("fatal_error")
+        cause = getattr(err, "cause", None)
+        fatal = cause if isinstance(cause, RuntimeError) else RuntimeError(str(err))
+    else:
+        queue.purge(user_id, batch)
+
+    return (tally["committed"], tally["staged"], tally["failed"], state, fatal)
+
+
+def drain_pending_documents(db_conn, backend_url: str, user_id: str,
+                            schema_name: str = None, statement_route: str = "rewrite",
+                            batch_size: int = _DOC_DRAIN_BATCH) -> int:
+    """Drain pending rows from the per-tenant `documents` registry (async lane).
+
+    For each pending document: claim it (pending → processing, atomic), run the
+    per-chunk HYBRID extraction (_document_chunk_edges) and ingest through the WGM
+    gate (source="mcp" → user_stated, durable), then flip status → 'ready' with the
+    per-chunk tallies. Per-chunk failure NEVER aborts the document (chunks_failed++);
+    a catastrophic failure marks the row 'error' with the message so it stops being
+    re-claimed (the chunks JSONB is retained verbatim for a future re-mine).
+
+    Runs INSIDE the caller's INGEST_ENABLED guard (a frozen store never drains, and
+    the gated backend would refuse the /ingest anyway). Per-tenant error isolation
+    mirrors reextract_episodic: any failure rolls back this tenant's connection and
+    returns; it never poisons the loop. Returns the count of documents finalized
+    (ready or error) this cycle."""
+    finalized = 0
+    try:
+        if schema_name:
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                db_conn.commit()
+            except Exception as e:
+                log.warning(f"re_embedder.document_search_path_failed schema={schema_name}: {e}")
+
+        # Migration 264 capability, resolved ONCE per drain call: pre-264 schemas have no
+        # documents.brain_deferred_since, and the finalize / deadline-requeue UPDATEs below
+        # name it. They CANNOT fall back via except-and-retry the way the claim does — an
+        # exception inside that try is what marks a document status='error', so an
+        # unmigrated schema would turn every healthy finalize into a false terminal error.
+        # One catalog probe keeps both sites branchable with no mid-flight abort.
+        _has_defer_clock = False
+        _has_remine_cols = False
+        try:
+            with db_conn.cursor() as cur:
+                # Prefer the EXPLICIT tenant schema over current_schema(): the SET
+                # search_path above can fail (logged, not raised), and a probe that
+                # then read current_schema() would silently grade a MIGRATED tenant
+                # as pre-264 and fall it back to the count bound (critic round 3,
+                # latent). schema_name is bound as a PARAMETER, never interpolated.
+                if schema_name:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'brain_deferred_since'",
+                        (schema_name,))
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'brain_deferred_since'")
+                _has_defer_clock = cur.fetchone() is not None
+                # Same probe for `chunk_state` (migration 205): the legacy-lane ledger write in
+                # the terminal finalize names the column, and an UndefinedColumn there would
+                # abort the finalize and mis-mark a healthy document 'error' (the exact failure
+                # mode the defer-clock probe above was added to prevent).
+                if schema_name:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'chunk_state'",
+                        (schema_name,))
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'chunk_state'")
+                _has_chunk_state = cur.fetchone() is not None
+                # Same probe for the re-mine marks (migration 298): the replay-tagging read
+                # and the zero-edge finalize stamp name these columns. Absent (pre-298
+                # schema) → replay=False everywhere and no stamping — byte-for-byte the
+                # shipped behaviour, the same fail-safe the other probes buy.
+                if schema_name:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'reextract_attempts'",
+                        (schema_name,))
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'reextract_attempts'")
+                _has_remine_cols = cur.fetchone() is not None
+                # Same probe for plain `attempts` (migration 195): the attempt-weighted
+                # claim ORDER BY and the zombie quarantine both NAME the column in SQL,
+                # and a pre-195 schema would reject the statement (UndefinedColumn,
+                # 42703 — NOT the undefined-TABLE 42P01 the handler below tolerates).
+                # Pre-195 → plain FIFO order and no quarantine, byte-for-byte today.
+                if schema_name:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'attempts'",
+                        (schema_name,))
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'attempts'")
+                _has_attempts_col = cur.fetchone() is not None
+        except Exception:
+            _has_defer_clock = False
+            _has_chunk_state = False
+            _has_remine_cols = False
+            _has_attempts_col = False
+
+        # ── ZOMBIE QUARANTINE (BUG docdrain-fifo-starvation, 2026-10-26) ─────────────────
+        # BEFORE any slot is spent: a pending document that is BOTH (1) at lifetime
+        # attempts >= _DOC_DRAIN_HARD_CEILING (DOC_REMINE_MAX_ATTEMPTS × 3, default 9)
+        # AND (2) at least _DOC_DRAIN_ZOMBIE_MIN_AGE (default 24h) into one CONTINUOUS
+        # unproductive deferral episode is dead weight that will not succeed on attempt
+        # N+1 — flip it terminal 'error' NOW so it cannot burn spare batch slots for the
+        # remaining 30 days. TWO-KEYED on purpose (gauntlet round 1): the count key alone
+        # is the 95fb517b defect — a plain brain-down defer re-pends instantly claimable
+        # and an INNOCENT document reaches any fixed count minutes into an hours-to-
+        # all-day outage. The age key is what makes the verdict about the DOCUMENT, not
+        # the brain: no episode clock (NULL) = not a zombie = the wall clock owns it; a
+        # paced park never reaches the count key (its claims are refunded); a pre-264
+        # schema has no clock column and keeps its legacy count bound instead.
+        # 'pending'-only on purpose: a zombie mid-pass under a live claim lease re-pends
+        # at the end of its pass and is quarantined at the START of the next cycle,
+        # before any claim can take it again (the finalize UPDATE carries no status
+        # guard, so yanking a 'processing' row mid-flight would let the finalize
+        # overwrite the quarantine — convergent beats racy).
+        if _has_attempts_col and _has_defer_clock:
+            _quarantined: list = []
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, attempts FROM documents
+                        WHERE status = 'pending' AND attempts >= %s
+                          AND brain_deferred_since IS NOT NULL
+                          AND brain_deferred_since <= now()
+                              - (%s * interval '1 second')
+                        ORDER BY created_at ASC
+                        """,
+                        (_DOC_DRAIN_HARD_CEILING, _DOC_DRAIN_ZOMBIE_MIN_AGE_S),
+                    )
+                    _quarantined = list(cur.fetchall())
+                if not _quarantined:
+                    release_read_transaction(
+                        db_conn,
+                        context="re_embedder.drain_pending_documents.quarantine_probe")
+            except psycopg2.Error as _q_err:
+                # Fail-safe: quarantine is an OPTIMIZATION of the batch, never a
+                # precondition — any error here logs (quietly for the expected
+                # pre-migration-183 undefined-table) and the drain proceeds un-quarantined.
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                if getattr(_q_err, "pgcode", None) != "42P01":
+                    log.warning(
+                        f"re_embedder.document_zombie_probe_failed "
+                        f"user_id={user_id[:8] if user_id else 'unknown'} "
+                        f"schema={schema_name}: {_q_err}")
+            for _z_id, _z_attempts in _quarantined:
+                try:
+                    with db_conn.cursor() as cur:
+                        # The WHERE re-checks status AND the ceiling: if another lane
+                        # claimed or re-pended the row since the SELECT, rowcount 0 and
+                        # this is a no-op — the verdict only ever lands on a row that is
+                        # STILL an unclaimed zombie. (The episode-age predicate is not
+                        # re-checked: age only GROWS, so a row that was old enough at
+                        # probe time is old enough at flip time.)
+                        cur.execute(
+                            "UPDATE documents SET status = 'error', ready_at = now(), "
+                            "error = %s WHERE id = %s AND status = 'pending' "
+                            "AND attempts >= %s",
+                            (f"zombie quarantine: lifetime attempts={_z_attempts} "
+                             f">= DOC_DRAIN_HARD_CEILING={_DOC_DRAIN_HARD_CEILING} "
+                             f"(DOC_REMINE_MAX_ATTEMPTS x 3) with an unproductive "
+                             f"episode >= DOC_DRAIN_ZOMBIE_MIN_AGE="
+                             f"{_DOC_DRAIN_ZOMBIE_MIN_AGE} — no longer claimable; "
+                             f"chunks retained verbatim; POST /documents/retry re-opens",
+                             _z_id, _DOC_DRAIN_HARD_CEILING),
+                        )
+                        _z_flipped = cur.rowcount
+                    db_conn.commit()
+                    if _z_flipped:
+                        _doc_log_crit(
+                            "re_embedder.document_zombie_quarantined",
+                            doc_id=_z_id, user_id=user_id[:8] if user_id else "unknown",
+                            attempts=_z_attempts,
+                            hard_ceiling=_DOC_DRAIN_HARD_CEILING,
+                            zombie_min_age=_DOC_DRAIN_ZOMBIE_MIN_AGE,
+                            bound="attempts >= DOC_DRAIN_HARD_CEILING AND episode age "
+                                  ">= DOC_DRAIN_ZOMBIE_MIN_AGE",
+                            note="terminal 'error'; chunks retained verbatim; "
+                                 "POST /documents/retry re-opens")
+                except Exception as _q_flip_err:  # noqa: BLE001 — per-zombie fail-safe
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                    log.warning(
+                        f"re_embedder.document_zombie_quarantine_failed doc_id={_z_id} "
+                        f"user_id={user_id[:8] if user_id else 'unknown'}: {_q_flip_err}")
+
+        # Fetch a modest batch of pending docs. ORDERING (BUG docdrain-fifo-starvation):
+        # the FIFO `created_at ASC` order gave two Oct-25 zombies (attempts=104/72) BOTH
+        # DOC_DRAIN_BATCH slots every cycle, starving a fresh ingest (attempts=0) for 34+
+        # minutes. The selector is now ATTEMPT-WEIGHTED: fresh docs (attempts=0) first,
+        # low-attempt (1-2) next, high-attempt zombies LAST, created_at ASC as the
+        # tie-break inside each band — deterministic, pure SQL, no LLM. The CLAIM
+        # ELIGIBILITY PREDICATE (backoff + lease reclaim) is UNCHANGED: this is batch
+        # SELECTION, not claim gating — a doc inside its backoff window is not eligible
+        # at any priority.
+        doc_ids: list = []
+        _weighted_order_used = False
+        try:
+            if _has_attempts_col:
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                            """
+                            SELECT id FROM documents
+                            WHERE (status = 'pending'
+                                   AND (started_at IS NULL
+                                        OR started_at < now() - (%s * interval '1 second')))
+                               OR (status = 'processing'
+                                   AND started_at IS NOT NULL
+                                   AND started_at < now() - %s::interval)
+                            ORDER BY CASE WHEN attempts = 0 THEN 0
+                                          WHEN attempts <= 2 THEN 1
+                                          ELSE 2 END ASC,
+                                     created_at ASC
+                            LIMIT %s
+                            """,
+                            (_DOC_RETRY_BACKOFF_S, _DOC_CLAIM_LEASE, batch_size),
+                        )
+                        doc_ids = [r[0] for r in cur.fetchall()]
+                    _weighted_order_used = True
+                except psycopg2.Error as _w_err:
+                    # FAIL-SAFE → today's FIFO (the brief's constraint): any error in the
+                    # weighting — a planner surprise, a transient connection state — falls
+                    # back to the byte-identical legacy selector below. The fresh-doc
+                    # guarantee below still runs, so even on the fallback path a fresh
+                    # document cannot be starved out of the batch.
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                    if getattr(_w_err, "pgcode", None) != "42P01":
+                        log.warning(
+                            f"re_embedder.document_drain_weighted_order_failed "
+                            f"user_id={user_id[:8] if user_id else 'unknown'} "
+                            f"schema={schema_name} (falling back to FIFO): {_w_err}")
+            if not _weighted_order_used:
+                with db_conn.cursor() as cur:
+                    # Also RECLAIM documents stranded in 'processing' past the lease.
+                    #
+                    # Nothing else in the codebase ever reads a 'processing' row back: the claim
+                    # flips pending -> processing, and only the finalize UPDATE moves it on. So if
+                    # the worker dies between those two points the row is stranded FOREVER — never
+                    # re-claimed, never terminal. The trigger is routine: a container restart mid
+                    # drain, or a db_conn that dies before finalize (in which case the outer
+                    # handler tries to write status='error' on the same broken connection, fails,
+                    # and swallows it).
+                    #
+                    # User-visible effect: /documents/pending counts ('pending','processing'), so
+                    # recall tells the user "still importing…" forever and the document's facts
+                    # never land. An entire document lost, silently, with a healthy-looking API.
+                    #
+                    # This deliberately reuses the EXISTING bounded-redelivery machinery rather
+                    # than adding a second one: the claim below bumps `attempts`, and
+                    # _DOC_MAX_ATTEMPTS already terminates a document that cannot make progress,
+                    # so a poisoned row is reaped a bounded number of times and then fails LOUD.
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                        """
+                        SELECT id FROM documents
+                        WHERE (status = 'pending'
+                               AND (started_at IS NULL
+                                    OR started_at < now() - (%s * interval '1 second')))
+                           OR (status = 'processing'
+                               AND started_at IS NOT NULL
+                               AND started_at < now() - %s::interval)
+                        ORDER BY created_at ASC
+                        LIMIT %s
+                        """,
+                        (_DOC_RETRY_BACKOFF_S, _DOC_CLAIM_LEASE, batch_size),
+                    )
+                    doc_ids = [r[0] for r in cur.fetchall()]
+            # ── FRESH-DOC GUARANTEE (fix C) ────────────────────────────────────────────
+            # At least ONE of the batch_size slots goes to the OLDEST eligible attempts=0
+            # document whenever one exists. With the weighted order above this is normally
+            # a no-op (a fresh doc sorts to the head, band 0 beats everything) — it exists
+            # for the failure paths: the FIFO fallback above, or any future ordering
+            # regression, must still not be able to starve a fresh ingest out of BOTH
+            # slots. A batch of zombies plus one fresh doc → the fresh doc TAKES the last
+            # slot from the lowest-priority zombie.
+            if _has_attempts_col and batch_size >= 1:
+                _fresh_id = None
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id FROM documents
+                            WHERE ((status = 'pending'
+                                    AND (started_at IS NULL
+                                         OR started_at < now() - (%s * interval '1 second')))
+                                   OR (status = 'processing'
+                                       AND started_at IS NOT NULL
+                                       AND started_at < now() - %s::interval))
+                              AND attempts = 0
+                            ORDER BY created_at ASC
+                            LIMIT 1
+                            """,
+                            (_DOC_RETRY_BACKOFF_S, _DOC_CLAIM_LEASE),
+                        )
+                        _fresh = cur.fetchone()
+                        _fresh_id = _fresh[0] if _fresh else None
+                    release_read_transaction(
+                        db_conn,
+                        context="re_embedder.drain_pending_documents.fresh_guarantee")
+                except psycopg2.Error as _fg_err:
+                    # Best-effort guarantee: an error here (e.g. pre-183 schema) logs and
+                    # the weighted/FIFO selection above stands on its own.
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                    if getattr(_fg_err, "pgcode", None) != "42P01":
+                        log.warning(
+                            f"re_embedder.document_fresh_guarantee_probe_failed "
+                            f"user_id={user_id[:8] if user_id else 'unknown'} "
+                            f"schema={schema_name}: {_fg_err}")
+                if _fresh_id is not None and _fresh_id not in doc_ids:
+                    if len(doc_ids) >= batch_size:
+                        doc_ids[-1] = _fresh_id
+                    else:
+                        doc_ids.append(_fresh_id)
+                    log.info(
+                        f"re_embedder.document_fresh_guaranteed doc_id={_fresh_id} "
+                        f"user_id={user_id[:8] if user_id else 'unknown'} "
+                        f"(oldest attempts=0 document reserved a batch slot)")
+            # READ BARRIER: the backend reachability probe and then the whole per-document
+            # chunk drain run on this connection; the pending-docs SELECT must not ride along.
+            release_read_transaction(
+                db_conn, context=f"re_embedder.drain_pending_documents.fetch schema={schema_name}")
+        except psycopg2.Error as e:
+            # Pre-migration-183 schema (undefined_table) — not an error, just skip.
+            _rollback_and_reapply_search_path(db_conn, schema_name)
+            if getattr(e, "pgcode", None) == "42P01":
+                return 0
+            raise
+
+        if not doc_ids:
+            return 0
+
+        # DOCDRAIN — DO NOT CLAIM WHAT WE CANNOT PROCESS. The re_embedder shares a container
+        # with the API, so on every deploy/restart this loop wakes while uvicorn is still
+        # binding. Claiming then means every chunk connect-refuses and the document is burned
+        # to TERMINAL 'partial' in seconds (measured: 1153/1166 chunk failures in one 6h
+        # window were ECONNREFUSED; two 200-chunk documents destroyed in 1.5s).
+        # One cheap probe converts that from permanent loss into a one-interval delay.
+        if DOC_BACKEND_READY_PROBE and not _backend_is_reachable(backend_url):
+            log.warning(
+                f"re_embedder.document_drain_backend_unreachable user_id={user_id[:8]} "
+                f"schema={schema_name} pending={len(doc_ids)} backend={backend_url} "
+                f"(nothing claimed — retrying next cycle)")
+            return 0
+
+        for doc_id in doc_ids:
+            # Claim atomically: pending → processing. Another worker/cycle may have
+            # taken it — rowcount 0 → skip. RETURNING gives us the chunk list.
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.drain_pending_documents.iteration")
+            _attempts = 0
+            try:
+                with db_conn.cursor() as cur:
+                    try:
+                        # DOCLOSS-B: count the claim. `attempts` bounds the at-least-once
+                        # redelivery below so a document whose brain never recovers cannot
+                        # re-pend forever. Pre-migration-195 schema → legacy claim.
+                        #
+                        # brain_deferred_since (migration 264) rides out UNCHANGED. Two
+                        # reasons, and the first is mechanical: RETURNING yields
+                        # POST-UPDATE values, so a SET ... = NULL here could never hand
+                        # the defer handler the clock it needs to judge age (caught by a
+                        # live one-off-container probe against real Postgres — a fake-conn
+                        # unit test had scripted the pre-UPDATE value, a state the real
+                        # SQL cannot produce). The second is semantic: a claim does NOT
+                        # end a deferral episode — it is a pure DB write that succeeds
+                        # while the brain is still down. The episode ends on PROGRESS: a
+                        # terminal finalize or a deadline requeue clears the clock there;
+                        # every defer of the episode reads it here, and the re-pend below
+                        # stamps it with COALESCE(now()) on the first defer only.
+                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                            """
+                            UPDATE documents
+                            SET status = 'processing', started_at = now(),
+                                attempts = attempts + 1
+                            WHERE id = %s
+                              AND ((status = 'pending'
+                                    AND (started_at IS NULL
+                                         OR started_at < now()
+                                            - (%s * interval '1 second')))
+                                   OR (status = 'processing'
+                                       AND started_at IS NOT NULL
+                                       AND started_at < now() - %s::interval))
+                            RETURNING chunks, source_ref, attempts, brain_deferred_since
+                            """,
+                            (doc_id, _DOC_RETRY_BACKOFF_S, _DOC_CLAIM_LEASE),
+                        )
+                    except psycopg2.errors.UndefinedColumn:
+                        # A THREE-RUNG CLAIM LADDER — the rung is decided by which columns
+                        # exist, and getting the middle rung wrong is how a termination
+                        # guard dies silently (fresh-critic round 1: the primary claim
+                        # names brain_deferred_since, so EVERY post-195/pre-264 schema
+                        # landed here — and this fallback did not increment attempts, so
+                        # the "retained" legacy count bound could NEVER fire and documents
+                        # re-pended forever at INFO strength. Measured live: all 41
+                        # pre-prod schemas are exactly post-195/pre-264 today).
+                        #
+                        # rung 2 — attempts exists, brain_deferred_since does not
+                        # (post-195, pre-264): claim WITH the attempt increment AND the
+                        # SAME reclaim-lease predicate as rung 1 — these schemas HAD
+                        # working reclaim through the old primary claim, and a rung with
+                        # only status='pending' would silently strand every document
+                        # left in 'processing' past the lease until 264 applies. The
+                        # defer handler then sees clock=None and its legacy count bound
+                        # works exactly as before migration 264 existed.
+                        # rollback resets search_path — re-apply the tenant bind (NO public).
+                        _rollback_and_reapply_search_path(db_conn, schema_name)
+                        try:
+                            with db_conn.cursor() as _lc:
+                                _lc.execute(
+                                    """
+                                    UPDATE documents
+                                    SET status = 'processing', started_at = now(),
+                                        attempts = attempts + 1
+                                    WHERE id = %s
+                                      AND ((status = 'pending'
+                                            AND (started_at IS NULL
+                                                 OR started_at < now()
+                                                    - (%s * interval '1 second')))
+                                           OR (status = 'processing'
+                                               AND started_at IS NOT NULL
+                                               AND started_at < now() - %s::interval))
+                                    RETURNING chunks, source_ref, attempts
+                                    """,
+                                    (doc_id, _DOC_RETRY_BACKOFF_S, _DOC_CLAIM_LEASE),
+                                )
+                                _claimed = _lc.fetchone()
+                            db_conn.commit()
+                            # 4th element None = no deferral clock on this schema.
+                            claimed = (_claimed[0], _claimed[1], _claimed[2], None) \
+                                if _claimed else None
+                        except psycopg2.errors.UndefinedColumn:
+                            # rung 3 — pre-195: no attempts column either. Legacy shape.
+                            _rollback_and_reapply_search_path(db_conn, schema_name)
+                            with db_conn.cursor() as _lc:
+                                _lc.execute(
+                                    """
+                                    UPDATE documents
+                                    SET status = 'processing', started_at = now()
+                                    WHERE id = %s AND status = 'pending'
+                                    RETURNING chunks, source_ref
+                                    """,
+                                    (doc_id,),
+                                )
+                                _claimed = _lc.fetchone()
+                            db_conn.commit()
+                            claimed = (_claimed[0], _claimed[1], 0, None) \
+                                if _claimed else None
+                    else:
+                        claimed = cur.fetchone()
+                        db_conn.commit()
+            except Exception as e:
+                log.error(f"re_embedder.document_claim_failed doc_id={doc_id} user_id={user_id[:8]}: {e}")
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                continue
+            if not claimed:
+                continue
+
+            chunks, source_ref = claimed[0], claimed[1]
+            _attempts = int(claimed[2] or 0) if len(claimed) > 2 else 0
+            # The deferral-episode clock as it stood at claim time (None until a
+            # brain-unavailable defer sets it; None on a pre-migration-264 schema).
+            _brain_deferred_since = claimed[3] if len(claimed) > 3 else None
+            chunks = chunks or []
+            committed = staged = chunks_failed = 0
+            # LEGACY-LANE LEDGER (None until the legacy pool below populates it; the queue
+            # lane maintains its own state via _drain_document_via_queue's incremental flush).
+            _legacy_state: Optional[dict] = None
+            # Round 5 (DOC_TEXT_LANE_BACKPRESSURE): chunks still owed AFTER this
+            # legacy pass ran its admitted slice — >0 means RE-PEND with the
+            # ledger (defer, never refuse), exactly like the queue lane's owed
+            # branch below. 0 on the queue lane, on an uncapped pass, and OFF.
+            _legacy_owed_remaining = 0
+            # REPLAY TAG (migration 298 / gauntlet R2): a document whose re-mine attempt
+            # count is > 0 is a RE-SEND of already-attempted content — every /ingest POST
+            # this drain makes for it carries the X-FL-Deferred-Replay marker so the
+            # backend's retired-value freeze engages. A FIRST drain (0, and any pre-298
+            # schema) never carries it — a first attempt IS a genuine write. Read AFTER the
+            # claim via the guarded helper (no claim-ladder fork); the flag is fixed for
+            # this drain pass, which is exactly its scope: the re-send-ness belongs to the
+            # content's history, not to any single chunk.
+            _doc_replay = (_has_remine_cols
+                           and _read_remine_attempts(db_conn, doc_id, schema_name) > 0)
+
+            def _process_one_chunk(idx, chunk):
+                """Thin delegate to the module-level `_process_document_chunk`.
+
+                The body was LIFTED to module scope (unchanged) so the queue lane and this
+                legacy lane run the SAME code instead of two copies that drift."""
+                return _process_document_chunk(
+                    chunk, idx=idx, doc_id=doc_id, user_id=user_id,
+                    backend_url=backend_url, source_ref=source_ref,
+                    statement_route=statement_route, replay=_doc_replay)
+
+            try:
+                # ── PARALLEL: the QUEUE lane (flag ON + Redis reachable) ──────────────
+                # Flag OFF or Redis down → fall straight through to the legacy pool below.
+                # `_queue_state` is None whenever the queue lane did not run, and every
+                # queue-specific branch downstream is guarded on it, so the OFF path is
+                # byte-identical.
+                _queue_state = None
+                _use_queue = DOC_CHUNK_QUEUE and _register_doc_chunk_handler()
+                if _use_queue:
+                    try:
+                        from src.ingest import chunk_queue as _cq_probe
+                        _use_queue = _cq_probe.available()
+                    except Exception:  # noqa: BLE001
+                        _use_queue = False
+                if _use_queue:
+                    _prior = _read_chunk_state(db_conn, doc_id, schema_name)
+                    # Carry forward what a PREVIOUS attempt already landed, so the finalize
+                    # tallies describe the whole document and not just this pass.
+                    for _st in (_prior or {}).values():
+                        if (_st or {}).get("s") == "done":
+                            committed += int(_st.get("c") or 0)
+                            staged += int(_st.get("g") or 0)
+                        elif (_st or {}).get("s") == "failed":
+                            chunks_failed += 1
+                    # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                    # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                    # transaction after it, and that read then rides across this hop. Measured live on the
+                    # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                    # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                    # seconds later.
+                    release_read_transaction(db_conn, context="re_embedder.drain_pending_documents.pre_blocking_call")
+                    _c, _s, _f, _queue_state, _fatal = _drain_document_via_queue(
+                        db_conn, doc_id, chunks, _prior, user_id=user_id,
+                        backend_url=backend_url, source_ref=source_ref,
+                        statement_route=statement_route, schema_name=schema_name,
+                        replay=_doc_replay)
+                    committed += _c
+                    staged += _s
+                    chunks_failed += _f
+                    if _fatal is not None:
+                        raise _fatal
+                else:
+                    # PARALLEL chunk drain: chunks are independent, so a bounded thread pool
+                    # turns the serial per-chunk /extract+/ingest pass into ~len/W wall-clock.
+                    # A RuntimeError from ANY chunk (backend freeze) re-raises out of .result()
+                    # → the outer handler re-pends the whole doc, exactly as the serial path did.
+                    #
+                    # LEGACY-LANE LEDGER (the Aug-8 evidence fix): this lane used to persist
+                    # COUNTS ONLY (chunks_failed) and discard the per-chunk evidence — the
+                    # shape measured on production docs 3/4/7 (chunk_state='{}', error='').
+                    # It now builds the SAME per-chunk terminal ledger the queue lane writes
+                    # ({"i": {"s": "done"|"failed", "c": n, "g": n, "e": reason}}) and flushes
+                    # it at the terminal finalize below, so a partial document names WHICH
+                    # chunks failed and WHY on BOTH lanes, and the retry lane can re-owe them.
+                    _legacy_state: dict = {}
+                    # RE-MINE KEEP HONOR (legacy pool): the queue lane's owed filter
+                    # (chunk_state entries not yet terminal) is what makes the prepass
+                    # flip's KEEP real — the default legacy lane has no such filter and
+                    # would re-read EVERY chunk, re-billing the brain for chunks that
+                    # already committed and re-POSTing their edges (a live-row
+                    # confirmed_count bump per kept fact per re-mine — reinforcement
+                    # without user evidence). On a re-mine drain (_doc_replay) the legacy
+                    # lane therefore mirrors the queue lane exactly: read the ledger once,
+                    # SKIP the done entries (the prepass kept exactly those), carry their
+                    # captured counts into the finalize tally, and SEED the ledger with
+                    # them so the finalize's ledger write does not wipe what it kept.
+                    # A non-replay drain is byte-for-byte unchanged (no read, no filter).
+                    if _doc_replay and _has_chunk_state:
+                        _remine_prior = _read_chunk_state(db_conn, doc_id, schema_name)
+                        for _st in (_remine_prior or {}).values():
+                            if isinstance(_st, dict) and _st.get("s") == "done":
+                                committed += int(_st.get("c") or 0)
+                                staged += int(_st.get("g") or 0)
+                        _legacy_state = {
+                            k: v for k, v in (_remine_prior or {}).items()
+                            if isinstance(v, dict) and v.get("s") == "done"}
+                        _legacy_chunks = [
+                            (i, c) for i, c in enumerate(chunks)
+                            if (_remine_prior or {}).get(str(i), {}).get("s") != "done"]
+                        # READ BARRIER: the ledger read above must not ride across the
+                        # per-chunk HTTP hops below (the same re-arm case the queue lane
+                        # barriers before its blocking call).
+                        release_read_transaction(
+                            db_conn,
+                            context="re_embedder.drain_pending_documents.remine_keep_filter")
+                    else:
+                        _legacy_chunks = list(enumerate(chunks))
+                        # ── ADMISSION CAP, legacy lane (round 5, DOC_TEXT_LANE_BACKPRESSURE) ──
+                        # Same doctrine as the queue lane above: at most the
+                        # per-seat chunk budget per pass, the rest stay owed in
+                        # the ledger and the document RE-PENDS. Owed-awareness
+                        # needs the chunk_state ledger (migration 205): without
+                        # the column there is no honest way to re-pend a PARTIAL
+                        # pass, so a pre-205 schema keeps the uncapped legacy
+                        # shape (byte-parity, same fail-safe as every other
+                        # _has_chunk_state gate in this drain).
+                        if DOC_TEXT_LANE_BACKPRESSURE and _has_chunk_state:
+                            _prior_state = _read_chunk_state(
+                                db_conn, doc_id, schema_name) or {}
+                            # THE BUDGET STAMP (bp): only chunks terminalized by
+                            # a CAPPED pass are owed-filtered on a non-replay
+                            # drain. A done/failed entry WITHOUT the stamp keeps
+                            # the shipped legacy semantics (re-read on the next
+                            # claim) — the re-mine keep-honor doctrine: the
+                            # ledger read must never silently change which
+                            # chunks a plain drain re-bills.
+                            def _bp_kept(idx: int) -> bool:
+                                _e = (_prior_state.get(str(idx)) or {})
+                                return (isinstance(_e, dict)
+                                        and _e.get("s") in ("done", "failed")
+                                        and _e.get("bp"))
+                            for _idx_kept in [i for i in range(len(chunks))
+                                              if _bp_kept(i)]:
+                                _st = _prior_state[str(_idx_kept)]
+                                if _st.get("s") == "done":
+                                    committed += int(_st.get("c") or 0)
+                                    staged += int(_st.get("g") or 0)
+                                else:
+                                    chunks_failed += 1
+                            _legacy_state = dict(_prior_state)
+                            _legacy_chunks = [
+                                (i, c) for i, c in _legacy_chunks
+                                if not _bp_kept(i)]
+                            from src.ingest import corpus_store as _cs
+                            _adm = _cs.chunk_pass_admission(len(_legacy_chunks))
+                            if _adm["deferred"] > 0:
+                                _legacy_owed_remaining = _adm["deferred"]
+                                _legacy_chunks = _legacy_chunks[:_adm["admit"]]
+                                log.info(
+                                    f"re_embedder.document_chunk_admission_deferred "
+                                    f"doc_id={doc_id} user_id={user_id[:8]} "
+                                    f"lane=legacy admitted={_adm['admit']} "
+                                    f"deferred={_adm['deferred']} cap={_adm['cap']} "
+                                    f"(per-pass chunk budget — the rest stay owed; "
+                                    f"document re-pends)")
+                            # READ BARRIER: the ledger read above must not ride
+                            # across the per-chunk HTTP hops below.
+                            release_read_transaction(
+                                db_conn,
+                                context="re_embedder.drain_pending_documents.admission_cap")
+                    _conc = min(_DOC_CHUNK_CONCURRENCY, max(1, len(_legacy_chunks)))
+                    if _conc <= 1:
+                        _results = [_process_one_chunk(i, c) for i, c in _legacy_chunks]
+                    else:
+                        with ThreadPoolExecutor(max_workers=_conc) as _ex:
+                            _futs = [_ex.submit(_process_one_chunk, i, c)
+                                     for i, c in _legacy_chunks]
+                            _results = [f.result() for f in _futs]  # ordered; re-raises freeze
+                    for (_i, _ci), _res in zip(_legacy_chunks, _results):
+                        _cls = _res[4] if isinstance(_res, tuple) and len(_res) >= 5 else None
+                        if isinstance(_res, tuple) and len(_res) >= 4:
+                            _c, _s, _f, _reason = _res[0], _res[1], _res[2], _res[3]
+                        else:
+                            _c, _s, _f, _reason = _res[0], _res[1], _res[2], None
+                        committed += _c
+                        staged += _s
+                        chunks_failed += _f
+                        _legacy_state[str(_i)] = (
+                            _chunk_terminal_entry("done", c=_c, g=_s, cls=_cls) if not _f
+                            else _chunk_terminal_entry("failed",
+                                                       reason=str(_reason or "unread")[:200]))
+                    if _legacy_owed_remaining:
+                        # CAPPED PASS: stamp this pass's terminal entries so the
+                        # NEXT claim's owed filter skips exactly them (bp) — done
+                        # work the budget lane itself scheduled is never re-spent.
+                        for _i, _c in _legacy_chunks:
+                            _e = _legacy_state.get(str(_i))
+                            if isinstance(_e, dict):
+                                _e["bp"] = 1
+
+                # ── chunk_failure_rate: the SECONDARY signal, teed where it already happens ──
+                # A document that finishes with unread chunks looks identical to a good one from
+                # the outside: the user asks a question, gets an answer built on partial capture,
+                # and nothing tells them a section was never read. saas/brain_health.py flagged
+                # this slot as "not measured" because this file was outside that pass's scope;
+                # this closes it. BOTH outcomes are emitted (see the last-write-wins contract in
+                # brain_health.probe_event): a clean document must clear a previous failure, or
+                # the alarm stays lit forever on a lane that has since recovered.
+                _bh_note_doc_chunks(user_id, len(chunks), chunks_failed, doc_id)
+
+                # DOCLOSS-B: THE TERMINAL STATUS MUST REFLECT REALITY. A document that
+                # finished with unread chunks is NOT 'ready' — 'ready' is the signal every
+                # downstream reader (recall's not-ready probe, the bench's terminal poll, a
+                # tenant console) treats as "this document is fully in memory". Reporting
+                # 'ready' over failed chunks is the same silent-success lie as the truncation
+                # cap, one layer down. Terminal 'partial' + log_crit; the failed chunks stay
+                # verbatim in documents.chunks AND the episodic log for a later re-mine.
+                _terminal = "partial" if (DOC_CHUNK_FAILURE_LOUD and chunks_failed > 0) else "ready"
+
+                # ── PARALLEL: A CHUNK THAT WAS NEVER REACHED MUST NOT BE STAMPED TERMINAL ──
+                # This is the burned-chunk fix at the document grain. Under the queue lane a
+                # chunk with NO entry in the ledger was never given a terminal outcome — the
+                # run hit its deadline, or a worker died and its lease had not yet been reaped.
+                # 'partial' is TERMINAL: every downstream reader stops looking, and ~1000
+                # chunks were destroyed exactly that way in one day. Put the document back to
+                # 'pending' instead; the next claim re-queues ONLY the owed chunks (the ledger
+                # says which), so nothing already done is re-spent. Bounded by the SAME
+                # `attempts` counter that bounds the brain-outage deferral — a document that
+                # cannot finish still terminates, it just is not terminated on the first miss.
+                _owed = 0
+                if _queue_state is not None:
+                    _owed = sum(1 for i in range(len(chunks))
+                                if (_queue_state.get(str(i)) or {}).get("s")
+                                not in ("done", "failed"))
+                elif _legacy_owed_remaining:
+                    # Round 5 (DOC_TEXT_LANE_BACKPRESSURE): the legacy pool ran a
+                    # budget-capped PARTIAL pass — the un-admitted remainder is
+                    # owed and the document re-pends with the ledger below.
+                    _owed = _legacy_owed_remaining
+                #
+                # THE OWED LANE IS BOUNDED BY THE SAME DOCTRINE AS THE FREEZE LANE
+                # (fresh-critic round 3). This gate used the LIFETIME `attempts` count
+                # (`_attempts < _DOC_MAX_ATTEMPTS`), and a queue pass can run ~56 min
+                # against a 30-min claim lease — so deadline requeues and lease
+                # reclaims alone, with a HEALTHY brain and real partial progress,
+                # walked a migrated-schema document to a terminal 'partial' at
+                # attempts>=5: blaming the document for system conditions, the exact
+                # 95fb517b/round-2 defect through a second doorway. The bound here is
+                # now PROGRESS-AWARE: a deadline requeue counts as progress ONLY when
+                # the owed count actually DECREASED this pass. A productive requeue
+                # clears the episode clock; an UNPRODUCTIVE one keeps/stamps it, and
+                # the 30-day wall clock — never the lifetime count — terminates. On
+                # pre-264 schemas the legacy count bound stays (nothing else exists).
+                _prior_owed = len(chunks)
+                if _queue_state is not None:
+                    _prior = _prior or {}
+                    _prior_owed = sum(1 for i in range(len(chunks))
+                                      if (_prior.get(str(i)) or {}).get("s")
+                                      not in ("done", "failed"))
+                elif _legacy_owed_remaining:
+                    # Legacy capped pass: before this pass, everything the pass
+                    # just processed (admitted slice) was also owed.
+                    _prior_owed = _owed + len(_legacy_chunks)
+                _progress = ((_queue_state is not None or _legacy_owed_remaining)
+                             and _owed < _prior_owed)
+                _unproductive_age_s = None
+                if _has_defer_clock and _owed and not _progress \
+                        and _brain_deferred_since is not None:
+                    try:
+                        _cs = _brain_deferred_since
+                        if not _cs.tzinfo:
+                            _cs = _cs.replace(tzinfo=timezone.utc)
+                        _unproductive_age_s = max(
+                            0.0, (datetime.now(timezone.utc) - _cs).total_seconds())
+                    except (AttributeError, TypeError, ValueError):
+                        _unproductive_age_s = None
+                if _owed and _has_defer_clock:
+                    _owed_exhausted = (DOC_CHUNK_FAILURE_LOUD
+                                       and _unproductive_age_s is not None
+                                       and _unproductive_age_s >= _DOC_BRAIN_DEFER_MAX_AGE_S)
+                elif _owed:
+                    _owed_exhausted = (DOC_CHUNK_FAILURE_LOUD
+                                       and _attempts >= _DOC_MAX_ATTEMPTS)
+                else:
+                    _owed_exhausted = False
+                # ── HARD RETRY CEILING (round 5, DOC_TEXT_LANE_BACKPRESSURE) ────────
+                # The defer clock bounds a re-pend loop at 30 DAYS — honest for a
+                # brain outage, but the 180s-timeout × fallback × re-pend tail is
+                # a LOOP, not an outage patient: each unproductive pass
+                # re-schedules the same chunks against the same wedged brain.
+                # The ceiling bounds UNPRODUCTIVE passes only, counted in the
+                # ledger's reserved "_bp" key ({"s": "passes", "u": N}) — an
+                # EPISODE-scoped counter, deliberately NOT the lifetime
+                # `attempts` (keying on lifetime attempts is the exact 95fb517b
+                # defect the round-3 pin retired: productive passes and lease
+                # events must never walk a document to a terminal verdict).
+                # Progress resets the counter; a productive multi-pass document
+                # is draining, never looping, and is never terminated here.
+                _ceiling = None
+                # The ledger to re-pend with: the queue lane's merged state, or
+                # the legacy pool's terminal ledger on a capped partial pass
+                # (round 5 — _legacy_state carries prior terminal entries PLUS
+                # this pass's, so the next claim re-runs only what is owed).
+                _requeue_state = (_queue_state if _queue_state is not None
+                                  else _legacy_state)
+                _bp_passes = 0
+                if isinstance(_requeue_state, dict):
+                    _bp_rec = _requeue_state.get("_bp")
+                    if isinstance(_bp_rec, dict):
+                        try:
+                            _bp_passes = max(0, int(_bp_rec.get("u") or 0))
+                        except (TypeError, ValueError):
+                            _bp_passes = 0
+                if DOC_TEXT_LANE_BACKPRESSURE and _owed and not _progress \
+                        and not _owed_exhausted:
+                    from src.ingest import corpus_store as _csrc
+                    _ceiling = _csrc.retry_ceiling_verdict(_bp_passes + 1, _progress)
+                    _owed_exhausted = _ceiling["exhausted"]
+                if _owed and not _owed_exhausted:
+                    # The EPISODE COUNTER rides the re-pend: productive → 0
+                    # (the episode is over), unproductive → N+1 (this pass is
+                    # the (N+1)th in a row). "_bp" is a dict under a reserved
+                    # NON-INDEX key — index-based readers never see it, and the
+                    # values()-iterators ignore it (s="passes" matches neither
+                    # "done" nor "failed").
+                    _requeue_state = dict(_requeue_state or {})
+                    _requeue_state["_bp"] = {
+                        "s": "passes", "u": (0 if _progress else _bp_passes + 1)}
+                    with db_conn.cursor() as cur:
+                        # _has_defer_clock gates every column reference: pre-264
+                        # schemas must not see the column at all (see the capability
+                        # probe above for why not try/except).
+                        if _has_defer_clock and _progress:
+                            cur.execute(
+                                "UPDATE documents SET status = 'pending', started_at = NULL, "
+                                "chunk_state = %s::jsonb, brain_deferred_since = NULL "
+                                "WHERE id = %s",
+                                (json.dumps(_requeue_state), doc_id))
+                        elif _has_defer_clock:
+                            # unproductive: START (or keep) the no-progress episode
+                            # clock — this is what makes the wall clock able to bound
+                            # this lane at all.
+                            cur.execute(
+                                "UPDATE documents SET status = 'pending', started_at = NULL, "
+                                "chunk_state = %s::jsonb, "
+                                "brain_deferred_since = COALESCE(brain_deferred_since, now()) "
+                                "WHERE id = %s",
+                                (json.dumps(_requeue_state), doc_id))
+                        else:
+                            cur.execute(
+                                "UPDATE documents SET status = 'pending', started_at = NULL, "
+                                "chunk_state = %s::jsonb WHERE id = %s",
+                                (json.dumps(_requeue_state), doc_id))
+                    db_conn.commit()
+                    _p_note = "progress" if _progress else "no progress this pass"
+                    log.warning(
+                        f"re_embedder.document_requeued doc_id={doc_id} user_id={user_id[:8]} "
+                        f"owed={_owed}/{len(chunks)} attempt={_attempts} ({_p_note}; "
+                        f"returned to the queue, not burned)")
+                    continue
+                if _owed:
+                    # Terminal on the bound that decided — and it says so loudly.
+                    chunks_failed += _owed
+                    _terminal = "partial" if DOC_CHUNK_FAILURE_LOUD else "ready"
+                    _owed_bound = ("unproductive episode "
+                                   + str(int(_unproductive_age_s or 0) // 86400) + " days "
+                                   + ">= DOC_BRAIN_DEFER_MAX_AGE="
+                                   + _DOC_BRAIN_DEFER_MAX_AGE
+                                   if _has_defer_clock else
+                                   "max_attempts=" + str(_DOC_MAX_ATTEMPTS))
+                    if _ceiling is not None and _ceiling["exhausted"]:
+                        _owed_bound = ("unproductive passes=" + str(_ceiling["passes"])
+                                       + " >= DOC_TEXT_LANE_RETRY_CEILING="
+                                       + str(_ceiling["ceiling"]))
+                    _doc_log_crit("re_embedder.document_owed_chunks_exhausted",
+                                  doc_id=doc_id, user_id=user_id[:8], owed=_owed,
+                                  attempts=_attempts, bound=_owed_bound,
+                                  note="verbatim_text_retained_in_documents.chunks+episodic")
+
+                with db_conn.cursor() as cur:
+                    # brain_deferred_since = NULL: terminal — any deferral episode is
+                    # over (migration 264). Gated on the capability probe: naming the
+                    # column on a pre-264 schema would abort this UPDATE and the except
+                    # below would mis-mark a healthy document as status='error'.
+                    # LEGACY-LANE LEDGER: when the legacy pool ran, persist the per-chunk
+                    # terminal ledger it built (reasons included) alongside the counts —
+                    # gated on the chunk_state capability probe for the same reason.
+                    _legacy_ledger_sql = ""
+                    _legacy_ledger_args: list = []
+                    if _legacy_state is not None and _has_chunk_state:
+                        _legacy_ledger_sql = ", chunk_state = %s::jsonb"
+                        _legacy_ledger_args = [json.dumps(_legacy_state)]
+                    if _has_defer_clock:
+                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                            """
+                            UPDATE documents
+                            SET status = %s, ready_at = now(),
+                                facts_committed = %s, facts_staged = %s, chunks_failed = %s,
+                                brain_deferred_since = NULL
+                            """ + _legacy_ledger_sql + """
+                            WHERE id = %s
+                            """,
+                            (_terminal, committed, staged, chunks_failed,
+                             *_legacy_ledger_args, doc_id),
+                        )
+                    else:
+                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                            """
+                            UPDATE documents
+                            SET status = %s, ready_at = now(),
+                                facts_committed = %s, facts_staged = %s, chunks_failed = %s
+                            """ + _legacy_ledger_sql + """
+                            WHERE id = %s
+                            """,
+                            (_terminal, committed, staged, chunks_failed,
+                             *_legacy_ledger_args, doc_id),
+                        )
+                db_conn.commit()
+                # RE-MINE MARK STAMP (migration 298, the "stamped on ingest" half): a
+                # document that finalizes with ZERO committed edges or a 'partial' verdict
+                # is exactly the re-mine cohort — record the tenant's walkable-place count
+                # at this moment so the bookkeeping exists from the FIRST finalize and a
+                # future regrowth-gated selection has its baseline (the migration-197 mark
+                # semantics). Happy path (committed > 0, 'ready') is untouched — zero extra
+                # queries. The attempts counter is deliberately NOT touched here: only the
+                # re-mine pass increments it. Best-effort: a failed count or write logs and
+                # moves on — bookkeeping must never re-verify a terminal verdict.
+                if _has_remine_cols and (committed == 0 or _terminal == "partial"):
+                    try:
+                        _remine_mark = _tenant_walkable_place_count(db_conn, schema_name)
+                        if _remine_mark is not None:
+                            with db_conn.cursor() as _mc:
+                                _mc.execute(
+                                    "UPDATE documents SET reextract_ontology_mark = %s "
+                                    "WHERE id = %s",
+                                    (_remine_mark, doc_id))
+                            db_conn.commit()
+                    except Exception as _stamp_err:  # noqa: BLE001 — bookkeeping, never fatal
+                        log.warning(f"re_embedder.document_remine_mark_failed "
+                                    f"doc_id={doc_id} user_id={user_id[:8]}: {_stamp_err}")
+                        try:
+                            _rollback_and_reapply_search_path(db_conn, schema_name)
+                        except Exception as _rb_err:  # noqa: BLE001 — the txn is already
+                            # aborted; the warning above is the failure record. This log
+                            # exists so the cleanup failure is never silent.
+                            log.warning(f"re_embedder.document_remine_mark_rollback_failed "
+                                        f"doc_id={doc_id} user_id={user_id[:8]}: {_rb_err}")
+                finalized += 1
+                if _terminal == "partial":
+                    _doc_log_crit("re_embedder.document_partial",
+                                  doc_id=doc_id, user_id=user_id[:8], chunks=len(chunks),
+                                  chunks_failed=chunks_failed, committed=committed, staged=staged,
+                                  note="unread_chunks_retained_verbatim_in_documents.chunks+episodic")
+                else:
+                    log.info(f"re_embedder.document_ready doc_id={doc_id} user_id={user_id[:8]} "
+                             f"chunks={len(chunks)} committed={committed} staged={staged} "
+                             f"failed={chunks_failed} route={statement_route}")
+
+            except RuntimeError as freeze_err:
+                # Backend frozen OR the tenant's brain is unavailable (DocumentBrainUnavailable,
+                # a RuntimeError subclass — an OPEN circuit breaker). Same correct response:
+                # put the whole document back to 'pending' and retry on a later cycle, which is
+                # the at-least-once redelivery this lane already implements (Nygard, Release It!:
+                # while the breaker is open the caller takes the fallback path and the work is
+                # retried after the reset timeout — it is NOT discarded).
+                # DOCLOSS-B: BOUND the redelivery. Without a bound, a document whose brain never
+                # comes back re-pends forever and its 'pending' state is indistinguishable from
+                # "queued and fine" — a slow-motion silent loss. Past _DOC_MAX_ATTEMPTS the
+                # document TERMINATES as 'error' with the reason (chunks retained verbatim).
+                # EXCEPTION — rate_deferred (critic pass 3): that bound was sized for a
+                # breaker-open outage (MINUTES); a background daily-budget park lasts HOURS by
+                # design (until reset_ms). Burning an attempt per 60s cycle terminally errored
+                # a user's upload ~5 minutes into a spent day — pass 2's hole reopened with a
+                # different terminal status. A PACED defer has a provider-bounded recovery
+                # (the window rolls), so it re-pends WITHOUT consuming the attempt budget.
+                # A FROZEN BACKEND IS NOT A DOCUMENT THAT CANNOT BE READ. DOCLOSS-B's
+                # attempt bound exists so a document whose BRAIN never returns cannot pend
+                # forever invisibly -- that rationale is about the brain. `ingest_disabled`
+                # is the BACKEND declining to store anything, for every document equally,
+                # and it is raised as a plain RuntimeError rather than
+                # DocumentBrainUnavailable, so it was silently inheriting the brain's bound
+                # and terminating uploads as 'error' during a freeze that had nothing to do
+                # with them. Same lane-versus-row split as the episodic poison guard.
+                _err_s = str(freeze_err)
+                _paced = "rate_deferred" in _err_s
+                _backend_frozen = "backend ingest disabled" in _err_s
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                #
+                # THE BOUND IS WALL CLOCK, NOT A COUNT — the question 95fb517b deliberately
+                # deferred, answered (see _DOC_BRAIN_DEFER_MAX_AGE for the magnitude). A claim
+                # COUNT is outage duration sized by the drain interval, and 95fb517b measured
+                # that sizing empirically wrong: brains sit unavailable for HOURS while five
+                # claims at a 60s cadence terminated an innocent upload in ~5 minutes. On a
+                # migrated schema (brain_deferred_since came back from the claim) the verdict
+                # is: has THIS document been CONTINUOUSLY deferred longer than every outage
+                # class the system has observed? If yes, no outage this deployment has ever
+                # seen explains it — genuinely unprocessable, terminate loudly, verbatim
+                # retained. Pre-migration-264 schema (clock is None): legacy attempt bound.
+                # THE VERDICT KEYS ON SCHEMA CAPABILITY, NOT ON THE CLOCK VALUE
+                # (fresh-critic round 2). The claim RETURNINGs the clock as it stood
+                # AT CLAIM TIME, so the FIRST defer of a fresh episode always sees
+                # NULL — the previous progress event cleared it. `attempts`, by
+                # contrast, is a LIFETIME counter (never reset; every claim
+                # increments it, including lease-reclaims and deadline requeues on a
+                # healthy-but-slow brain). Branching a NULL clock to the count bound
+                # therefore terminated a migrated-schema document carrying 4 lifetime
+                # claims on the first defer of a NEW outage, ~0 seconds in — the
+                # exact 95fb517b defect (blaming the document for the brain's
+                # outage) alive inside the mechanism that retires it. On a migrated
+                # schema NULL means "episode not started" = age 0 = survive; the
+                # count bound exists ONLY for schemas without the column.
+                _clock_age_s = None
+                if _brain_deferred_since is not None:
+                    try:
+                        _cs = _brain_deferred_since
+                        if not _cs.tzinfo:
+                            _cs = _cs.replace(tzinfo=timezone.utc)
+                        _clock_age_s = max(
+                            0.0, (datetime.now(timezone.utc) - _cs).total_seconds())
+                    except (AttributeError, TypeError, ValueError):
+                        _clock_age_s = None
+                if _has_defer_clock:
+                    # MIGRATED SCHEMA: the wall clock is the ONLY bound. A NULL or
+                    # unusable clock means age 0 / unknown — fail toward re-pend,
+                    # never toward the count bound: a TIMESTAMPTZ RETURNING only
+                    # ever yields a datetime or None, so "unusable" is paranoia,
+                    # and the count bound is the defect this migration retires.
+                    _exhausted = (DOC_CHUNK_FAILURE_LOUD and not _paced
+                                  and not _backend_frozen
+                                  and _clock_age_s is not None
+                                  and _clock_age_s >= _DOC_BRAIN_DEFER_MAX_AGE_S)
+                    _bound_note = ("deferred_since=" + str(_brain_deferred_since)
+                                   + " defer_max_age_s=" + str(_DOC_BRAIN_DEFER_MAX_AGE_S))
+                    _err_msg = ("brain unavailable after " + str(_attempts) + " attempts "
+                                + "(deferred " + str(int(_clock_age_s or 0) // 86400)
+                                + " days, exceeds DOC_BRAIN_DEFER_MAX_AGE="
+                                + _DOC_BRAIN_DEFER_MAX_AGE + "): "
+                                + _errors.public_detail(freeze_err, where="doc.drain.deferred_exhausted",
+                                                        what=type(freeze_err).__name__))
+                else:
+                    # PRE-MIGRATION-264 SCHEMA: the legacy count bound is the only
+                    # bound that exists here (and on pre-195 schemas, where rung 3
+                    # yields attempts=0, it cannot fire — the documented honest
+                    # limit pinned by test_pre195_schema_documents_its_honest_limit).
+                    _exhausted = (DOC_CHUNK_FAILURE_LOUD and not _paced
+                                  and not _backend_frozen
+                                  and _attempts >= _DOC_MAX_ATTEMPTS)
+                    _bound_note = ("max_attempts=" + str(_DOC_MAX_ATTEMPTS))
+                    _err_msg = ("brain unavailable after " + str(_attempts) + " attempts: "
+                                + _errors.public_detail(freeze_err, where="doc.drain.attempts_exhausted",
+                                                        what=type(freeze_err).__name__))
+                try:
+                    with db_conn.cursor() as cur:
+                        if _exhausted:
+                            cur.execute(
+                                "UPDATE documents SET status = 'error', ready_at = now(), "
+                                "error = %s WHERE id = %s",
+                                (_err_msg, doc_id),
+                            )
+                        else:
+                            if _paced or _backend_frozen:
+                                # Give the burned claim-attempt back: the document waits out
+                                # the pace window at the SAME attempt count, so real failures
+                                # (which still count) retain the full budget.
+                                #
+                                # _backend_frozen belongs here for the same reason, and
+                                # suppressing _exhausted without refunding was not enough:
+                                # the claim query increments attempts every cycle, so a
+                                # five-minute freeze silently drained the whole budget and
+                                # the FIRST genuine brain hiccup after it lifted -- a breaker
+                                # open precisely because everything just reconnected --
+                                # terminated the upload as 'error' on its first attempt. The
+                                # fix without the refund only moved the loss later.
+                                #
+                                # The deferral clock is deliberately untouched here
+                                # too: a designed park must never age a document
+                                # toward a terminal verdict.
+                                #
+                                # RATE_DEFERRED BACKOFF (BUG-005): started_at = now() is the
+                                # backoff stamp, NOT a claim mark — on a PENDING row the
+                                # claim predicates treat a non-NULL started_at as "not
+                                # claimable before this instant" (see _DOC_RETRY_BACKOFF_S).
+                                # The old `started_at = NULL` made the re-pend claimable on
+                                # the very next 4s tick, so the drain re-ran the full
+                                # harvest-turn timeout ladder against the very budget that
+                                # had just refused it — 129/133 chunks died that way on prod
+                                # while the retry ladder consumed the 40 RPM budget itself.
+                                # The stamp self-expires (pure timestamp comparison; nothing
+                                # clears it) and 0 disables it.
+                                cur.execute(
+                                    "UPDATE documents SET status = 'pending', started_at = now(), "
+                                    "attempts = GREATEST(attempts - 1, 0) WHERE id = %s",
+                                    (doc_id,),
+                                )
+                            else:
+                                # Start (or keep) the CONTINUOUS deferral-episode clock.
+                                # COALESCE is exactly "first defer of this episode": the
+                                # clock is NULL since the last PROGRESS cleared it (terminal
+                                # finalize / productive requeue — the claim deliberately does
+                                # NOT clear it) or it was never set. A schema without the
+                                # column raises and lands in the except below — the plain
+                                # re-pend still happens there, so nothing is lost.
+                                cur.execute(
+                                    "UPDATE documents SET status = 'pending', started_at = NULL, "
+                                    "brain_deferred_since = COALESCE(brain_deferred_since, now()) "
+                                    "WHERE id = %s",
+                                    (doc_id,),
+                                )
+                    db_conn.commit()
+                    if _exhausted:
+                        finalized += 1
+                except Exception:
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                    try:
+                        with db_conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE documents SET status = 'pending', started_at = NULL WHERE id = %s",
+                                (doc_id,),
+                            )
+                        db_conn.commit()
+                    except Exception:
+                        _rollback_and_reapply_search_path(db_conn, schema_name)
+                if _exhausted:
+                    _doc_log_crit("re_embedder.document_redelivery_exhausted",
+                                  doc_id=doc_id, user_id=user_id[:8], attempts=_attempts,
+                                  bound=_bound_note, reason=str(freeze_err)[:200],
+                                  note="chunks_retained_verbatim_for_remine_NOT_ingested")
+                elif _paced:
+                    log.info(f"re_embedder.document_paced doc_id={doc_id} user_id={user_id[:8]} "
+                             f"attempts={_attempts} reason={str(freeze_err)[:120]} "
+                             f"note=re-pended without consuming the attempt budget; "
+                             f"retries when the daily budget window rolls")
+                elif _backend_frozen:
+                    log.info(f"re_embedder.document_backend_frozen doc_id={doc_id} "
+                             f"user_id={user_id[:8]} attempts={_attempts} "
+                             f"note=backend declined to store for EVERY document; re-pended "
+                             f"without consuming the attempt budget: {freeze_err}")
+                else:
+                    _age_note = (" deferred_for_s=" + str(int(_clock_age_s))
+                                 if _clock_age_s is not None else "")
+                    log.info(f"re_embedder.document_deferred doc_id={doc_id} user_id={user_id[:8]} "
+                             f"attempt={_attempts}{_age_note} "
+                             f"(brain unavailable — retry next cycle): {freeze_err}")
+                # Stop this cycle — the whole backend/brain is unavailable, no point continuing.
+                break
+            except Exception as e:
+                # Catastrophic per-document failure → mark 'error' so it isn't re-claimed.
+                _rollback_and_reapply_search_path(db_conn, schema_name)
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE documents SET status = 'error', ready_at = now(), error = %s WHERE id = %s",
+                            # PERSISTED then RENDERED (GET /documents/status, document_status tool):
+                            # the public shape goes in the row, the sentence to the CRIT line.
+                            (_errors.public_detail(e, where="doc.drain.document_failed", what="document processing failed"), doc_id),
+                        )
+                    db_conn.commit()
+                    finalized += 1
+                except Exception:
+                    _rollback_and_reapply_search_path(db_conn, schema_name)
+                log.error(f"re_embedder.document_error doc_id={doc_id} user_id={user_id[:8]}: {e}")
+
+    except Exception as e:
+        log.error(f"re_embedder.document_drain_error user_id={user_id[:8] if user_id else 'unknown'} "
+                  f"schema={schema_name}: {e}")
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+
+    return finalized
+
+
+def fast_drain_pending_documents_prepass(postgres_dsn: str, ready_schemas,
+                                         saas_skip, backend_api_url: str,
+                                         statement_route: str = "rewrite") -> int:
+    """Top-of-cycle FAST pre-pass for the async document lane (LATENCY FIX).
+
+    ``drain_pending_documents`` also runs in the in-order per-tenant walk, but there
+    it sits BEHIND that tenant's heavy passes (promotion, expiry, episodic
+    re-extraction, synonym convergence, whatis-climb, …) AND behind every earlier
+    active tenant's heavy passes — so with a slow brain over ~N schemas a freshly
+    enqueued document waited a FULL cycle to be reached (measured >6 min live), while
+    ingest_document promised ~seconds.
+
+    This pre-pass runs BEFORE any heavy pass and touches ONLY pending documents: a
+    cheap indexed EXISTS probe per tenant, and a drain ONLY for the tenants that
+    actually have a pending doc. So a queued doc is claimed on the very next poll tick
+    regardless of its position in the walk, never waiting behind unrelated lifecycle
+    work.
+
+    SAFETY / NO-REGRESSION: it is a STRICT SUBSET of what the in-order walk already
+    does (same drain, same claim/finalize SQL). A doc drained here is already 'ready'
+    when the in-order pass reaches it (its pending probe returns nothing → 0), so the
+    heavy passes are untouched. Per-tenant isolation mirrors the heavy walk: one shared
+    connection with ``_rollback_and_reapply_search_path`` on any per-tenant error, so a
+    broken / pre-migration-183 tenant is skipped and NEVER poisons the sweep. Honours
+    ``saas_skip`` (suspended/locked accounts) and binds each tenant's BYO brain
+    (fail-closed, no global spend). Callers gate on ingest_enabled — a frozen store
+    never drains. Returns the number of documents finalized this pre-pass; never raises.
+    """
+    finalized = 0
+    saas_skip = saas_skip or set()
+    _db = None
+    try:
+        _db = psycopg2.connect(postgres_dsn)
+        for _user, _schema in (ready_schemas or []):
+            if _user in saas_skip:
+                continue
+            try:
+                # Cheap pending probe — skip tenants with nothing to drain so a busy
+                # rig's pre-pass stays fast (one indexed EXISTS per tenant).
+                _has_pending = False
+                try:
+                    with _db.cursor() as _c:
+                        _c.execute(f"SET search_path TO {_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                        # BUG-005 residual: 'processing' MUST be probed too. The claim's
+                        # stale-lease reclaim arm is unreachable from THIS lane when the
+                        # only stranded row is 'processing' — a pending-only probe returns
+                        # nothing, the tenant is skipped, and a doc orphaned by a worker
+                        # death (prod doc_id=10, 2026-10-20) is invisible to the very
+                        # daemon that exists to drain it. The partial index from migration
+                        # 183 covers exactly this status pair, so the probe stays indexed;
+                        # the claim's lease predicate remains the only thing that can
+                        # actually TAKE a 'processing' row, so an in-flight drain by
+                        # another lane is still never stolen early.
+                        _c.execute("SELECT 1 FROM documents "
+                                   "WHERE status IN ('pending', 'processing') LIMIT 1")
+                        _has_pending = _c.fetchone() is not None
+                    _db.commit()
+                except psycopg2.Error as _probe_err:
+                    # Pre-migration-183 schema (undefined_table) or any probe error →
+                    # nothing to drain here; clean the txn and move on.
+                    _rollback_and_reapply_search_path(_db, _schema)
+                    if getattr(_probe_err, "pgcode", None) != "42P01":
+                        log.debug(f"re_embedder.fast_doc_probe_error schema={_schema}: {_probe_err}")
+                    continue
+                if not _has_pending:
+                    continue
+
+                _reembedder_bind_tenant_brain(_schema)
+                try:
+                    _n = drain_pending_documents(
+                        _db, backend_api_url, user_id=_user,
+                        schema_name=_schema, statement_route=statement_route,
+                    )
+                    if _n:
+                        finalized += _n
+                        log.info(f"re_embedder.fast_doc_drain user_id={_user[:8]} "
+                                 f"schema={_schema} docs={_n}")
+                finally:
+                    # THE CLEAR HALF OF THE BIND CONTRACT — this prepass binds per tenant
+                    # (above) and is the doc-drain daemon's WHOLE life (DOC_DRAIN_STANDALONE
+                    # runs it on its own tight loop), so a bind left standing after the drain
+                    # kept the LAST drained tenant's brain resident in this thread's context
+                    # FOREVER. Harmless only while every doc-lane call stays on the HTTP path
+                    # (the backend re-binds per request from the body user_id) — exactly the
+                    # kind of "today harmless, tomorrow a cross-tenant leak" seam the in-order
+                    # walk already closes (it clears at end of cycle) and the supervisor's
+                    # _run_tenant_work_cycle closes in its own finally. Same contract here.
+                    _reembedder_clear_tenant_brain()
+            except Exception as _fast_err:
+                # Per-tenant fail-safe: never let one tenant abort the sweep.
+                _rollback_and_reapply_search_path(_db, _schema)
+                log.warning(f"re_embedder.fast_doc_drain_error user_id={_user[:8]}: {_fast_err}")
+    except Exception as _prepass_err:
+        log.warning(f"re_embedder.fast_doc_drain_prepass_error: {_prepass_err}")
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception:
+                pass
+    return finalized
+
+
+def remine_documents_prepass(postgres_dsn: str, ready_schemas, saas_skip=None) -> int:
+    """DOCUMENT-lane ontology-regrowth re-mine (gauntlet R2; DOC_REMINE_ENABLED, default OFF).
+
+    The migration-298 analog of the episodic lane's regrowth re-eligibility: re-queue
+    terminal documents whose chunks produced ZERO committed edges (or that terminated
+    'partial') so the NORMAL drain re-reads them against the ontology as it stands NOW —
+    including rel_types/taxonomies grown since their last (failed) pass.
+
+    SELECTOR + STAMPER, NEVER A SECOND PIPELINE. The pass only (a) selects, (b) re-opens
+    the zero-edge/failed chunks in ``chunk_state`` (done chunks that committed something
+    are KEPT — re-reading a captured fact would double-count), and (c) flips the row
+    terminal → pending with the same transition POST /documents/retry uses
+    (started_at/ready_at NULL, attempts reset, brain_deferred_since cleared). The
+    ordinary drain then re-reads the owed chunks under the X-FL-Deferred-Replay marker
+    (their reextract_attempts > 0), inheriting every bound the drain already enforces:
+    the atomic claim, the DOC_RETRY_BACKOFF reclaim gate (a rate_deferred re-mine
+    reschedules at the paced cadence instead of hammering — the shared-backoff
+    requirement), the lease reclaim, the brain bind, the chunk queue.
+
+    BUDGET — every axis is bounded, because a growth-triggered backfill that ignores
+    budget is BUG-005 at corpus scale (and GraphRAG's own "indexing can be an expensive
+    operation" warning):
+      • DOC_REMINE_BATCH documents per pass, total (default 2);
+      • at most ONE document per tenant per pass, round-robin via a rotation cursor —
+        with batch=2 two DIFFERENT tenants are served each pass, never the same
+        corpus twice in a row;
+      • the pass runs at most once per DOC_REMINE_INTERVAL_SECONDS (default 900s) no
+        matter how often its callers tick (the doc-drain daemon ticks every 4s);
+      • eligibility: terminal ('ready'/'partial'/'error') AND (facts_committed = 0 OR
+        status = 'partial') AND terminal since >= DOC_REMINE_MIN_AGE_HOURS (default 24)
+        AND reextract_attempts < DOC_REMINE_MAX_ATTEMPTS (default 3). A document that
+        re-terminates zero-edge is re-selected only after the age floor again, and only
+        while attempts remain — no infinite re-mining.
+
+    The mark (``reextract_ontology_mark``) is stamped with the tenant's walkable-place
+    count at selection time — the migration-197 bookkeeping, recorded even though
+    selection itself is time+attempts based, so a future regrowth-gated variant has its
+    baseline.
+
+    Returns the number of documents re-queued; NEVER raises (per-tenant fail-safe, the
+    prepass contract). Callers do not need to gate on DOC_REMINE_ENABLED — the check is
+    inside, first thing, so an OFF deploy costs one env read.
+    """
+    if not DOC_REMINE_ENABLED:
+        return 0
+    now_m = time.monotonic()
+    if now_m - _DOC_REMINE_LAST_RUN[0] < _DOC_REMINE_INTERVAL_S:
+        return 0
+    _DOC_REMINE_LAST_RUN[0] = now_m
+
+    saas_skip = saas_skip or set()
+    tenants = [(u, s) for u, s in (ready_schemas or []) if u not in saas_skip]
+    if not tenants:
+        return 0
+
+    # ROUND-ROBIN: start at the tenant AFTER the last one served last pass (the cursor
+    # holds the user_id that was being served when the batch ran out). A restart resuming
+    # from the top is correct — process-local cursors only ever cost one rotation.
+    _start = 0
+    if _DOC_REMINE_CURSOR[0] is not None:
+        for _i, (_u, _s) in enumerate(tenants):
+            if _u == _DOC_REMINE_CURSOR[0]:
+                _start = (_i + 1) % len(tenants)
+                break
+    ordered = tenants[_start:] + tenants[:_start]
+
+    queued = 0
+    served: list = []
+    _db = None
+    try:
+        _db = psycopg2.connect(postgres_dsn)
+        for _user, _schema in ordered:
+            if queued >= _DOC_REMINE_BATCH:
+                break
+            if _schema in _remine_columns_missing_schemas:
+                continue
+            try:
+                with _db.cursor() as cur:
+                    # Capability probe (pre-298 schema → self-disable the lane for this
+                    # tenant, log once): the flip names the new columns, and an
+                    # UndefinedColumn there would abort this tenant's txn every pass.
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = %s "
+                        "AND table_name = 'documents' "
+                        "AND column_name = 'reextract_attempts'",
+                        (_schema,))
+                    if cur.fetchone() is None:
+                        _remine_columns_missing_schemas.add(_schema)
+                        log.warning(
+                            f"re_embedder.doc_remine_columns_missing schema={_schema} "
+                            f"(migration 298 not applied — re-mine lane disabled for "
+                            f"this tenant)")
+                        continue
+                    # The candidate. Partial-index-shaped predicate (migration 298's
+                    # idx_documents_regrowth): expressions MUST stay identical to the
+                    # index predicate or the planner cannot use it. Oldest terminal
+                    # first; ONE row per tenant per pass (round-robin).
+                    cur.execute(f"SET search_path TO {_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                    # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+                        """
+                        SELECT id, chunk_state FROM documents
+                        WHERE status IN ('ready', 'partial', 'error')
+                          AND (facts_committed = 0 OR status = 'partial')
+                          AND reextract_attempts < %s
+                          AND COALESCE(ready_at, started_at, created_at)
+                              < now() - (%s * INTERVAL '1 hour')
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                        """,
+                        (_DOC_REMINE_MAX_ATTEMPTS, _DOC_REMINE_MIN_AGE_HOURS),
+                    )
+                    row = cur.fetchone()
+                _db.commit()
+                if not row:
+                    continue
+                doc_id, chunk_state = row[0], row[1]
+                state = chunk_state if isinstance(chunk_state, dict) else {}
+                if isinstance(chunk_state, str):
+                    try:
+                        state = json.loads(chunk_state)
+                    except Exception:  # noqa: BLE001 — unreadable ledger → whole doc re-owed
+                        state = {}
+                # CHUNK-LEVEL RE-OPEN (the actual re-mine): a chunk with NO entry has no
+                # terminal state and is already owed. Of the TERMINAL entries, KEEP only
+                # the ones that captured something (s='done' with c>0 — re-reading them
+                # would double-count what already landed); re-ow the ZERO-EDGE done
+                # entries (c==0 — the ontology could not cast them then) and the FAILED
+                # ones by dropping their ledger entries entirely.
+                # GAUNTLET R1 FINDING 4: keep done-with-edges chunks UNLESS they are
+                # l1_deterministic_first captures — those committed deterministic edges
+                # against a measured-slow brain and their LLM enrichment is DEFERRED to
+                # exactly this lane; re-owing them is the deferred read landing. The
+                # natural-key upsert absorbs facts the deterministic pass already filed.
+                kept = {k: v for k, v in (state or {}).items()
+                        if isinstance(v, dict) and v.get("s") == "done"
+                        and (int(v.get("c") or 0)) > 0
+                        and v.get("cls") != "l1_deterministic_first"}
+                dropped = len(state or {}) - len(kept)
+                # PURE-PACED REFUND (litmus fix L5, 2026-11-03; gauntlet R1 finding 5
+                # HONESTY AMENDMENT): DEFENSIVE, currently unreachable — READ THIS.
+                # Today's doc lanes NEVER write a terminal chunk_state "failed" entry
+                # whose reason carries rate_deferred: every paced episode converts to a
+                # whole-DOCUMENT fatal re-pend (FatalBatchError) that REFUNDS the claim
+                # attempt upstream (embedder `_exhausted` requires `not _paced`; paced
+                # parks refund the claim), so a never-progressing doc keeps an EMPTY
+                # ledger and this classifier never fires. The wound L5 claimed to fix
+                # (remine ceiling consumed by paced episodes) is prevented upstream —
+                # this block exists so that IF a future lane ever starts writing
+                # paced-failed ledger entries (the BUG-005-era shape it guards against),
+                # the flip refunds instead of burning _DOC_REMINE_MAX_ATTEMPTS on a
+                # terminal whose EVERY failed chunk was rate_deferred (the limiter never
+                # put the turn on the wire — zero real R2 budget consumed).
+                # REPLAY-MARKER HAZARD GUARD (the reason it is kept rather than
+                # deleted): the marker (X-FL-Deferred-Replay) arms on
+                # reextract_attempts > 0 — its premise is that the content was ALREADY
+                # RE-SENT once. A pure-paced terminal never re-sent anything, so the
+                # refund (attempts stays at its old value) leaves the next drain
+                # un-marked exactly when that is TRUE; any real prior attempt (attempts
+                # >= 1) still arms the marker. Two guards hold the refund honest:
+                #   • there must BE at least one paced-failed entry (else a zero-edge
+                #     doc would refund forever);
+                #   • no zero-edge DONE entry may be present — a read-and-empty chunk
+                #     was really read; re-reading it is new work, not a refund case.
+                _dropped_entries = [v for k, v in (state or {}).items() if k not in kept]
+                _paced_failed = [v for v in _dropped_entries
+                                 if isinstance(v, dict) and v.get("s") == "failed"
+                                 and "rate_deferred" in str(v.get("e") or "")]
+                _zeroedge_done = [v for v in _dropped_entries
+                                  if isinstance(v, dict) and v.get("s") == "done"
+                                  and int(v.get("c") or 0) <= 0]
+                _pure_paced = (bool(_paced_failed)
+                               and len(_paced_failed) == len(_dropped_entries)
+                               and not _zeroedge_done)
+                # The mark for THIS pass (migration-197 bookkeeping: walkable places now).
+                _mark = _tenant_walkable_place_count(_db, _schema)
+                # The flip — atomic on STILL-terminal: a concurrent drain/retry that
+                # already took the row makes this UPDATE a no-op (rowcount 0 → skip).
+                # attempts = 0 mirrors POST /documents/retry: the re-mine is a deliberate
+                # fresh re-read, not an outage redelivery, so the drain's redelivery bound
+                # starts clean (the RE-MINE bound is reextract_attempts, separate).
+                with _db.cursor() as cur:
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+                        """
+                        UPDATE documents
+                        SET status = 'pending', started_at = NULL, ready_at = NULL,
+                            attempts = 0, brain_deferred_since = NULL,
+                            reextract_ontology_mark = COALESCE(%s, reextract_ontology_mark),
+                            reextract_attempts = reextract_attempts + %s,
+                            chunk_state = %s::jsonb
+                        WHERE id = %s AND user_id = %s
+                          AND status IN ('ready', 'partial', 'error')
+                          AND (facts_committed = 0 OR status = 'partial')
+                        RETURNING reextract_attempts
+                        """,
+                        (_mark, 0 if _pure_paced else 1,
+                         json.dumps(kept), doc_id, _user),
+                    )
+                    _flipped = cur.fetchone()
+                    flipped = 1 if _flipped else 0
+                    _new_attempt = int(_flipped[0] or 0) if _flipped else 0
+                _db.commit()
+                if not flipped:
+                    continue
+                queued += 1
+                served.append(_user)
+                log.info(f"re_embedder.doc_remine_queued doc_id={doc_id} "
+                         f"user_id={_user[:8]} schema={_schema} "
+                         f"attempt={_new_attempt} "
+                         f"reopened_chunks={dropped} kept_chunks={len(kept)} "
+                         f"mark={_mark} "
+                         f"pure_paced_refund={_pure_paced} "
+                         f"(zero-edge/failed chunks re-owed to the NORMAL drain under "
+                         f"the replay marker unless pure-paced refunded)")
+            except psycopg2.Error as _probe_err:
+                _rollback_and_reapply_search_path(_db, _schema)
+                if getattr(_probe_err, "pgcode", None) == "42703":
+                    # UndefinedColumn mid-pass (migration 298 vanished? partial schema):
+                    # self-disable for this tenant, same as the probe above.
+                    _remine_columns_missing_schemas.add(_schema)
+                    log.warning(f"re_embedder.doc_remine_columns_missing_midpass "
+                                f"schema={_schema}: {_probe_err}")
+                    continue
+                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
+                            f"{_probe_err}")
+            except Exception as _t_err:  # noqa: BLE001 — one tenant never aborts the pass
+                _rollback_and_reapply_search_path(_db, _schema)
+                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
+                            f"{_t_err}")
+    except Exception as _pass_err:  # noqa: BLE001 — never raises, prepass contract
+        log.warning(f"re_embedder.doc_remine_pass_error: {_pass_err}")
+    finally:
+        if _db is not None:
+            try:
+                _db.close()
+            except Exception as _close_err:  # noqa: BLE001 — a failed close on an
+                # already-dead connection is not actionable here; logged so it is
+                # never silent.
+                log.debug(f"re_embedder.doc_remine_pass_close_failed: {_close_err}")
+    # Advance the rotation cursor to the LAST tenant actually served this pass, so the
+    # next pass starts after it. No tenant served → cursor untouched (start from top).
+    if served:
+        _DOC_REMINE_CURSOR[0] = served[-1]
+    return queued
+
+
 def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
     """
     Full reconciliation pass across all FaultLine Qdrant collections.
     Scrolls all points, compares payloads to PostgreSQL ground truth,
     deletes orphaned/superseded points, re-upserts diverged payloads.
     Returns: {"deleted": int, "reupserted": int, "ok": int, "errors": int}
+
+    REMOVAL (REMOVE_QDRANT_MEMORY_LANE, default ON): this pass reconciles ONLY the
+    user-memory collections (per-seat `faultline-<uuid>` / shared `faultline-memory`).
+    The cortex collections (flagent-*) are NOT matched by the enumeration filters below
+    and are reconciled by their own cortex sweep — so under the removal the whole pass
+    is dead: returns zeroed stats with zero HTTP. Rollback arm: verbatim legacy pass.
     """
     stats = {"deleted": 0, "reupserted": 0, "ok": 0, "errors": 0}
+    if _REMOVE_QDRANT_MEMORY_LANE:
+        return stats
 
     # Step 1: Discover active FaultLine collections only — skip stale/test collections
     # that have no provisioned users to avoid scrolling dead data every cycle.
@@ -3042,6 +7911,8 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                 "SELECT user_id FROM public.user_provisioning WHERE status = 'ready'"
             )
             active_user_ids = {row[0] for row in _cur.fetchall()}
+            # READ BARRIER: the collection enumeration below is an HTTP hop to Qdrant.
+            release_read_transaction(db_conn, context="re_embedder.reconcile_qdrant.seats")
     except Exception as e:
         log.warning(f"re_embedder.reconcile_active_users_failed (using all collections): {e}")
         try:
@@ -3050,27 +7921,80 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             pass
         active_user_ids = None
 
-    try:
-        response = httpx.get(f"{qdrant_url}/collections", timeout=10.0)
-        response.raise_for_status()
-        data = response.json()
-        all_collections = [
-            c["name"] for c in data.get("result", {}).get("collections", [])
-            if c["name"].startswith("faultline-")
-        ]
-        if active_user_ids is not None:
-            active_collection_names = {derive_collection(uid) for uid in active_user_ids}
-            collections = [c for c in all_collections if c in active_collection_names]
-            skipped = len(all_collections) - len(collections)
-            if skipped:
-                log.debug(f"re_embedder.reconcile_skipped_inactive collections={skipped}")
-        else:
-            collections = all_collections
-    except Exception as e:
-        log.error(f"re_embedder.reconcile_discover_failed: {e}")
-        return stats
+    # SAAS_MODE only: drop tenants whose seat belongs to a non-active account from the
+    # reconcile set too (fail-safe: empty skip set when SAAS off / tables absent / error).
+    if active_user_ids:
+        try:
+            _skip = _saas_suspended_user_ids(os.getenv("POSTGRES_DSN", ""),
+                                             [str(u) for u in active_user_ids])
+            if _skip:
+                active_user_ids = {u for u in active_user_ids if str(u) not in _skip}
+        except Exception:
+            pass
 
-    if not collections:
+    # Partition-aware work list: each item is (collection, recon_user_id, tenant_filter).
+    #   collection_per_seat → one item per per-seat `faultline-<uuid>` collection; user_id is
+    #     derived from the collection name (below); tenant_filter is None (byte-for-byte today).
+    #   shared_payload → one item per ACTIVE seat, all pointing at the single `faultline-memory`
+    #     collection but each carrying its own tenant filter so the scroll/delete/reupsert only
+    #     ever touches that seat's points.
+    from src.api.qdrant_partition import (
+        shared_mode as _qp_shared_mode, SHARED_MEMORY_COLLECTION as _QP_SHARED_MEM,
+        tenant_filter_for as _qp_tenant_filter_for, apply_tenant_filter as _qp_apply_filter,
+        build_delete_body as _qp_delete_body, qdrant_headers as _qp_headers,
+        stamp_tenant as _qp_stamp,
+    )
+    _shared = _qp_shared_mode()
+    work_items = []
+    if _shared:
+        # Enumerate seats: prefer the caller's active set; else derive from PG schemas.
+        _seat_ids = None
+        if active_user_ids is not None:
+            _seat_ids = [str(u) for u in active_user_ids]
+        else:
+            try:
+                with db_conn.cursor() as _scur:
+                    _scur.execute(
+                        "SELECT schema_name FROM information_schema.schemata "
+                        "WHERE schema_name LIKE 'faultline\\_%' ESCAPE '\\'"
+                    )
+                    _seat_ids = []
+                    for (_sn,) in _scur.fetchall():
+                        _uid = _sn[len("faultline_"):].replace("_", "-")
+                        if _uid and _uid not in ("test", "main"):
+                            _seat_ids.append(_uid)
+            except Exception as e:
+                log.error(f"re_embedder.reconcile_seat_enum_failed: {e}")
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+                return stats
+        for _uid in (_seat_ids or []):
+            work_items.append((_QP_SHARED_MEM, _uid, _qp_tenant_filter_for(_uid)))
+    else:
+        try:
+            response = httpx.get(f"{qdrant_url}/collections", headers=_qp_headers(), timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            all_collections = [
+                c["name"] for c in data.get("result", {}).get("collections", [])
+                if c["name"].startswith("faultline-")
+            ]
+            if active_user_ids is not None:
+                active_collection_names = {derive_collection(uid) for uid in active_user_ids}
+                collections = [c for c in all_collections if c in active_collection_names]
+                skipped = len(all_collections) - len(collections)
+                if skipped:
+                    log.debug(f"re_embedder.reconcile_skipped_inactive collections={skipped}")
+            else:
+                collections = all_collections
+        except Exception as e:
+            log.error(f"re_embedder.reconcile_discover_failed: {e}")
+            return stats
+        work_items = [(c, None, None) for c in collections]
+
+    if not work_items:
         log.info("re_embedder.reconcile no collections found")
         return stats
 
@@ -3088,6 +8012,8 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                 "WHERE schema_name LIKE 'faultline_%'"
             )
             existing_schemas = {row[0] for row in _scur.fetchall()}
+        # READ BARRIER: everything after this is per-collection scroll/delete/upsert HTTP.
+        release_read_transaction(db_conn, context="re_embedder.reconcile_qdrant.schemas")
     except Exception as e:
         log.warning(f"re_embedder.reconcile_schema_enum_failed (processing all collections): {e}")
         try:
@@ -3096,13 +8022,14 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             pass
         existing_schemas = None
 
-    log.info(f"re_embedder.reconcile_start collections={len(collections)}")
+    log.info(f"re_embedder.reconcile_start collections={len(work_items)}")
 
-    # Process each collection
-    for collection in collections:
+    # Process each work item
+    for collection, _recon_uid, _recon_tflt in work_items:
         try:
-            # ORPHAN-SKIP: per-tenant collection whose PG schema is gone → don't scroll it.
-            if not should_reconcile_collection(collection, existing_schemas):
+            # ORPHAN-SKIP: per-seat collection whose PG schema is gone → don't scroll it.
+            # (shared_payload has no orphan collections — one shared collection, seat-filtered.)
+            if not _shared and not should_reconcile_collection(collection, existing_schemas):
                 log.info(f"re_embedder.reconcile_skip_orphan collection={collection} "
                          f"reason=no_pg_schema")
                 continue
@@ -3111,6 +8038,11 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             next_page_offset = None
 
             while True:
+                # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+                # read left open by the PREVIOUS iteration would ride across it. A batch-level
+                # barrier alone does not cover this — measured live: climb_state and the
+                # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+                release_read_transaction(db_conn, context="re_embedder.reconcile_qdrant.iteration")
                 scroll_body = {
                     "limit": 250,
                     "with_payload": True,
@@ -3118,10 +8050,13 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                 }
                 if next_page_offset is not None:
                     scroll_body["offset"] = next_page_offset
+                # shared_payload: scope the scroll to THIS seat (no-op in collection_per_seat).
+                scroll_body = _qp_apply_filter(scroll_body, _recon_tflt)
 
                 response = httpx.post(
                     f"{qdrant_url}/collections/{collection}/points/scroll",
                     json=scroll_body,
+                    headers=_qp_headers(),
                     timeout=10.0
                 )
                 response.raise_for_status()
@@ -3149,9 +8084,9 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             if not fact_ids:
                 continue
 
-            # Set search_path to user's schema derived from collection name
-            # Collection format: "faultline-{user_id}" or "faultline-test"
-            _collection_user_id = collection.replace("faultline-", "", 1)
+            # Set search_path to user's schema. collection_per_seat → derive from the
+            # collection name; shared_payload → the seat uuid is carried in _recon_uid.
+            _collection_user_id = _recon_uid if _shared else collection.replace("faultline-", "", 1)
             _schema_name = None
             if _collection_user_id and _collection_user_id != "test" and _collection_user_id != "main":
                 try:
@@ -3171,10 +8106,12 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             with db_conn.cursor() as cur:
                 if _schema_name:
                     cur.execute(f"SET search_path TO {_schema_name}, public")
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
 
                 placeholders = ",".join(["%s"] * len(fact_ids))
                 # Query BOTH facts and staged_facts (Class B/C live in staged_facts)
-                cur.execute(
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                     f"""
                     SELECT 'facts' AS source_table, id, subject_id, object_id, rel_type,
                            confidence, superseded_at, deleted_at
@@ -3188,7 +8125,11 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                     """,
                     fact_ids + fact_ids
                 )
-                for row in cur.fetchall():
+                _rq_rows = cur.fetchall()
+                # READ BARRIER: the divergence pass below re-embeds and re-upserts each
+                # point over HTTP, once per row, on this same connection.
+                release_read_transaction(db_conn, context="re_embedder.reconcile_qdrant.pg_facts")
+                for row in _rq_rows:
                     pg_facts[(row[0], row[1])] = {
                         "source_table": row[0],
                         "id": row[1],
@@ -3210,10 +8151,12 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
             # minutes at a time.
             #
             # That is not merely untidy: an open transaction blocks ACCESS EXCLUSIVE lock
-            # acquisition, so it stalls every `TRUNCATE` on the tenant schema, and holds back
-            # the xmin horizon so autovacuum cannot reclaim dead tuples database-wide.
-            # Observed 2026-07-30: one such connection, idle-in-transaction for 16 minutes,
-            # blocked a chain of ~13 backends waiting on `SET search_path`.
+            # acquisition, so it stalls every `TRUNCATE` on the tenant schema. Observed
+            # 2026-07-30: one such connection, idle-in-transaction for 16 minutes, blocked a
+            # chain of ~13 backends waiting on `SET search_path` and made the bench harness's
+            # `reset_tenant` TRUNCATE fail on 9 consecutive questions — which the harness
+            # recorded as infra errors and FILTERED OUT of the score, so the dashboard showed a
+            # flawless 2/2 while nothing was actually being measured.
             #
             # rollback() rather than commit(): this is a read-only snapshot, so rollback ends
             # the transaction without any possibility of persisting something unintended.
@@ -3224,6 +8167,11 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
 
             # Step 4: Reconcile each point
             for point in all_points:
+                # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+                # read left open by the PREVIOUS iteration would ride across it. A batch-level
+                # barrier alone does not cover this — measured live: climb_state and the
+                # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+                release_read_transaction(db_conn, context="re_embedder.reconcile_qdrant.iteration")
                 try:
                     point_id = point["id"]
                     payload = point.get("payload", {})
@@ -3254,7 +8202,8 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                     if pg_key not in pg_facts:
                         httpx.post(
                             f"{qdrant_url}/collections/{collection}/points/delete",
-                            json={"points": [point_id]},
+                            json=_qp_delete_body(_recon_tflt, point_ids=[point_id]),
+                            headers=_qp_headers(),
                             timeout=10.0
                         )
                         stats["deleted"] += 1
@@ -3267,7 +8216,8 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                     if pg_row.get("superseded_at") is not None:
                         httpx.post(
                             f"{qdrant_url}/collections/{collection}/points/delete",
-                            json={"points": [point_id]},
+                            json=_qp_delete_body(_recon_tflt, point_ids=[point_id]),
+                            headers=_qp_headers(),
                             timeout=10.0
                         )
                         stats["deleted"] += 1
@@ -3281,7 +8231,8 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                     if pg_row.get("deleted_at") is not None:
                         httpx.post(
                             f"{qdrant_url}/collections/{collection}/points/delete",
-                            json={"points": [point_id]},
+                            json=_qp_delete_body(_recon_tflt, point_ids=[point_id]),
+                            headers=_qp_headers(),
                             timeout=10.0
                         )
                         stats["deleted"] += 1
@@ -3302,10 +8253,13 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
                         text = f"{payload.get('subject', '')} {expected_rel_type} {payload.get('object', '')}"
                         vector = embed_text(text, qwen_api_url, timeout=30.0, fallback=True)
                         _reupsert_payload = {**payload, "rel_type": expected_rel_type, "confidence": expected_confidence}
+                        # shared_payload: re-stamp the seat's tenant_id (no-op in per-seat).
+                        _reupsert_payload = _qp_stamp(_reupsert_payload, _recon_uid)
                         try:
                             httpx.put(
                                 f"{qdrant_url}/collections/{collection}/points",
                                 json={"points": [{"id": point_id, "vector": vector, "payload": _reupsert_payload}]},
+                                headers=_qp_headers(),
                                 timeout=10.0
                             )
                             stats["reupserted"] += 1
@@ -3328,11 +8282,15 @@ def reconcile_qdrant(db_conn, qdrant_url: str, qwen_api_url: str) -> dict:
 
 
 def _query_llm_for_rel_type_metadata(candidate_rel: str, subj_type: str, obj_type: str,
-                                      snippet: str, qwen_api_url: str) -> dict:
+                                      snippet: str, qwen_api_url: str,
+                                      raise_on_nonanswer: bool = False) -> dict:
     """
     dprompt-126: Phase 2 — Query LLM for natural language metadata during ontology evaluation.
 
-    When a novel rel_type reaches occurrence_count >= 3, query the LLM to generate:
+    Called from the `decision == "approved"` branch of evaluate_ontology_candidates, i.e. when a
+    novel rel_type reaches REL_TYPE_APPROVAL_THRESHOLD (default 1 since 2026-08-27 — engine
+    structure is usable on derivation; it was a hardcoded 3). This function has NO gate of its own:
+    its frequency behaviour is entirely the caller's. Generates:
     - natural_language: human-readable description
     - is_symmetric: whether the relationship is bidirectional
     - inverse_rel_type: the opposite relationship (if asymmetric)
@@ -3373,12 +8331,26 @@ Respond with ONLY valid JSON (no markdown, no extra text):
         result = call_llm_with_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("ENRICHMENT"),
-            user_id="re_embedder",
+            # PER-TENANT (was the hardcoded "re_embedder" literal): every caller of this helper
+            # — the Class-C promotion classifier, the ontology-evaluation mint and the
+            # head/tail backfill — runs inside a `ready_schemas` iteration that has already
+            # bound this tenant's brain, so the seat that OWNS the rel_type being described is
+            # the seat this call must be attributed to. See _reembedder_llm_user_id.
+            user_id=_reembedder_llm_user_id(),
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
         )
 
         # call_llm_with_retry_sync() returns PARSED JSON (not raw OpenAI response)
+        if raise_on_nonanswer and not _brain_answered(result):
+            # A NON-ANSWER IS NOT "no constraints". Falling through here returns {}, the caller
+            # reads llm_head_types/llm_tail_types as None and substitutes the ANY/ANY wildcard —
+            # and ANY/ANY is precisely the shape that quarantines a rel into
+            # category='pending_placement' forever (_lc_set discards wildcards, so type-match
+            # placement can never fire). So a transient outage would mint a permanently
+            # unplaceable rel AND stamp its evaluation row 'approved' so it is never revisited.
+            # Opt-in per call site: the two callers that can tolerate defaults are unchanged.
+            raise LLMUnavailable("nonanswer_shape", "ENRICHMENT")
         if not result or not isinstance(result, dict):
             log.warning(f"re_embedder.llm_metadata_query_failed rel_type={candidate_rel} reason=no_valid_response")
             return {}
@@ -3512,6 +8484,21 @@ _CLIMB_MAX_ATTEMPTS = int(os.environ.get("ENGINE_CLASSIFY_MAX_ATTEMPTS", "3") or
 # fingerprint change). 0 disables time-backoff (rely on fingerprint + cap only).
 _CLIMB_BACKOFF_MIN = int(os.environ.get("ENGINE_CLASSIFY_BACKOFF_MIN", "60") or "60")
 
+# LIFETIME CEILING — the cap above is bounded by the FINGERPRINT, and the fingerprint contains a
+# TENANT-GLOBAL term (`_concept_fingerprint` component (b): the count of distinct hierarchy PARENT
+# nodes across the whole tenant). That term moves whenever ANY concept anywhere gains a parent, so
+# on a growing tenant EVERY cached verdict is invalidated at once and `_CLIMB_MAX_ATTEMPTS` NEVER
+# BINDS. Measured on production (seat 10d7d879, 2026-08-11): cap = 3, yet `fraggle` sat at
+# attempt_count=188, `slinky` 189, `mittens` 187 — each a re-classification burning LLM calls — with
+# 47 rows over cap and 2,372 recorded attempts across 570 rows on ONE seat.
+# This ceiling is checked BEFORE the fingerprint comparison and is therefore the only bound that a
+# global-ontology bump cannot reset. It does NOT replace the additive re-validation: below the
+# ceiling a fingerprint change still re-opens a concept exactly as before. `attempt_count` is a
+# LIFETIME failure counter (reset to 0 only on a 'placed' verdict), so a concept that ever succeeds
+# starts over. 0 disables the ceiling (pure legacy behavior).
+_CLIMB_LIFETIME_MAX_ATTEMPTS = int(
+    os.environ.get("ENGINE_CLASSIFY_LIFETIME_MAX_ATTEMPTS", "25") or "25")
+
 
 def _concept_fingerprint(db_conn, entity_id: str) -> str:
     """Cheap, deterministic per-concept input fingerprint for additive re-validation.
@@ -3582,6 +8569,16 @@ def _climb_state_should_skip(db_conn, entity_id: str, fingerprint: str) -> bool:
     if not row:
         return False
     verdict, attempts, cached_fp, last_at = row[0], int(row[1] or 0), row[2], row[3]
+    # LIFETIME CEILING — checked BEFORE the fingerprint comparison, because the fingerprint carries
+    # a tenant-GLOBAL term that a growing ontology bumps constantly, which re-opens every capped
+    # concept and makes `_CLIMB_MAX_ATTEMPTS` unreachable (see the constant's note for the measured
+    # production numbers). A concept that has failed this many times is not one more ontology
+    # parent away from resolving; it needs its own evidence. `attempt_count` resets to 0 on a
+    # 'placed' verdict, so this never permanently retires a concept that can be placed.
+    if (_CLIMB_LIFETIME_MAX_ATTEMPTS > 0
+            and verdict != "placed"
+            and attempts >= _CLIMB_LIFETIME_MAX_ATTEMPTS):
+        return True
     # Additive re-validation: inputs changed → re-open regardless of prior verdict.
     if (cached_fp or "") != (fingerprint or ""):
         return False
@@ -3795,7 +8792,7 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
             f"  worried -> fear\n"
             f"  fence -> structure\n"
             f"  democracy -> political_system\n"
-            f"  alexander -> null\n\n"
+            f"  alicia -> null\n\n"
             f"Concept: \"{c}\"\n\n"
             f"Respond with ONLY valid JSON (no markdown, no extra text):\n"
             f"{{\n"
@@ -3808,12 +8805,23 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
         result = call_llm_with_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("ENRICHMENT"),
-            user_id="re_embedder",
+            # PER-TENANT: the concept being classified came out of THIS tenant's
+            # ontology_evaluations / hierarchy walk, and the caller (classify_unknown_concepts /
+            # climb_classification_chains) has already bound this tenant's brain.
+            user_id=_reembedder_llm_user_id(),
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # See _query_llm_full_chain: a call that never happened must not be cached as
+            # a classification verdict.
+            raise_on_unavailable=True,
         )
-        if not result or not isinstance(result, dict):
-            return None
+        if not _brain_answered(result):
+            # THE CALL PRODUCED NO ANSWER (never reached / empty / error envelope). Convert it
+            # into the LLMUnavailable this helper already promises for the RAISING half of the
+            # same failure family, so every existing caller's "no verdict cached, no attempt
+            # burned" handler covers it too. Without this the shape falls through as
+            # "unclassifiable" and a transient outage is spent as the concept's retry budget.
+            raise LLMUnavailable("nonanswer_shape", "ENRICHMENT")
 
         # Validate the proposed type against the canonical closed set (Pitfall 11). An
         # off-set / 'unknown' type means the LLM could NOT classify → return None (C is the
@@ -3840,6 +8848,9 @@ def _query_llm_what_is(concept: str, qwen_api_url: str, context: str | None = No
                 parent = None
         log.info(f"re_embedder.whatis concept={c[:40]} type={entity_type} parent={parent}")
         return {"entity_type": entity_type, "parent": parent}
+    except LLMUnavailable:
+        # Never asked → the caller must NOT record a verdict for this concept.
+        raise
     except Exception as e:
         log.warning(f"re_embedder.whatis_query_failed concept={c[:40]} error={type(e).__name__}: {str(e)[:100]}")
         return None
@@ -3914,7 +8925,7 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             f"\"affective_state\"/\"psychological_phenomenon\"/\"mental_concept\"/\"cognitive_entity\""
             f"/\"abstract_entity\"; those are upper-ontology junk, NOT a real category)\n"
             f"  apollo   -> []\n"
-            f"  alexander -> []\n\n"
+            f"  alicia -> []\n\n"
             f"Concept: \"{c}\"\n\n"
             f"Respond with ONLY valid JSON (no markdown, no extra text):\n"
             f"{{\n"
@@ -3925,13 +8936,24 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
         result = call_llm_with_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("CLASSIFY_CHAIN"),
-            user_id="re_embedder",
+            # PER-TENANT: same lane as _query_llm_what_is — the concept is the tenant's, and
+            # the enclosing growth loop bound the tenant's brain before reaching here.
+            user_id=_reembedder_llm_user_id(),
             timeout=LLMTimeouts.get("CLASSIFY_CHAIN"),
             operation="CLASSIFY_CHAIN",
             max_tokens=LLMMaxTokens.get("CLASSIFY_CHAIN"),
+            # DIDN'T-HAPPEN must not read as "answered nothing": this function's callers
+            # CACHE A VERDICT on a None return (climb_state 'placed'/'unplaceable') and
+            # burn the concept's retry budget doing it. Raising keeps an unreachable brain
+            # from writing permanent conclusions the model never actually supplied.
+            raise_on_unavailable=True,
         )
-        if not result or not isinstance(result, dict):
-            return None
+        if not _brain_answered(result):
+            # NO ANSWER (never reached / empty / error envelope) — same conversion as
+            # _query_llm_what_is. _chain_for re-raises this deliberately: caching an empty
+            # chain here would make an unreachable brain look like "this concept has no is-a
+            # ladder" and the specificity comparison would be decided on that.
+            raise LLMUnavailable("nonanswer_shape", "ENRICHMENT")
 
         # PROPER-NAME GUARD: an explicit empty chain means "specific named instance" — prefer
         # null over a speculative ladder (apollo → spacecraft was wrong; qwen knows the program).
@@ -3970,9 +8992,249 @@ def _query_llm_full_chain(concept: str, qwen_api_url: str, context: str | None =
             return None
         log.info(f"re_embedder.whatis_chain concept={cl[:40]} chain={ordered}")
         return ordered
+    except LLMUnavailable:
+        # The brain was NEVER ASKED (rate-deferred / breaker open / retries exhausted).
+        # Propagate: the caller must skip this concept WITHOUT recording a verdict.
+        raise
     except Exception as e:
         log.warning(f"re_embedder.whatis_chain_query_failed concept={c[:40]} error={type(e).__name__}: {str(e)[:100]}")
         return None
+
+
+# Sentinel: "the brain was never asked — abandon this sweep", distinct from every real
+# answer INCLUDING None (which legitimately means "asked, and there is no classification").
+_BRAIN_UNAVAILABLE = object()
+
+
+def _ask_brain(fn, *args, stats: Optional[dict] = None, what: str = "", **kwargs):
+    """Call an LLM helper, converting LLMUnavailable into an explicit ABORT sentinel.
+
+    The whole point of the sentinel is that it is NOT None. Every caller in this module
+    treats None as a decision ("the model could not classify this") and caches it; a call
+    that never reached the model has produced no such evidence and must not be recorded.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except LLMUnavailable as e:
+        if stats is not None:
+            stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+        log.warning(f"re_embedder.sweep_aborted_brain_unavailable lane={what} "
+                    f"reason={e.reason} operation={e.operation} "
+                    f"note=no verdict cached, no attempt burned; retried on a later sweep")
+        return _BRAIN_UNAVAILABLE
+
+
+def _tenant_brain_unavailable() -> bool:
+    """True when THIS tenant currently has no reachable brain (the same fail-closed predicate the
+    LLM stack itself uses). Fail-safe: False (assume a working brain) on any fault, because the
+    only thing this gates is the withholding of destructive lifecycle work.
+
+    PROCESSABILITY GATES THE CLOCK. A Class C row is short-term memory held so it can be typed
+    later; reaping it for expiry is only honest if it HAD a chance to be typed. A seat whose
+    credential will not decrypt fails every extraction, so its rows never had that chance — the
+    outage is ours and the clock must not charge the user for it."""
+    try:
+        from src.api.llm_calls import _saas_brain_unavailable
+        return bool(_saas_brain_unavailable())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# THE C-TIER AUTHORITY LADDER, read from the codebase's OWN declared ordering rather than a
+# number chosen here. This is the same ladder main._PROVENANCE_AUTHORITY declares; it is the
+# only "weighting" in this file, and it is the store's, not ours.
+_FACT_PROVENANCE_RANK: dict = {"user_stated": 3, "llm_learned": 2, "llm_inferred": 1}
+
+
+def evaluate_struck_class_c(db_conn, user_id: str = None) -> dict:
+    """A STRUCK Class C row is evaluated against the durable A/B tier, and takes one of two
+    exits — reaped as already-covered, or given extended life to try again.
+
+    THE LOOP THIS CLOSES. Recall consults the short-term tier and the durable tier. When a C row
+    is struck, that surfacing already increments its relevance counter (the recall half of the
+    gate, in main.fetch_facts_from_anchor). What was missing is the SECOND half of the strike:
+    deciding what the strike MEANS. If the durable tier already carries the same edge with at
+    least the same authority, the C row has served its purpose — the fact is durable now, and
+    the short-term copy is redundant, so it is retired. If it is merely a weak hit — nothing in
+    A/B corroborates it, or only something the store itself ranks LOWER — it gets a chance at
+    life: the clock is extended and it goes round again for another attempt at being typed.
+
+    NO THRESHOLD IS CHOSEN HERE, AND THAT IS DELIBERATE. "Covered by A/B" is an IDENTITY question
+    the store can already answer — is there a live `facts` row for this exact triple — not a
+    similarity score. The only ordering applied is `fact_provenance`, which is the store's own
+    declared authority ladder (user_stated > llm_learned > llm_inferred). A durable row that the
+    store ranks BELOW the staged one does not cover it, so the staged row survives. There is no
+    similarity floor, no confidence cutoff, and no per-seat tuning, because none could be derived
+    from what the graph has observed — and inventing one would be exactly the brittleness this
+    work exists to remove.
+
+    RETIREMENT IS A TOMBSTONE, NEVER A DELETE (migration 097): `deleted_at` drops the row from
+    the live walk while staying recoverable. Class A/B are never touched — only `fact_class='C'`
+    rows are candidates, so the A-B-C model and the single C→B tier change are untouched.
+    Withheld entirely while the tenant's brain is unavailable (see `_tenant_brain_unavailable`).
+
+    Returns {"struck": n, "reaped": n, "extended": n}. Fail-safe: never raises.
+    """
+    out = {"struck": 0, "reaped": 0, "extended": 0}
+    if _tenant_brain_unavailable():
+        log.info("re_embedder.class_c_strike_eval_withheld "
+                 f"user_id={str(user_id or '')[:8]} reason=brain_unavailable "
+                 "note=a row that could not be typed has not had its chance")
+        return out
+    try:
+        with db_conn.cursor() as cur:
+            # STRUCK = surfaced by recall since it was staged. The recall writers bump
+            # last_seen_at on every strike and nothing else moves it, so `last_seen_at >
+            # first_seen_at` IS the strike record — no new column, no new state.
+            cur.execute(
+                "SELECT s.id, s.subject_id, s.object_id, s.rel_type, s.fact_provenance"
+                "  FROM staged_facts s"
+                " WHERE s.fact_class = 'C'"
+                "   AND s.promoted_at IS NULL AND s.deleted_at IS NULL"
+                "   AND s.last_seen_at > s.first_seen_at"
+            )
+            struck = cur.fetchall()
+        out["struck"] = len(struck)
+        for sid, subj, obj, rel, sprov in struck:
+            try:
+                with db_conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT fact_provenance FROM facts"
+                        " WHERE subject_id = %s AND object_id = %s AND rel_type = %s"
+                        "   AND superseded_at IS NULL AND archived_at IS NULL"
+                        "   AND deleted_at IS NULL",
+                        (subj, obj, rel),
+                    )
+                    durable = [r[0] for r in cur.fetchall()]
+                _s_rank = _FACT_PROVENANCE_RANK.get((sprov or "").strip().lower(), 0)
+                _covered = any(
+                    _FACT_PROVENANCE_RANK.get((d or "").strip().lower(), 0) >= _s_rank
+                    for d in durable
+                )
+                with db_conn.cursor() as cur:
+                    if _covered:
+                        cur.execute(
+                            "UPDATE staged_facts SET deleted_at = now(), qdrant_synced = false"
+                            " WHERE id = %s AND deleted_at IS NULL", (sid,))
+                        out["reaped"] += 1
+                    else:
+                        # A CHANCE AT LIFE: extend by the tier's OWN window (the same interval
+                        # the C clock is defined in — not a new number) and leave everything
+                        # else alone so the next classification pass can try it again.
+                        cur.execute(
+                            "UPDATE staged_facts"
+                            "   SET expires_at = now() + interval '30 days'"
+                            " WHERE id = %s AND deleted_at IS NULL", (sid,))
+                        out["extended"] += 1
+                db_conn.commit()
+            except Exception as _e:  # noqa: BLE001 — one row must never abort the pass
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+                log.debug(f"re_embedder.class_c_strike_eval_row_failed staged_id={sid}: {_e}")
+        if out["struck"]:
+            log.info(f"re_embedder.class_c_strike_evaluated user_id={str(user_id or '')[:8]} "
+                     f"struck={out['struck']} reaped={out['reaped']} extended={out['extended']}")
+    except Exception as e:  # noqa: BLE001
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        log.warning(f"re_embedder.class_c_strike_eval_failed: {e}")
+    return out
+
+
+def _rung_exists(db_conn, subj_id: str, obj_id: str, rel_type: str = "subclass_of") -> bool:
+    """True iff a LIVE staged row for exactly this triple exists. Read-only, fail-safe (False on
+    error → the caller falls through to its ordinary placement path)."""
+    if not subj_id or not obj_id:
+        return False
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM staged_facts"
+                " WHERE subject_id = %s AND object_id = %s AND rel_type = %s"
+                "   AND promoted_at IS NULL AND deleted_at IS NULL LIMIT 1",
+                (str(subj_id), str(obj_id), rel_type),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _reconfirm_existing_rung(db_conn, subj_id: str, obj_id: str,
+                            rel_type: str = "subclass_of", commit: bool = True) -> bool:
+    """RELEVANCE GATE, ingest half: the producer re-derived an edge that ALREADY exists → COUNT
+    the re-encounter. Returns True iff a LIVE staged row for exactly this triple was bumped.
+
+    WHY THIS EXISTS. `confirmed_count` is the promotion gate, and its intent is relevance: a
+    thing that keeps recurring earns its way in. Every producer below already carries the right
+    ON CONFLICT (`confirmed_count + 1`) — but each one runs its CYCLE-GUARD first, and the
+    cheapest way for `_is_ancestor_or_descendant(X, Y)` to be true is that `X subclass_of Y`
+    IS ITSELF THE EDGE IT FINDS: the guard walks facts ∪ staged, so the moment a rung is staged
+    it makes its own parent reachable and the producer returns BEFORE the counter can move. A
+    rung could therefore never re-confirm itself. Measured on a live seat: 432 grown rungs, none
+    eligible, highest count anywhere 2.
+
+    PREVENTING A DUPLICATE ROW AND REFUSING TO RECORD A RE-ENCOUNTER ARE DIFFERENT THINGS, and
+    the guard conflates them. This separates them: an EXACT re-derivation is a confirmation and
+    is counted here; anything else (a genuine cycle through some OTHER path, a redundant edge)
+    still falls through to the cycle-guard and is still rejected.
+
+    THIS IS NOT A PER-CYCLE TICK. The producers do not re-derive on a timer — the classify climb
+    is gated by `_climb_state_should_skip`, which honours a cached 'placed' verdict until the
+    concept's deterministic input FINGERPRINT changes (additive new evidence on the concept, or
+    a new candidate parent in the tenant ontology). So reaching this function at all means the
+    engine looked again BECAUSE NEW INFORMATION ARRIVED, and re-derived the same shape. That is
+    exactly the signal the counter is meant to measure, and it is why the fix belongs here and
+    not in the threshold.
+
+    TIER-PRESERVING: bumps `confirmed_count` and `last_seen_at` only. It never inserts, never
+    promotes, never touches `fact_class` — the A/B/C tier and the C→B / B→facts stages are
+    untouched. Tombstoned (`deleted_at`) and already-promoted rows are excluded, matching every
+    other lifecycle writer. Fail-safe: False on any error, so the caller behaves exactly as it
+    does today.
+    """
+    if not subj_id or not obj_id or str(subj_id) == str(obj_id):
+        return False
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE staged_facts"
+                "   SET confirmed_count = confirmed_count + 1,"
+                "       last_seen_at = now()"
+                " WHERE subject_id = %s AND object_id = %s AND rel_type = %s"
+                "   AND promoted_at IS NULL AND deleted_at IS NULL"
+                " RETURNING confirmed_count",
+                (str(subj_id), str(obj_id), rel_type),
+            )
+            row = cur.fetchone()
+        if not row:
+            if commit:
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+            return False
+        if commit:
+            db_conn.commit()
+        log.info("re_embedder.rung_reconfirmed",
+                 extra={"subject": str(subj_id)[:12], "object": str(obj_id)[:12],
+                        "rel_type": rel_type, "confirmed_count": int(row[0] or 0)})
+        return True
+    except Exception as e:  # noqa: BLE001 — fail-safe: never break a producer
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        log.debug(f"re_embedder.rung_reconfirm_failed subj={str(subj_id)[:8]} "
+                  f"obj={str(obj_id)[:8]}: {e}")
+        return False
 
 
 def _is_ancestor_or_descendant(db_conn, x_id: str, y_id: str, max_walk: int = 64) -> bool:
@@ -4152,6 +9414,9 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
                 (_WHATIS_BATCH_LIMIT,),
             )
             rows = cur.fetchall()
+        # READ BARRIER: the loop below asks the tenant brain (_query_llm_what_is) per row.
+        release_read_transaction(
+            db_conn, context=f"re_embedder.classify_unknown_concepts.fetch schema={schema_name}")
     except Exception as e:
         if schema_name:
             _rollback_and_reapply_search_path(db_conn, schema_name)
@@ -4164,6 +9429,11 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
     log.info(f"re_embedder.whatis_candidates count={len(rows)}")
 
     for _row_id, _concept, _snippet in rows:
+        # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+        # read left open by the PREVIOUS iteration would ride across it. A batch-level
+        # barrier alone does not cover this — measured live: climb_state and the
+        # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+        release_read_transaction(db_conn, context="re_embedder.classify_unknown_concepts.iteration")
         concept = (_concept or "").strip().lower()
         if not concept:
             continue
@@ -4186,7 +9456,7 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
             # authoritative stop. Mark the OE row resolved so it isn't re-fetched every cycle. Only
             # checked once the concept is a REGISTERED entity (an unregistered concept has no edges
             # to inspect → can't be a known named instance yet; falls through to occurrence/decay).
-            if _cid and _is_named_instance(db_conn, _cid):
+            if _cid and _is_named_instance(db_conn, _cid, user_id=user_id):
                 stats["deferred"] += 1
                 _mark_whatis_row_capped(db_conn, _row_id)
                 log.debug("re_embedder.whatis_skipped_named_instance",
@@ -4210,7 +9480,26 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
                           extra={"concept": concept, "path": "whatis_oe_capped"})
                 continue
 
-            proposal = _query_llm_what_is(concept, qwen_api_url, context=_context)
+            try:
+                # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                # transaction after it, and that read then rides across this hop. Measured live on the
+                # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                # seconds later.
+                release_read_transaction(db_conn, context="re_embedder.classify_unknown_concepts.pre_blocking_call")
+                proposal = _query_llm_what_is(concept, qwen_api_url, context=_context)
+            except LLMUnavailable as _unavail:
+                # THE BRAIN WAS NEVER ASKED. Do NOT record a verdict, do NOT bump the
+                # attempt counter, and do NOT keep sweeping — every remaining concept in
+                # this batch would hit the same unavailable brain. The rows stay UNDECIDED
+                # and are picked up unchanged on a later cycle.
+                stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+                log.warning(f"re_embedder.whatis_aborted_brain_unavailable "
+                            f"reason={_unavail.reason} concept={concept[:40]} "
+                            f"batch_size={len(rows)} "
+                            f"note=no verdict cached; batch abandoned until the brain returns")
+                break
             if not proposal:
                 # LLM could not classify → record 'unplaceable' so we DON'T re-LLM it every
                 # cycle (the apparel_item 9x/40s runaway). The OE row stays UNDECIDED (C is the
@@ -4297,6 +9586,22 @@ def classify_unknown_concepts(db_conn, qwen_api_url: str, user_id: str = None, s
                         # No two DISTINCT UUIDs (unresolvable, or would self-loop) → defer.
                         _ground_deferred = True
                 if subj_uuid and obj_uuid and subj_uuid != obj_uuid:
+                    # THE HARD-LINE LADDER GUARD (src/api/hardline_guard.py — FAIL-CLOSED). The
+                    # what-is classifier minted 244+6 census rows on user VALUE / named-instance
+                    # nodes (blue, zzcanaryglyph, krellin) because _is_named_instance is POS/edge
+                    # dependent and node_role fails OPEN. The guard decides from the HARD-LINE
+                    # evidence (P31 subject / attribute holder / naming surface / value-slot object
+                    # / stamp corroboration / common-noun morphology of a user-asserted surface)
+                    # and REFUSES on uncertainty — a memory never becomes a place.
+                    _hl_refuse, _hl_reason = _ladder_hardline.refuses_subclass_rung(
+                        db_conn, subj_uuid, concept, user_id=user_id)
+                    if _hl_refuse:
+                        stats["deferred"] += 1
+                        _mark_whatis_row_capped(db_conn, _row_id)
+                        log.debug("re_embedder.hardline_ladder_refused",
+                                   extra={"concept": concept, "reason": _hl_reason,
+                                          "lane": "whatis_classify"})
+                        continue
                     try:
                         with db_conn.cursor() as cur:
                             cur.execute(
@@ -4516,13 +9821,22 @@ def _type_word_of_entity(db_conn, entity_id: str) -> Optional[str]:
     return None
 
 
-def _is_named_instance(db_conn, entity_id: str) -> bool:
+def _is_named_instance(db_conn, entity_id: str, user_id: str = None) -> bool:
     """THE HARD LINE — is `entity_id` a NAMED INSTANCE (a memory) rather than a TYPE (an L4 place)?
 
     A named instance must NEVER receive a `subclass_of` edge: a name never becomes a place. The
     test is purely STRUCTURAL (edge/graph + naming-layer membership) — NO proper-noun word list,
     NO capitalization heuristic, NO entity-name literal — so it is subject-agnostic and deterministic:
 
+      (0) the entity IS THE USER ANCHOR (entity_id == the tenant user_id). The anchor is the
+          grounded self ("I"/"me") — the one specific speaking subject, a NAMED INSTANCE by
+          identity, never a TYPE. It uniquely evades (a) and (b): the self is grounded directly
+          (it carries NO `instance_of` edge — "I" is never classified as an instance-of-a-type),
+          and its `user` alias reads as a bare TYPE-word to `_type_word_of_entity`, so both checks
+          below return "not a name" and the what-is climb mints `(user, subclass_of, role)` — the
+          exact category error the founding distinction forbids. Recognizing the anchor by IDENTITY
+          is subject-agnostic: `user_id` is the runtime tenant anchor — the system's sole grounding
+          hook ("I/me = the user") — NOT a hardcoded subject name or word list.
       (a) the entity is the SUBJECT of a live `instance_of` edge → it is an INSTANCE *of* a type
           (e.g. `rex instance_of poodle`). An instance is classified by climbing its TYPE
           (poodle), never by giving the instance itself a `subclass_of`. This is the founding
@@ -4536,6 +9850,9 @@ def _is_named_instance(db_conn, entity_id: str) -> bool:
     LINE forbids minting subclass_of for a name, so when uncertain we skip rather than risk the
     category error — better to leave a concept un-laddered than to file a name as a place."""
     if not entity_id:
+        return True
+    # (0) THE USER ANCHOR — the grounded self is a named instance by identity (never a type).
+    if user_id and str(entity_id) == str(user_id):
         return True
     try:
         with db_conn.cursor() as cur:
@@ -4739,7 +10056,8 @@ def _place_full_chain(
 
     Returns {"placed": int, "cycle_skipped": int, "terminated": bool, "quarantined": bool}.
     Fail-safe: never raises; rolls back on error and returns what it attempted."""
-    out = {"placed": 0, "cycle_skipped": 0, "terminated": False, "quarantined": False}
+    out = {"placed": 0, "cycle_skipped": 0, "reconfirmed": 0,
+           "terminated": False, "quarantined": False}
     ln = (leaf_name or "").strip().lower()
     if not ln or not chain:
         return out
@@ -4792,6 +10110,24 @@ def _place_full_chain(
                     pass
                 return out
             if not nxt_id or str(nxt_id) == str(cur_id):
+                continue
+            # RELEVANCE GATE (before the cycle-guard): the one-shot chain is re-asked only when
+            # `_climb_state_should_skip` re-opened this concept — new evidence changed its
+            # fingerprint — and the LLM returning the SAME ladder on new evidence is the single
+            # strongest confirmation this engine produces. Today every such rung dies as
+            # `cycle_skipped`, because the rung's own presence makes its parent reachable. Count
+            # it and CLIMB ON (advance to nxt_id) so the rungs ABOVE are re-confirmed too;
+            # skipping without advancing would strand the walk at the leaf. No commit here — the
+            # caller owns the transaction so the whole chain stays atomic.
+            if _rung_exists(db_conn, cur_id, nxt_id, "subclass_of"):
+                if _reconfirm_existing_rung(db_conn, cur_id, nxt_id, "subclass_of", commit=False):
+                    out["reconfirmed"] = out.get("reconfirmed", 0) + 1
+                last_placed_id, last_placed_name = nxt_id, t
+                cur_id, cur_name = nxt_id, t
+                if t in roots:
+                    reached_root = True
+                    out["terminated"] = True
+                    break
                 continue
             # CYCLE-GUARD: reject `cur subclass_of nxt` if nxt is already an ancestor/descendant
             # of cur. Skip this rung (don't abort) and re-anchor from the same node to the next.
@@ -4849,11 +10185,23 @@ def _place_full_chain(
                                     "seeded_root": (old_root_name or "").strip().lower()})
 
         if out["placed"] == 0:
-            # Nothing new to place (all rungs cycle-skipped or pre-existing) → no supersede.
+            # Nothing NEW to place → no supersede. But "nothing new" is not "nothing happened":
+            # if the LLM re-derived rungs that already exist, those RE-CONFIRMATIONS are the
+            # relevance signal and must survive. Commit them; roll back only a genuinely empty
+            # pass (all rungs cycle-skipped / proper-name rejected).
             try:
-                db_conn.rollback()
+                if out.get("reconfirmed", 0) > 0:
+                    db_conn.commit()
+                    log.info("re_embedder.climb_full_chain_reconfirmed",
+                             extra={"leaf": ln, "rungs_reconfirmed": out["reconfirmed"],
+                                    "cycle_skipped": out["cycle_skipped"]})
+                else:
+                    db_conn.rollback()
             except Exception:
-                pass
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
             return out
 
         # SUPERSEDE the old too-direct leaf->root edge (SPLICE case only), same transaction.
@@ -4893,7 +10241,8 @@ def _place_full_chain(
         except Exception:
             pass
         log.debug(f"re_embedder.full_chain_failed leaf={ln}: {e}")
-        return {"placed": 0, "cycle_skipped": 0, "terminated": False, "quarantined": False}
+        return {"placed": 0, "cycle_skipped": 0, "reconfirmed": 0,
+                "terminated": False, "quarantined": False}
 
     # CHAIN-TOP TERMINATION (non-physical domains): the chain ran out without reaching a
     # PRE-SEEDED root, but the LLM's OWN top category is where the is-a ladder genuinely tops
@@ -4985,7 +10334,7 @@ def climb_classification_chains(
     Returns stats dict.
     """
     stats = {"climbed": 0, "terminated": 0, "quarantined": 0, "deferred": 0,
-             "skipped_cached": 0, "errors": 0}
+             "skipped_cached": 0, "errors": 0, "reconfirmed": 0}
     if not _ENGINE_CLASSIFY_CLIMB:
         return stats
     if not user_id or not schema_name:
@@ -5045,6 +10394,9 @@ def climb_classification_chains(
                 (rels, rels),
             )
             leaves = [r[0] for r in cur.fetchall() if r[0]]
+        # READ BARRIER: co-instance grounding and the per-leaf climb below are both LLM lanes.
+        release_read_transaction(
+            db_conn, context=f"re_embedder.climb_classification_chains.leaves schema={schema_name}")
     except Exception as e:
         log.error(f"re_embedder.climb_fetch_leaves_failed: {e}")
         try:
@@ -5062,8 +10414,42 @@ def climb_classification_chains(
         log.error(f"re_embedder.climb_registry_failed: {e}")
         return stats
 
+    # CO-INSTANCE SPECIFICITY (the real breed miss, ingest-side): when the SAME named instance is
+    # `instance_of` two type nodes the eager anchor left as SIBLINGS under the seeded root
+    # (poodle & dog both `subclass_of animal`), ground the more-specific type UNDER the more-general
+    # (`poodle subclass_of dog`) so the shipped most-specific recall collapse has a ladder to act on.
+    # Runs BEFORE the per-leaf splice so the subsequent climb sees the already-grounded ordering.
+    # Bounded, cache-gated, fail-safe (never crashes the loop).
+    try:
+        # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+        # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+        # transaction after it, and that read then rides across this hop. Measured live on the
+        # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+        # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+        # seconds later.
+        release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.pre_blocking_call")
+        _coi = _ground_coinstance_specificity(db_conn, qwen_api_url, user_id, roots)
+        if _coi.get("grounded", 0) > 0:
+            log.info(f"re_embedder.coinstance_specificity schema={schema_name} "
+                     f"grounded={_coi['grounded']} undetermined={_coi['undetermined']} "
+                     f"skipped_cached={_coi['skipped_cached']}")
+    except LLMUnavailable as _unavail:
+        # Brain never reached — this lane grounds nothing rather than grounding on absence.
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        log.warning(f"re_embedder.coinstance_specificity_deferred schema={schema_name} "
+                    f"reason={_unavail.reason} note=brain unavailable; nothing grounded")
+    except Exception as e:
+        _rollback_and_reapply_search_path(db_conn, schema_name)
+        log.warning(f"re_embedder.coinstance_specificity_failed schema={schema_name} "
+                    f"error={type(e).__name__}: {str(e)[:120]}")
+
     advanced = 0
     for leaf_id in leaves:
+        # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+        # read left open by the PREVIOUS iteration would ride across it. A batch-level
+        # barrier alone does not cover this — measured live: climb_state and the
+        # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+        release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.iteration")
         if advanced >= _CLIMB_BATCH_LIMIT:
             break
         try:
@@ -5079,7 +10465,7 @@ def climb_classification_chains(
             # as a false "type-word" and the leaf gets handed to the LLM, which (live) classified the
             # NAME into `rex subclass_of fictional_character`. _is_named_instance closes the gap
             # via the instance_of-subject check (committed Class A by climb time → no race).
-            if _is_named_instance(db_conn, leaf_id):
+            if _is_named_instance(db_conn, leaf_id, user_id=user_id):
                 stats["deferred"] += 1
                 continue
             leaf_name = _type_word_of_entity(db_conn, leaf_id)
@@ -5119,7 +10505,17 @@ def climb_classification_chains(
                 # one pass, cycle-guarded, superseding the too-direct edge atomically. This fixes
                 # the rung-by-rung STALL (qwen returns the whole taxonomy in one shot but refuses
                 # the next rung asked one at a time).
-                full_chain = _query_llm_full_chain(leaf_name, qwen_api_url)
+                # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                # transaction after it, and that read then rides across this hop. Measured live on the
+                # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                # seconds later.
+                release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.pre_blocking_call")
+                full_chain = _ask_brain(_query_llm_full_chain, leaf_name, qwen_api_url,
+                                        stats=stats, what="climb_splice_full_chain")
+                if full_chain is _BRAIN_UNAVAILABLE:
+                    break
                 advanced += 1
                 if full_chain:
                     # ±6 FROM THE RESIDENCE: the budget for NEW rungs above this anchor is 6 minus
@@ -5131,8 +10527,14 @@ def climb_classification_chains(
                         db_conn, _reg, user_id, leaf_id, leaf_name, full_chain,
                         roots, old_root_name=direct_root, max_hops=_budget,
                     )
-                    if fc.get("placed", 0) > 0:
+                    # RE-CONFIRMATION IS A SUCCESSFUL OUTCOME. A chain whose rungs all already
+                    # exist is grounded — the leaf IS placed. Treating that as failure sent it
+                    # down the single-rung fallback (a second LLM call) and then recorded
+                    # 'unplaceable', burning an attempt against the cap for a concept that is
+                    # correctly laddered. Count it as placed and stop.
+                    if fc.get("placed", 0) > 0 or fc.get("reconfirmed", 0) > 0:
                         stats["climbed"] += 1
+                        stats["reconfirmed"] = stats.get("reconfirmed", 0) + fc.get("reconfirmed", 0)
                         if fc.get("terminated"):
                             stats["terminated"] += 1
                         if fc.get("quarantined"):
@@ -5146,7 +10548,17 @@ def climb_classification_chains(
 
                 # SINGLE-RUNG SPLICE (FALLBACK): LLM PROPOSES the leaf's IMMEDIATE parent only
                 # (dog → canine). Used when the one-shot full chain returned nothing usable.
-                proposal = _query_llm_what_is(leaf_name, qwen_api_url)
+                # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                # transaction after it, and that read then rides across this hop. Measured live on the
+                # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                # seconds later.
+                release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.pre_blocking_call")
+                proposal = _ask_brain(_query_llm_what_is, leaf_name, qwen_api_url,
+                                      stats=stats, what="climb_splice_single_rung")
+                if proposal is _BRAIN_UNAVAILABLE:
+                    break
                 inter = ((proposal or {}).get("parent") or "").strip().lower() if proposal else ""
                 if not inter or inter == leaf_name or inter == direct_root:
                     # No genuine intermediate (leaf is already one rung below the root, or the
@@ -5205,7 +10617,17 @@ def climb_classification_chains(
             # remaining ladder above the tip and place EVERY rung in one pass (cycle-guarded,
             # terminate at a seeded root, else quarantine the final tip). No too-direct edge to
             # supersede here (old_root_name=None) — we are EXTENDING an un-grounded tip upward.
-            full_chain = _query_llm_full_chain(tip_name, qwen_api_url)
+            # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+            # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+            # transaction after it, and that read then rides across this hop. Measured live on the
+            # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+            # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+            # seconds later.
+            release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.pre_blocking_call")
+            full_chain = _ask_brain(_query_llm_full_chain, tip_name, qwen_api_url,
+                                    stats=stats, what="climb_tip_full_chain")
+            if full_chain is _BRAIN_UNAVAILABLE:
+                break
             advanced += 1
             if full_chain:
                 # ±6 FROM THE RESIDENCE: the tip sits `hops` above the residence-leaf, so its
@@ -5218,8 +10640,10 @@ def climb_classification_chains(
                     db_conn, _reg, user_id, tip_id, tip_name, full_chain, roots,
                     old_root_name=None, max_hops=_budget,
                 )
-                if fc.get("placed", 0) > 0:
+                # Re-confirmation counts as placement — see the note at the splice caller above.
+                if fc.get("placed", 0) > 0 or fc.get("reconfirmed", 0) > 0:
                     stats["climbed"] += 1
+                    stats["reconfirmed"] = stats.get("reconfirmed", 0) + fc.get("reconfirmed", 0)
                     if fc.get("terminated"):
                         stats["terminated"] += 1
                     if fc.get("quarantined"):
@@ -5229,7 +10653,17 @@ def climb_classification_chains(
                 # else fall through to the single-rung climb FALLBACK below.
 
             # SINGLE-RUNG CLIMB (FALLBACK): ask the LLM "what is <tip>?" (proposes a parent).
-            proposal = _query_llm_what_is(tip_name, qwen_api_url)
+            # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+            # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+            # transaction after it, and that read then rides across this hop. Measured live on the
+            # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+            # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+            # seconds later.
+            release_read_transaction(db_conn, context="re_embedder.climb_classification_chains.pre_blocking_call")
+            proposal = _ask_brain(_query_llm_what_is, tip_name, qwen_api_url,
+                                  stats=stats, what="climb_tip_single_rung")
+            if proposal is _BRAIN_UNAVAILABLE:
+                break
             if not proposal or not proposal.get("parent"):
                 # LLM had no genuine parent (already general) → leave it; converge/decay
                 # handle the rest. Not an error. CACHE 'unplaceable'/no_parent — re-open only
@@ -5351,6 +10785,15 @@ def _place_climb_rung(db_conn, registry, user_id: str, tip_id: str, tip_name: st
         return False
     if not obj_uuid or str(obj_uuid) == str(tip_id):
         return False
+    # RELEVANCE GATE (before the cycle-guard, deliberately): the climb only re-derives a rung
+    # when `_climb_state_should_skip` re-opened the concept — i.e. new information changed its
+    # fingerprint. Re-deriving the SAME parent on new evidence is a confirmation, not a cycle,
+    # and the cycle-guard below would otherwise swallow it (a staged rung makes its own parent
+    # reachable). Count it and stop; nothing is inserted and no tier changes.
+    if _reconfirm_existing_rung(db_conn, tip_id, obj_uuid, "subclass_of"):
+        log.info("re_embedder.climb_rung_reconfirmed",
+                 extra={"tip": tip_name, "parent": parent_name})
+        return True
     # CYCLE-GUARD: never place `tip subclass_of parent` if parent is already a transitive
     # ancestor/descendant of tip (kills the machine<->mechanical_device reciprocal cycle).
     if _is_ancestor_or_descendant(db_conn, tip_id, obj_uuid):
@@ -5486,6 +10929,18 @@ def _splice_intermediate_rung(db_conn, registry, user_id: str, leaf_id: str, lea
     if not root_uuid or str(root_uuid) == str(inter_uuid):
         # inter resolved to the root itself → no genuine intermediate; leave the direct edge.
         return False
+    # RELEVANCE GATE (before the cycle-guard): a splice re-proposed on new evidence whose BOTH
+    # rungs already exist is the same structure recurring — count both and stop, rather than
+    # letting the cycle-guard read the rungs' own existence as a loop and drop the signal. Only
+    # a COMPLETE re-derivation counts; a half-present splice falls through to place the rest.
+    _l_i = _rung_exists(db_conn, leaf_id, inter_uuid, "subclass_of")
+    _i_r = _rung_exists(db_conn, inter_uuid, root_uuid, "subclass_of")
+    if _l_i and _i_r:
+        _reconfirm_existing_rung(db_conn, leaf_id, inter_uuid, "subclass_of")
+        _reconfirm_existing_rung(db_conn, inter_uuid, root_uuid, "subclass_of")
+        log.info("re_embedder.splice_reconfirmed",
+                 extra={"leaf": li, "inter": inter, "root": root})
+        return True
     # CYCLE-GUARD: reject either spliced rung if it would close a loop (inter already an
     # ancestor/descendant of leaf, or root already one of inter). A loop in the splice is the
     # same reciprocal-parent corruption — skip the splice, leave the direct edge intact.
@@ -5550,6 +11005,260 @@ def _splice_intermediate_rung(db_conn, registry, user_id: str, leaf_id: str, lea
         return False
 
 
+# Bound on co-instance specificity pairs grounded per tenant per cycle (worst case one classifier
+# call each — keep the async loop cheap; the pass self-terminates once a pair is ordered).
+_COINSTANCE_BATCH_LIMIT = int(os.environ.get("ENGINE_COINSTANCE_BATCH", "5") or "5")
+
+
+def _place_coinstance_rung(db_conn, child_id: str, child_name: str,
+                           parent_id: str, parent_name: str, roots: set) -> bool:
+    """Stage `child subclass_of parent` (an EXISTING type node) and RETIRE the child's too-direct
+    `child subclass_of <seeded root>` sibling edge, in ONE atomic transaction. Cycle-guarded.
+
+    This is the placement half of co-instance specificity grounding: `parent` already exists in
+    the tenant L4 (it is a co-classifying type of the same instance) and already carries its own
+    ladder toward the root, so we only insert the ONE missing rung `child -> parent` and soft-
+    supersede the child's direct-to-root edge (`poodle subclass_of animal`) so the walk climbs
+    child -> parent -> ... -> root instead of leaving `child` a sibling of `parent` under the root.
+    The new `child -> parent` edge is NEVER superseded (object_id <> parent_id). Root membership is
+    by NAME identity against the seeded-root set (no cosine). Fail-safe: rolls back on any error."""
+    if not child_id or not parent_id or str(child_id) == str(parent_id):
+        return False
+    # RELEVANCE GATE (before the cycle-guard): co-instance grounding re-proposing a rung that
+    # already exists is the same specificity ordering observed again — count it. The retirement
+    # of the too-direct sibling edge below has already happened on the first placement, so
+    # there is nothing further to do.
+    if _reconfirm_existing_rung(db_conn, child_id, parent_id, "subclass_of"):
+        return True
+    # CYCLE-GUARD: never place child -> parent if parent is already an ancestor/descendant of child
+    # (would loop or is redundant). The same reciprocal-parent protection the splice uses.
+    if _is_ancestor_or_descendant(db_conn, child_id, parent_id):
+        return False
+    rels = list(_HIERARCHY_RELS)
+    _root_list = [r for r in roots if r]
+    try:
+        if not _stage_rung(db_conn, child_id, parent_id):
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+            return False
+        # Retire ONLY the child's too-direct edge(s) whose OBJECT is a SEEDED ROOT (the sibling
+        # artefact `child subclass_of animal`) — never the just-placed `child -> parent` edge and
+        # never a non-root intermediate. Soft supersede (recoverable), both tables.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE facts SET superseded_at = now(), archived_at = now(), qdrant_synced = false"
+                "  WHERE subject_id = %s AND rel_type = ANY(%s)"
+                "    AND superseded_at IS NULL AND archived_at IS NULL"
+                "    AND object_id <> %s"
+                "    AND object_id IN (SELECT entity_id FROM entity_aliases"
+                "                        WHERE lower(alias) = ANY(%s))",
+                (child_id, rels, parent_id, _root_list),
+            )
+            cur.execute(
+                "UPDATE staged_facts SET deleted_at = now(), qdrant_synced = false"
+                "  WHERE subject_id = %s AND rel_type = ANY(%s)"
+                "    AND promoted_at IS NULL AND deleted_at IS NULL"
+                "    AND object_id <> %s"
+                "    AND object_id IN (SELECT entity_id FROM entity_aliases"
+                "                        WHERE lower(alias) = ANY(%s))",
+                (child_id, rels, parent_id, _root_list),
+            )
+        db_conn.commit()
+        log.info("re_embedder.coinstance_grounded",
+                 extra={"child": child_name, "parent": parent_name})
+        return True
+    except Exception as e:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        log.debug(f"re_embedder.coinstance_place_failed child={child_name} parent={parent_name}: {e}")
+        return False
+
+
+def _ground_coinstance_specificity(db_conn, qwen_api_url: str, user_id: str, roots: set) -> dict:
+    """CO-INSTANCE SPECIFICITY — ground the more-SPECIFIC of two co-classifying types UNDER the
+    more-general one, so the ±6 produces `poodle subclass_of dog` instead of leaving poodle and
+    dog as SIBLINGS both attached straight to the broad seeded root (`animal`).
+
+    THE GAP THIS CLOSES (the real breed miss, ingest-side): when a named instance is `instance_of`
+    MULTIPLE type nodes (`fraggle instance_of poodle` + `fraggle instance_of dog`), the eager
+    leaf-anchor (`_attach_to_seeded_backbone`) attaches EACH type DIRECTLY to the seeded backbone
+    root — `poodle subclass_of animal` AND `dog subclass_of animal` — as SIBLINGS. The per-leaf
+    splice deepens each ladder toward the root but never, on its own, re-parents one sibling UNDER
+    the other, so the specific breed never lands under its parent type and the (shipped, correct)
+    most-specific recall collapse has no `poodle subclass_of dog` ladder to act on → recall shows
+    BOTH "instance of dog" and "instance of poodle". The CO-INSTANCE signal — the SAME instance
+    IS-A both types — is the ground truth that one type SUBSUMES the other; this pass grounds it.
+
+    SUBJECT-AGNOSTIC / ENGINE-DRIVEN (no literal, no breed/type word list, no seed additive):
+      • Candidates are purely STRUCTURAL — an instance with >= 2 live `instance_of` type-objects
+        that are currently UNORDERED (no `subclass_of`/`is_a` path between them).
+      • DIRECTION is decided by the SAME classifier the splice already uses
+        (`_query_llm_full_chain`): A is-a B iff B appears in A's is-a ladder. The LLM CLASSIFIES;
+        deterministic rules PLACE/validate. NO cosine / similarity — the hypernym is exactly what
+        the classifier returns, and if it cannot relate the pair we SKIP (never guess a direction).
+
+    Off the ingest hot path (async re_embedder), bounded (`_COINSTANCE_BATCH_LIMIT`), cache-gated
+    (`climb_state` on the INSTANCE entity — a fingerprint bump when a new type is added or the
+    ontology grows a parent re-opens it) and FAIL-SAFE (never raises; the loop must not crash)."""
+    out = {"grounded": 0, "undetermined": 0, "skipped_cached": 0}
+    if not user_id or not roots:
+        return out
+    # Instances with >= 2 distinct live instance_of type-objects (the co-classification signal).
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT subject_id, array_agg(DISTINCT object_id) FROM ("
+                "  SELECT subject_id, object_id FROM facts"
+                "    WHERE rel_type = 'instance_of'"
+                "      AND superseded_at IS NULL AND archived_at IS NULL"
+                "  UNION"
+                "  SELECT subject_id, object_id FROM staged_facts"
+                "    WHERE rel_type = 'instance_of'"
+                "      AND promoted_at IS NULL AND deleted_at IS NULL"
+                ") q GROUP BY subject_id HAVING count(DISTINCT object_id) >= 2",
+            )
+            rows = cur.fetchall()
+        # READ BARRIER: _query_llm_full_chain is called per type name below.
+        release_read_transaction(
+            db_conn, context="re_embedder.ground_coinstance_specificity.fetch")
+    except Exception:
+        try:
+            db_conn.rollback()
+        except Exception:
+            pass
+        return out
+    if not rows:
+        return out
+
+    _chain_cache: dict = {}
+
+    def _chain_for(name: str) -> set:
+        n = (name or "").strip().lower()
+        if not n:
+            return set()
+        if n in _chain_cache:
+            return _chain_cache[n]
+        try:
+            ch = _query_llm_full_chain(n, qwen_api_url) or []
+        except LLMUnavailable:
+            # Never asked → do NOT cache an empty chain for this name. Caching "" here would
+            # make an unreachable brain look like "this concept has no is-a ladder" for the
+            # rest of the run, and the specificity comparison would be decided on that.
+            raise
+        except Exception:
+            ch = []
+        s = {(str(t) if t is not None else "").strip().lower() for t in ch}
+        _chain_cache[n] = s
+        return s
+
+    grounded = 0
+    for inst_id, type_ids in rows:
+        # READ BARRIER (per iteration): this loop body reaches the brain through a NESTED
+        # helper (`_chain_for` -> _query_llm_full_chain), which a call-graph scan that stops
+        # at module scope does not see. The per-row `_concept_fingerprint` /
+        # `_climb_state_should_skip` reads would otherwise ride across that call.
+        release_read_transaction(db_conn, context="re_embedder._ground_coinstance_specificity.iteration")
+        if grounded >= _COINSTANCE_BATCH_LIMIT:
+            break
+        tids = [t for t in (type_ids or []) if t]
+        if len(tids) < 2:
+            continue
+        # CACHE (DB = cache): honour a prior verdict on THIS instance unless its input changed
+        # (a new type added / the ontology grew a parent → fingerprint bumps → re-open). Keying on
+        # the INSTANCE uuid is a distinct keyspace from the type-leaf climb (which keys on TYPE
+        # uuids) — no collision.
+        _fp = _concept_fingerprint(db_conn, inst_id)
+        if _climb_state_should_skip(db_conn, inst_id, _fp):
+            out["skipped_cached"] += 1
+            continue
+        # Resolve each type node to its canonical TYPE-word (poodle/dog). Exclude a named instance
+        # or a pure name (a name never orders an L4 ladder — THE HARD LINE) and the seeded roots
+        # themselves (a root is not a child to re-parent).
+        typed = []
+        for tid in tids:
+            if _is_named_instance(db_conn, tid, user_id=user_id):
+                continue
+            # FIRST-CLASS value/place stamp (migration 192, flag VALUE_PLACE_FIRST_CLASS default OFF).
+            # THE HARD LINE in the ASYNC tier: a user VALUE node (stamped favorite_colour/scalar
+            # object) has no in-flight edge here to re-derive from, so the persisted stamp is the only
+            # guard — never order/ladder it into an L4 type. OFF → False (byte-identical).
+            if _node_role.is_protected_value(db_conn, tid):
+                continue
+            nm = _type_word_of_entity(db_conn, tid) or _name_of_entity(db_conn, tid)
+            if nm and nm not in roots:
+                # THE HARD-LINE LADDER GUARD (fail-closed; src/api/hardline_guard.py). The climb
+                # lane minted census rows on value/name nodes (krellin → krelling) because the
+                # stamp is partial and node_role fails OPEN. Guards the LEAF before any rung is
+                # ordered off it; deeper rung subjects are canonical type words already filtered.
+                _hl_refuse, _hl_reason = _ladder_hardline.refuses_subclass_rung(
+                    db_conn, tid, nm, user_id=user_id)
+                if _hl_refuse:
+                    log.debug("re_embedder.hardline_ladder_refused",
+                              extra={"concept": nm, "reason": _hl_reason,
+                                     "lane": "classify_climb"})
+                    continue
+                typed.append((tid, nm))
+        if len(typed) < 2:
+            _climb_state_record(db_conn, inst_id, "unplaceable", "no_ordered_types", _fp)
+            continue
+        did = False           # grounded at least one rung THIS pass
+        unresolved = False     # >=1 pair the classifier could not order (leave for a later pass)
+        for i in range(len(typed)):
+            # READ BARRIER (per iteration): this loop body reaches the brain through a NESTED
+            # helper (`_chain_for` -> _query_llm_full_chain), which a call-graph scan that stops
+            # at module scope does not see. The per-row `_concept_fingerprint` /
+            # `_climb_state_should_skip` reads would otherwise ride across that call.
+            release_read_transaction(db_conn, context="re_embedder._ground_coinstance_specificity.iteration")
+            for j in range(i + 1, len(typed)):
+                # READ BARRIER (per iteration): this loop body reaches the brain through a NESTED
+                # helper (`_chain_for` -> _query_llm_full_chain), which a call-graph scan that stops
+                # at module scope does not see. The per-row `_concept_fingerprint` /
+                # `_climb_state_should_skip` reads would otherwise ride across that call.
+                release_read_transaction(db_conn, context="re_embedder._ground_coinstance_specificity.iteration")
+                a_id, a_nm = typed[i]
+                b_id, b_nm = typed[j]
+                # Already ordered by an existing ladder → a resolved (done) pair, no LLM call.
+                if _is_ancestor_or_descendant(db_conn, a_id, b_id):
+                    continue
+                child = parent = None
+                # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                # transaction after it, and that read then rides across this hop. Measured live on the
+                # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                # seconds later.
+                release_read_transaction(db_conn, context="re_embedder._ground_coinstance_specificity.pre_blocking_call")
+                if b_nm in _chain_for(a_nm):        # A is-a B → A is the more-specific child.
+                    child, parent = (a_id, a_nm), (b_id, b_nm)
+                elif a_nm in _chain_for(b_nm):       # B is-a A → B is the more-specific child.
+                    child, parent = (b_id, b_nm), (a_id, a_nm)
+                if not child:
+                    out["undetermined"] += 1
+                    unresolved = True
+                    continue
+                if _place_coinstance_rung(db_conn, child[0], child[1],
+                                          parent[0], parent[1], roots):
+                    grounded += 1
+                    out["grounded"] += 1
+                    did = True
+                else:
+                    unresolved = True  # cycle-guarded / stage failure → retry a later pass
+        # 'placed' = every pair is resolved (ordered by an existing ladder or grounded this pass);
+        # only a genuinely un-orderable pair leaves the instance 'unplaceable' (cap/backoff bounds
+        # the re-tries; a new type or a grown parent bumps the fingerprint and re-opens it).
+        _climb_state_record(
+            db_conn, inst_id,
+            "unplaceable" if unresolved else "placed",
+            "coinstance_grounded" if did else
+            ("coinstance_undetermined" if unresolved else "coinstance_resolved"), _fp,
+        )
+    return out
+
+
 def _quarantine_climb_tip(db_conn, tip_id: Optional[str], tip_name: str) -> None:
     """MINT-AND-QUARANTINE a chain tip (or an unresolved proposed parent) for later grounding.
 
@@ -5560,6 +11269,21 @@ def _quarantine_climb_tip(db_conn, tip_id: Optional[str], tip_name: str) -> None
     name = (tip_name or "").strip().lower()
     if not name:
         return
+    # THE HARD LINE — TERM ADMISSIBILITY (third and last writer of `ingest_miss_pushback` rows;
+    # the two ingest-side writers in main.py carry the same gate). The names arriving here are
+    # LLM-PROPOSED parents/tips, so they are normally well-formed snake_case type names and pass
+    # untouched — this is the defense-in-depth arm that stops a malformed proposal (a path, an
+    # expression, a lifted phrase) from being minted as a concept and re-entering the very
+    # classifier that proposed it. Fail-safe: any import/parse error → today's behavior (insert).
+    try:
+        from src.extraction.linguistics import type_term_shape
+        _ok_term, _term_why = type_term_shape(name)
+        if not _ok_term:
+            log.info("climb.tip_quarantine_refused_not_a_term "
+                     f"tip={name[:80]} reason={_term_why}")
+            return
+    except Exception:  # noqa: BLE001 — never break the sweep over the shape check
+        pass
     # sample_subject_id is part of the UNIQUE key (candidate_rel_type, sample_subject_id,
     # sample_object); the tip's own entity UUID keys it (or 'climb' when an unresolved
     # proposed parent has no node yet). The async whatis consumer reads sample_object.
@@ -5627,7 +11351,8 @@ def converge_hierarchy_by_identity(db_conn, schema_name: str = "") -> dict:
     try:
         with db_conn.cursor() as cur:
             # 1. Candidate hierarchy node ids (objects of hierarchy edges), both tables.
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT DISTINCT object_id FROM facts
                   WHERE rel_type = ANY(%s) AND superseded_at IS NULL
@@ -5643,7 +11368,8 @@ def converge_hierarchy_by_identity(db_conn, schema_name: str = "") -> dict:
 
         # 2. Canonical name per node — prefer the is_preferred alias, else any alias.
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT entity_id, alias, is_preferred FROM entity_aliases
                 WHERE entity_id = ANY(%s)
@@ -5678,7 +11404,8 @@ def converge_hierarchy_by_identity(db_conn, schema_name: str = "") -> dict:
                 for loser in losers:
                     # Repoint hierarchy edges that POINT AT the duplicate node onto the survivor,
                     # in both tables. Guard against creating a self-loop (subject == survivor).
-                    cur.execute(
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                         """
                         UPDATE facts SET object_id = %s, qdrant_synced = false
                         WHERE object_id = %s AND rel_type = ANY(%s)
@@ -5687,7 +11414,8 @@ def converge_hierarchy_by_identity(db_conn, schema_name: str = "") -> dict:
                         (survivor, loser, _rels, survivor),
                     )
                     repointed += cur.rowcount
-                    cur.execute(
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                         """
                         UPDATE staged_facts SET object_id = %s, qdrant_synced = false
                         WHERE object_id = %s AND rel_type = ANY(%s)
@@ -5783,7 +11511,8 @@ def collapse_hierarchy_2cycles(db_conn, schema_name: str = "") -> dict:
     rels = list(_HIERARCHY_RELS)
     try:
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 WITH live AS (
                     SELECT subject_id AS s, object_id AS o FROM facts
@@ -6222,6 +11951,14 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
     except Exception as e:
         log.error(f"re_embedder.ontology_eval_fetch_failed: {e}")
         return stats
+    finally:
+        # BELT-AND-BRACES read barrier. `if not candidates: return stats` below returns with
+        # this SELECT's transaction still OPEN on the caller's long-lived sweep connection —
+        # the next subsystem then makes an LLM call inheriting it, holding AccessShareLock on
+        # ontology_evaluations for the whole call. The caller's own barrier already covers
+        # this; the `finally` makes the function safe for ANY caller, including the exception
+        # path (which returns with the transaction INERROR, still holding every lock it took).
+        release_read_transaction(db_conn, context="re_embedder.evaluate_ontology_candidates.fetch")
 
     if not candidates:
         return stats
@@ -6267,6 +12004,11 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
         curated_rels = set(existing_types)
 
     for row in candidates:
+        # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+        # read left open by the PREVIOUS iteration would ride across it. A batch-level
+        # barrier alone does not cover this — measured live: climb_state and the
+        # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+        release_read_transaction(db_conn, context="re_embedder.evaluate_ontology_candidates.iteration")
         candidate_rel, subj_type, obj_type, snippet, occ, subj_id, obj = row
         try:
             decision = None
@@ -6277,9 +12019,28 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
             # ── Decision 1: Pattern frequency (per-rel_type aggregate) ──
             # occ is SUM(occurrence_count) over all undecided sibling rows of this
             # rel_type — the aggregate frequency, not a single sample triple's count.
-            if occ >= 3:
+            # ⚠️ UNGATED 2026-08-27 (owner ruling — see the note on LINGUISTIC_CUE_GROWTH_THRESHOLD).
+            # A rel_type is ENGINE STRUCTURE — a SHELF, ours — so it becomes usable the moment it is
+            # derived. The old `occ >= 3` held a derived rel in ontology_evaluations for two more
+            # sightings, during which the fact that needed it had nowhere walkable to live and the
+            # user could not see (and therefore could not correct) the shape the engine had chosen.
+            # A NOVEL rel is minted with source='engine'/engine_generated and NEVER overwrites a
+            # curated or user rel (the trust hierarchy user > wikidata > engine > builtin is enforced
+            # at /ontology/rel_types and by the curated_rels guard above), so ungating cannot damage
+            # seeded ontology — it only lets the tenant's own grown shelf exist sooner.
+            #
+            # ⚠️ COST CONSEQUENCE, STATED PLAINLY (do not discover this in a bill). The `approved`
+            # branch below calls `_query_llm_for_rel_type_metadata` — ONE LLM call per approved rel.
+            # At the legacy gate that call fired on the THIRD sighting; at threshold 1 it fires on
+            # the FIRST. It is one call per DISTINCT NOVEL rel_type per tenant, not per turn, and
+            # rel_types converge quickly — but on a CPU-cloud tenant brain (the SaaS target) it is a
+            # real, measurable increase in the first hours of a new tenant, and it front-loads it.
+            # If that becomes the binding constraint the right answer is to APPROVE the rel
+            # immediately and DEFER only its metadata enrichment, not to re-gate approval.
+            # ROLLBACK LEVER: REL_TYPE_APPROVAL_THRESHOLD=3 restores the legacy gate exactly.
+            if occ >= REL_TYPE_APPROVAL_THRESHOLD:
                 decision = "approved"
-                reason = f"aggregate_occurrence={occ} >= 3"
+                reason = f"aggregate_occurrence={occ} >= {REL_TYPE_APPROVAL_THRESHOLD}"
 
             # ── Decision 2: Semantic similarity (DEMOTED — RUNG-6) ──────
             # The cosine>0.85 → auto-rewrite collapse is RETIRED as the primary mechanism
@@ -6308,6 +12069,11 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     best_score = 0.0
                     best_fit = None
                     for ext in existing_types:
+                        # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+                        # read left open by the PREVIOUS iteration would ride across it. A batch-level
+                        # barrier alone does not cover this — measured live: climb_state and the
+                        # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+                        release_read_transaction(db_conn, context="re_embedder.evaluate_ontology_candidates.iteration")
                         ext_text = f"relationship: {ext}"
                         # dprompt-121: Check cache first
                         ext_vector = _embedding_cache.get(ext_text)
@@ -6396,9 +12162,32 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
             with db_conn.cursor() as cur:
                 if decision == "approved":
                     # dprompt-126: Phase 2 — Query LLM for natural language metadata
-                    llm_metadata = _query_llm_for_rel_type_metadata(
-                        candidate_rel, subj_type, obj_type, snippet, qwen_api_url
-                    )
+                    try:
+                        # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                        # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                        # transaction after it, and that read then rides across this hop. Measured live on the
+                        # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                        # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                        # seconds later.
+                        release_read_transaction(db_conn, context="re_embedder.evaluate_ontology_candidates.pre_blocking_call")
+                        llm_metadata = _query_llm_for_rel_type_metadata(
+                            candidate_rel, subj_type, obj_type, snippet, qwen_api_url,
+                            raise_on_nonanswer=True,
+                        )
+                    except LLMUnavailable as _md_unavail:
+                        # DEFER, do not decide. Leaving re_embedder_decision NULL is this
+                        # lane's own documented non-terminal state ("Decision 3: Defer") — the
+                        # candidate keeps accruing occurrences and is re-evaluated on a later
+                        # sweep. Writing 'approved' here would be terminal (every fetch in this
+                        # lane is `WHERE re_embedder_decision IS NULL`) and would persist the
+                        # ANY/ANY wildcard the missing metadata forces.
+                        stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+                        log.warning(
+                            f"re_embedder.ontology_approve_deferred_brain_unavailable "
+                            f"rel_type={candidate_rel} reason={_md_unavail.reason} "
+                            f"note=candidate left UNDECIDED; no ANY/ANY rel minted, no "
+                            f"'approved' stamped — re-evaluated on a later sweep")
+                        continue
 
                     # Register the new rel_type with full metadata
                     label = llm_metadata.get("llm_natural_language", "").split(" is ")[0].title() if llm_metadata.get("llm_natural_language") else candidate_rel.replace('_', ' ').title()
@@ -6488,7 +12277,8 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                     if category and not is_hierarchy:
                         try:
                             with db_conn.cursor() as _tax_cur:
-                                _tax_cur.execute(
+                                _tax_cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                                     """
                                     UPDATE entity_taxonomies
                                     SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
@@ -6498,11 +12288,12 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                                     (candidate_rel, category, candidate_rel),
                                 )
                                 if _tax_cur.rowcount > 0:
-                                    log.info("re_embedder.taxonomy_rel_type_appended",
-                                             rel_type=candidate_rel, taxonomy=category)
+                                    log.info("re_embedder.taxonomy_rel_type_appended "
+                                             f"rel_type={candidate_rel} taxonomy={category}")
                                 else:
                                     # Exact match found no row — try ILIKE fallback
-                                    _tax_cur.execute(
+                                    _tax_cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                                         """
                                         UPDATE entity_taxonomies
                                         SET rel_types_defining_group = array_append(rel_types_defining_group, %s)
@@ -6512,17 +12303,17 @@ def evaluate_ontology_candidates(db_conn, qwen_api_url: str) -> dict:
                                         (candidate_rel, category, candidate_rel),
                                     )
                                     if _tax_cur.rowcount > 0:
-                                        log.info("re_embedder.taxonomy_rel_type_appended_ilike",
-                                                 rel_type=candidate_rel, taxonomy_pattern=category)
+                                        log.info("re_embedder.taxonomy_rel_type_appended_ilike "
+                                                 f"rel_type={candidate_rel} taxonomy_pattern={category}")
                                     else:
-                                        log.debug("re_embedder.taxonomy_no_match_for_category",
-                                                  rel_type=candidate_rel, category=category)
+                                        log.debug("re_embedder.taxonomy_no_match_for_category "
+                                                  f"rel_type={candidate_rel} category={category}")
                         except Exception as _tax_err:
-                            log.warning("re_embedder.taxonomy_append_failed",
-                                        rel_type=candidate_rel, error=str(_tax_err)[:100])
+                            log.warning("re_embedder.taxonomy_append_failed "
+                                        f"rel_type={candidate_rel} error={str(_tax_err)[:100]}")
                     elif is_hierarchy:
-                        log.debug("re_embedder.taxonomy_append_skipped_hierarchy",
-                                  rel_type=candidate_rel)
+                        log.debug("re_embedder.taxonomy_append_skipped_hierarchy "
+                                  f"rel_type={candidate_rel}")
 
                     # Refresh unified metadata cache so the newly approved rel_type
                     # is immediately available to the ingest pipeline without waiting
@@ -6665,6 +12456,14 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
     except Exception as e:
         log.error(f"re_embedder.pending_drain_fetch_failed schema={schema_name}: {e}")
         return stats
+    finally:
+        # BELT-AND-BRACES read barrier — see evaluate_ontology_candidates. `if not
+        # pending_rels: return stats` below is one of the three confirmed leak sites: it
+        # returns holding AccessShareLock on rel_types, and the next subsystem's LLM call
+        # inherits it.
+        release_read_transaction(
+            db_conn,
+            context=f"re_embedder.drain_pending_placement_by_morphology.fetch schema={schema_name}")
 
     if not pending_rels:
         return stats
@@ -6679,6 +12478,42 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
             # 0. SEEDED morphology match ONLY — never fold onto a tenant-grown rel, never
             #    cosine. A miss leaves the rel pending for the freq>=3/LLM path.
             seeded = _resolve_seeded_morph(_pending, dsn, schema_name)
+            if not seeded or seeded == _pending:
+                # ROUND-5 pending-placement backfill -- ALIAS-MAP FOLD. The morphology fold
+                # above only sees a SEEDED canonical when the SURFACE shape matches; a rel
+                # whose alias row already exists (migration 297: exist_on -> member_of) is
+                # byte-identical to a true orphan here and its facts stay invisible to the
+                # scoped walk. The tenant rel_type_aliases table IS the authoritative DATA
+                # mapping an alias onto a canonical -- the same map the in-flow ingest edge
+                # lane reads -- so a pending rel mapping through it onto a SEEDED canonical
+                # folds onto that canonical. Data, not code: the fold follows whatever row
+                # the tenant carries; a miss leaves the rel pending for the freq/LLM path.
+                try:
+                    with db_conn.cursor() as _al_cur:
+                        _al_cur.execute(
+                            "SELECT canonical_rel_type FROM rel_type_aliases"
+                            " WHERE alias = %s LIMIT 1", (_pending,))
+                    _al_row = _al_cur.fetchone()
+                except Exception as _al_err:  # noqa: BLE001 -- no map -> plain orphan
+                    log.debug(f"re_embedder.pending_drain_alias_probe_failed "
+                                f"rel={_pending} schema={schema_name}: {str(_al_err)[:120]}")
+                    _al_row = None
+                _alias_cand = ((_al_row[0] or "").strip().lower() if _al_row else None)
+                if _alias_cand and _alias_cand != _pending:
+                    try:
+                        with db_conn.cursor() as _sd_cur:
+                            _sd_cur.execute(
+                                "SELECT 1 FROM rel_types WHERE rel_type = %s"
+                                " AND lower(COALESCE(source, %s)) IN %s"
+                                " AND category <> %s LIMIT 1",
+                                (_alias_cand, tuple(_SEEDED_SOURCES), _CATEGORY_PENDING_RE))
+                        _seeded_target = _sd_cur.fetchone() is not None
+                    except Exception as _sd_err:  # noqa: BLE001 -- fail-safe: stay pending
+                        log.debug(f"re_embedder.pending_drain_seed_probe_failed "
+                                    f"rel={_pending}: {str(_sd_err)[:120]}")
+                        _seeded_target = False
+                    if _seeded_target:
+                        seeded = _alias_cand
             if not seeded or seeded == _pending:
                 continue
 
@@ -6755,6 +12590,74 @@ def drain_pending_placement_by_morphology(db_conn, dsn: str, schema_name: str) -
         except Exception:
             pass
 
+    # ── UNDRAINABLE BACKLOG — make the silence countable (FAIL LOUD) ──────────────────────
+    # This drain folds a pending rel ONLY onto a SEEDED canonical it MORPHOLOGY-matches
+    # (`live_in` → `lives_in`). That predicate is deliberately narrow, and the population it
+    # is fed is dominated by semantically NOVEL predicates (`hike`, `wash`, `commute`) which
+    # match no seed by construction. The two states are byte-identical in the data: a drain
+    # that never ran, and a drain that ran correctly over a population where its predicate is
+    # never true. Returning a bare `reconciled=0` reported neither.
+    #
+    # This is not bookkeeping. A rel stuck at `category='pending_placement'` is NEVER appended
+    # to `entity_taxonomies.rel_types_defining_group`, so the query path's
+    # `rel_type = ANY(allowed_rels)` projection can never admit it — every fact filed under it
+    # is INVISIBLE to a scoped recall (stated in migrations/197 and mirrored at :2498 above).
+    # So the honest unit of the backlog is not "rels" but "USER FACTS currently unreachable".
+    #
+    # Emitted at CRIT only when real memory is affected (rels that actually carry facts) so a
+    # tenant whose pending rels are all factless stays quiet. Fail-safe: any error here is
+    # swallowed — an observability probe must never break the sweep. Counts are added to
+    # `stats` so a test can pin them without scraping logs.
+    try:
+        _remaining = max(0, stats["scanned"] - stats["reconciled"])
+        if _remaining > 0:
+            with db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(DISTINCT r.rel_type), COALESCE(sum(c.n), 0)"
+                    "  FROM rel_types r"
+                    "  JOIN LATERAL ("
+                    "       SELECT count(*) AS n FROM ("
+                    "         SELECT 1 FROM facts f"
+                    "          WHERE f.rel_type = r.rel_type AND f.superseded_at IS NULL"
+                    "            AND f.archived_at IS NULL AND f.deleted_at IS NULL"
+                    "         UNION ALL"
+                    "         SELECT 1 FROM staged_facts s"
+                    "          WHERE s.rel_type = r.rel_type AND s.promoted_at IS NULL"
+                    "            AND s.deleted_at IS NULL"
+                    "       ) u"
+                    "  ) c ON TRUE"
+                    " WHERE r.category = %s AND c.n > 0",
+                    (_CATEGORY_PENDING_RE,),
+                )
+                _row = cur.fetchone() or (0, 0)
+            stats["unplaceable_rels"] = int(_row[0] or 0)
+            stats["unplaceable_facts"] = int(_row[1] or 0)
+            if stats["unplaceable_rels"] > 0:
+                # `_doc_log_crit` is this module's ONLY CRITICAL renderer, and it is not
+                # document-specific despite the name: `log` here is a STDLIB logger, so
+                # src.api.logging_config.log_crit's kwargs-passthrough shape raises
+                # TypeError (see its docstring at :3360). Renaming it is out of scope.
+                _doc_log_crit(
+                    "re_embedder.pending_placement_backlog_undrainable",
+                    schema=schema_name,
+                    scanned=stats["scanned"], reconciled=stats["reconciled"],
+                    unplaceable_rels=stats["unplaceable_rels"],
+                    unplaceable_facts=stats["unplaceable_facts"],
+                    note="pending rels carrying REAL facts that no drain can place: this "
+                         "morphology fold only matches a SEEDED canonical, and a semantically "
+                         "novel predicate matches none. Their facts are stored but INVISIBLE "
+                         "to scoped recall (never enter rel_types_defining_group, so "
+                         "allowed_rels can never admit them). reconciled=0 here means the "
+                         "predicate did not match — NOT that the lane is dark.",
+                )
+    except Exception as _ble:  # noqa: BLE001 — observability must never break the sweep
+        try:
+            db_conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning(
+            f"re_embedder.pending_backlog_probe_failed schema={schema_name}: {str(_ble)[:160]}")
+
     return stats
 
 
@@ -6793,6 +12696,10 @@ def _synonym_conv_batch() -> int:
 _SYNONYM_CONV_METHOD = "synonym_convergence"
 _SYNONYM_CONV_MEMO_SUBJ = "__synonym_convergence__"
 _SYNONYM_CONV_MEMO_OBJ = "__memo__"
+# The decision written when the brain did NOT answer. Deliberately NOT 'left_novel': the
+# skip-probe in converge_lifted_synonyms matches 'left_novel' exactly, so this value leaves the
+# door OPEN for a later sweep while still being visible to an operator reading the table.
+_MEMO_BRAIN_UNAVAILABLE = "llm_unavailable"
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -6820,8 +12727,18 @@ def _aspect_syn_min_conf_emb() -> float:
 def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: str):
     """Background (retry-OK) brain call mirroring main._aspect_map_via_llm: does '<aspect_word>'
     refer to EXACTLY ONE of the things this user actually tracks (a scalar attribute OR a
-    relationship the anchor holds), or NONE? Returns (canonical|None, confidence). Fail-safe →
-    (None, 0.0). Bounded, low-token; existing LLM stack (no hardcoded timeout)."""
+    relationship the anchor holds), or NONE? Returns ``(canonical|None, confidence, called_ok)``.
+
+    ⚠️ THE THIRD ELEMENT IS THE WHOLE POINT, AND ITS ABSENCE WAS A LIVE DEFECT. The INLINE twin
+    ``main._aspect_map_via_llm`` has always returned ``called_ok`` and its caller branches on it —
+    "Brain judged NONE → memoize" vs "timed out/failed → async backstop". This ASYNC twin returned
+    only 2 values, so ``evaluate_aspect_synonym_candidates`` wrote the PERMANENT
+    ``left_unmapped`` memo on a brain outage — the very memo the inline path is careful not to
+    write, and the one ``main._aspect_word_memoized_unmapped`` honours forever. The correct
+    contract already existed one file away; this lane simply did not implement it.
+
+    Fail-safe → (None, 0.0, False): unanswered, so the caller leaves the row UNDECIDED and the
+    next sweep retries. Bounded, low-token; existing LLM stack (no hardcoded timeout)."""
     _names = {c[0] for c in candidates}
     _lines = "\n".join(f'  - {a}: {(nl or a.replace("_", " "))}' for a, nl in candidates)
     prompt = (
@@ -6841,21 +12758,38 @@ def _aspect_map_via_llm_async(aspect_word: str, candidates: list, qwen_api_url: 
         result = call_llm_with_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("ENRICHMENT"),
-            user_id="re_embedder",
+            # PER-TENANT: the aspect word AND the candidate list are this tenant's own memory
+            # aspects (evaluate_aspect_synonym_candidates runs under their search_path), so
+            # this is unambiguously their spend.
+            user_id=_reembedder_llm_user_id(),
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # Same reason as the synonym-convergence gate: this caller CACHES A VERDICT.
+            raise_on_unavailable=True,
         )
-        if isinstance(result, dict):
+        if _brain_answered(result):
             attr = result.get("attribute")
             try:
                 conf = float(result.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 conf = 0.0
             if attr and str(attr).strip().lower() in _names:
-                return str(attr).strip().lower(), conf
+                return str(attr).strip().lower(), conf, True
+            # ANSWERED, and the answer was "none of them" (or a name not in the bound
+            # candidate set, which is the same non-match). That IS a verdict — memoize it.
+            return None, conf, True
+        log.warning(f"re_embedder.aspect_map_brain_nonanswer aspect={aspect_word} "
+                    f"shape={type(result).__name__} "
+                    f"error={(result or {}).get('error') if isinstance(result, dict) else None} "
+                    f"note=NOT memoized; row left undecided for a later sweep")
+        return None, 0.0, False
+    except LLMUnavailable as e:
+        log.warning(f"re_embedder.aspect_map_brain_unavailable aspect={aspect_word} "
+                    f"reason={e.reason} operation={e.operation} "
+                    f"note=no verdict cached; row left undecided for a later sweep")
     except Exception as e:
         log.debug(f"re_embedder.aspect_map_llm_failed aspect={aspect_word}: {type(e).__name__}: {str(e)[:120]}")
-    return None, 0.0
+    return None, 0.0, False
 
 
 def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen_api_url: str) -> dict:
@@ -6867,7 +12801,7 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
     deterministically by the query walk (no query-time model call). Fail-safe per row.
     Returns {"grown","unmapped","skipped","errors"}.
     """
-    stats = {"grown": 0, "unmapped": 0, "skipped": 0, "errors": 0}
+    stats = {"grown": 0, "unmapped": 0, "skipped": 0, "brain_unavailable": 0, "errors": 0}
     if not _ASPECT_SYNONYM_GROWTH_ENABLED:
         return stats
     try:
@@ -6884,6 +12818,9 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
                 (_ASPECT_SYN_METHOD_EMB,),
             )
             rows = cur.fetchall()
+        # READ BARRIER: _aspect_map_via_llm_async runs per candidate row below.
+        release_read_transaction(
+            db_conn, context=f"re_embedder.aspect_synonym.fetch schema={schema_name}")
     except Exception as e:
         log.error(f"re_embedder.aspect_synonym_fetch_failed schema={schema_name}: {str(e)[:160]}")
         return stats
@@ -6892,6 +12829,11 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
 
     min_conf = _aspect_syn_min_conf_emb()
     for (row_id, anchor_uuid, aspect_word) in rows:
+        # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+        # read left open by the PREVIOUS iteration would ride across it. A batch-level
+        # barrier alone does not cover this — measured live: climb_state and the
+        # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+        release_read_transaction(db_conn, context="re_embedder.evaluate_aspect_synonym_candidates.iteration")
         aspect_word = (aspect_word or "").strip().lower()
         if not aspect_word or not anchor_uuid:
             stats["skipped"] += 1
@@ -6945,7 +12887,27 @@ def evaluate_aspect_synonym_candidates(db_conn, dsn: str, schema_name: str, qwen
                 stats["skipped"] += 1
                 continue
 
-            attr, conf = _aspect_map_via_llm_async(aspect_word, candidates, qwen_api_url)
+            # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+            # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+            # transaction after it, and that read then rides across this hop. Measured live on the
+            # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+            # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+            # seconds later.
+            release_read_transaction(db_conn, context="re_embedder.evaluate_aspect_synonym_candidates.pre_blocking_call")
+            attr, conf, called_ok = _aspect_map_via_llm_async(
+                aspect_word, candidates, qwen_api_url)
+            if not called_ok:
+                # THE BRAIN NEVER ANSWERED. Leave re_embedder_decision NULL — that IS this
+                # lane's retry mechanism (the drain SELECT above is `WHERE re_embedder_decision
+                # IS NULL`), so writing ANY non-NULL value here, including a "retryable" one,
+                # would remove the row from its own queue. Never write a decision this lane
+                # cannot itself re-read.
+                stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+                log.warning(
+                    f"re_embedder.aspect_synonym_not_memoized schema={schema_name} "
+                    f"aspect={aspect_word} note=a non-answer is not a verdict (RFC 9520 "
+                    f"type-3); row left UNDECIDED so the next sweep retries")
+                continue
             names = {c[0] for c in candidates}
             if attr and attr in names and conf >= min_conf:
                 grew = _record_alias(alias=aspect_word, canonical=attr, requires_inversion=False,
@@ -7038,6 +13000,78 @@ def _observed_entity_types(db_conn, rel_type: str, which: str) -> set:
     return types
 
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# A NON-ANSWER IS NOT A VERDICT (memo honesty)
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Every lane below CACHES A DECISION derived from a brain answer. The LLM stack returns the SAME
+# python shape for three different things (llm_calls.call_llm_with_retry_sync):
+#
+#   (a) the brain ANSWERED               -> the parsed JSON object, carrying the verdict key
+#   (b) the brain answered NOTHING       -> {}          (empty content / unparseable response)
+#   (c) the brain was NEVER REACHED      -> {}          (saas_no_brain_failclosed), or an
+#                                          {"error": ...} dict (circuit_breaker_open, and
+#                                          — measured live — context_overrun_preflight, which
+#                                          refuses BEFORE the wire and is NOT covered by
+#                                          raise_on_unavailable: llm_calls.py returns `_ctx_block`
+#                                          straight out of _context_preflight).
+#
+# (b) and (c) are indistinguishable from (a)-answering-"null" once you look only at the verdict
+# value, which is exactly how a transient outage became a PERMANENT exclusion: measured on
+# production 2026-08-27, `llm_call.context_overrun_preflight operation=ENRICHMENT window=448`
+# fired 198 times in 72h, and 512 `left_novel` memos across 9 of 22 tenants carry
+# `ans='' conf=0.00` — the fingerprint of a call that never happened.
+#
+# THE STANDARD IS EXPLICIT ABOUT THIS SPLIT. RFC 9520, "Negative Caching of DNS Resolution
+# Failures" (Kristoff, Wessels, Wallström, Dec 2023) opens by separating exactly these three:
+# "(1) a response containing the requested data, (2) a response indicating the requested data does
+# not exist, or (3) a non-response due to a resolution failure in which the resolver does not
+# receive any useful information regarding the data's existence. This document concerns itself
+# only with the third type." It then rules that "NXDOMAIN and NOERROR/NODATA responses are not
+# conditions for resolution failure ... the server is providing a useful response", and that a
+# FAILURE may be cached but "MUST NOT be cached for longer than 5 minutes". Our defect is the
+# prohibited combination: caching a type-3 non-response AS a type-2 negative answer, forever.
+#
+# THE PREDICATE: a dict that CARRIES THE VERDICT KEY is an answer. Everything else — {}, an
+# {"error": ...} envelope, a non-dict, a raised LLMUnavailable — is a non-answer. This is
+# key-PRESENCE, not truthiness: {"equivalent_to": None, "confidence": 0.95} is a considered
+# "not equivalent" and MUST still be memoized. Cheap, local, and covers every shape above,
+# including the preflight refusal that raise_on_unavailable cannot express.
+_ONTOLOGY_MEMO_REQUIRES_ANSWER = _flag("ONTOLOGY_MEMO_REQUIRES_ANSWER", "true")
+
+
+def _brain_answered(result) -> bool:
+    """False when ``result`` is one of the three shapes ``llm_calls`` returns for a call that
+    produced NO answer, and True otherwise.
+
+    DELIBERATELY NARROW — it enumerates the shapes, it does not judge the content:
+      * not a dict            — nothing came back at all;
+      * an EMPTY dict         — saas_no_brain_failclosed / empty_llm_content /
+                                unparseable_llm_response;
+      * an ``{"error": ...}`` envelope — circuit_breaker_open, and context_overrun_preflight,
+                                which refuses BEFORE the wire and therefore cannot be expressed
+                                by ``raise_on_unavailable``.
+    Every prompt in this module asks for a schema with no ``error`` key, so this cannot
+    mis-fire on a real answer. It is narrow ON PURPOSE: a WIDER predicate (e.g. "the verdict
+    key must be present") would also reject a malformed-but-real answer, and since a non-answer
+    is retried rather than memoized, that would mean re-asking a broken model forever.
+
+    Flag ``ONTOLOGY_MEMO_REQUIRES_ANSWER=false`` restores the byte-for-byte legacy behaviour
+    (every returned shape treated as an answer). Default TRUE = the SAFE direction: refuse to
+    cache a verdict we have no evidence for. Fail-safe on any fault -> True (treat as answered),
+    because this predicate must never invent an outage that did not happen.
+    """
+    if not _ONTOLOGY_MEMO_REQUIRES_ANSWER:
+        return True
+    try:
+        if not isinstance(result, dict):
+            return False
+        if not result:
+            return False
+        return "error" not in result
+    except Exception:  # noqa: BLE001 — a guard must never break its host
+        return True
+
+
 def _llm_propose_equivalence(
     novel_rel: str,
     novel_nl: str,
@@ -7050,7 +13084,9 @@ def _llm_propose_equivalence(
     relation as ONE of the already type-compatible ``candidates`` (a strict bidirectional synonym —
     "X novel Y" is true IFF "X candidate Y" is true), NOT merely related/narrower/broader. Bounded,
     low-token, existing LLM stack (LLMTimeouts — no hardcoded timeout). Returns the parsed dict or {}.
-    Fail-safe: any error / no valid JSON → {} (caller leaves the rel novel)."""
+    Returns ``(proposal, answered)``. ``answered`` is False when the brain was never reached or
+    returned nothing — see ``_brain_answered``; the caller MUST NOT memoize a verdict then.
+    Fail-safe: any error / no valid JSON → ({}, False) (caller leaves the rel novel AND RETRIES)."""
     _cand_lines = "\n".join(
         f'  - {pk}: {(meta.get("nl") or pk.replace("_", " "))}'
         + (" (symmetric)" if meta.get("is_symmetric") else "")
@@ -7079,15 +13115,32 @@ Respond with ONLY valid JSON (no markdown):
         result = call_llm_with_retry_sync(
             messages=[{"role": "user", "content": prompt}],
             model=LLMModels.get("ENRICHMENT"),
-            user_id="re_embedder",
+            # PER-TENANT: Gate 1 resolved the observed head/tail types from THIS tenant's live
+            # facts, so both the novel rel and the candidate set are their data.
+            user_id=_reembedder_llm_user_id(),
             timeout=LLMTimeouts.get("ENRICHMENT"),
             operation="ENRICHMENT",
+            # This caller CACHES A VERDICT — llm_calls.py's own docstring names that as the
+            # reason this kwarg exists. It converts breaker_open / rate_deferred /
+            # retries_exhausted into an explicit LLMUnavailable instead of an error dict.
+            # It is NOT sufficient on its own (the preflight refusal returns a dict either
+            # way), which is why _brain_answered is the real backstop.
+            raise_on_unavailable=True,
         )
-        if isinstance(result, dict):
-            return result
+        if _brain_answered(result):
+            return result, True
+        log.warning(f"re_embedder.synonym_conv_brain_nonanswer rel={novel_rel} "
+                    f"shape={type(result).__name__} "
+                    f"error={(result or {}).get('error') if isinstance(result, dict) else None} "
+                    f"note=NOT memoized; retried on a later sweep")
+        return (result if isinstance(result, dict) else {}), False
+    except LLMUnavailable as e:
+        log.warning(f"re_embedder.synonym_conv_brain_unavailable rel={novel_rel} "
+                    f"reason={e.reason} operation={e.operation} "
+                    f"note=no verdict cached, no attempt burned; retried on a later sweep")
     except Exception as e:
         log.debug(f"re_embedder.synonym_conv_llm_failed rel={novel_rel}: {type(e).__name__}: {str(e)[:120]}")
-    return {}
+    return {}, False
 
 
 def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: str = None) -> dict:
@@ -7128,7 +13181,7 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
     per rel (savepoint) and per pass. Returns {"converged": int, "scanned": int, "left_novel": int,
     "errors": int}.
     """
-    stats = {"converged": 0, "scanned": 0, "left_novel": 0, "errors": 0}
+    stats = {"converged": 0, "scanned": 0, "left_novel": 0, "brain_unavailable": 0, "errors": 0}
     if not _ENGINE_SYNONYM_CONVERGENCE:
         return stats
 
@@ -7159,6 +13212,11 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
     except Exception as e:
         log.error(f"re_embedder.synonym_conv_fetch_failed schema={schema_name}: {str(e)[:160]}")
         return stats
+    finally:
+        # BELT-AND-BRACES read barrier — see evaluate_ontology_candidates. Third of the three
+        # confirmed leak sites: `if not novel_rows: return stats` below.
+        release_read_transaction(
+            db_conn, context=f"re_embedder.converge_lifted_synonyms.fetch schema={schema_name}")
 
     if not novel_rows:
         return stats
@@ -7176,6 +13234,11 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
     except Exception as e:
         log.error(f"re_embedder.synonym_conv_seed_fetch_failed schema={schema_name}: {str(e)[:160]}")
         return stats
+    finally:
+        # Same class as the novel_rows fetch above: this `return stats` exits with the
+        # transaction INERROR, still holding every lock the SELECT took.
+        release_read_transaction(
+            db_conn, context=f"re_embedder.converge_lifted_synonyms.seed_fetch schema={schema_name}")
 
     seeded = {}
     for (pk, ht, tt, sym, hier, inv, nl, cat) in seeded_rows:
@@ -7252,9 +13315,60 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
             llm_budget -= 1
 
             # ── GATE 2 (LLM proposes, deterministic accept) ──
-            proposal = _llm_propose_equivalence(
+            # PER-ITEM READ BARRIER, immediately before the blocking call. Gate 1 just read
+            # the rel's observed entity types (_observed_entity_types → facts/entities), and
+            # the alias/memo probes above read rel_type_aliases + ontology_evaluations — all
+            # on the caller's long-lived sweep connection, all still INTRANS. Without this the
+            # LLM call is made holding those locks for its entire duration; a wedged endpoint
+            # makes that unbounded. Pure reads → rolled back; a pending write → log_crit, never
+            # silently discarded.
+            release_read_transaction(
+                db_conn,
+                context=f"re_embedder.converge_lifted_synonyms.llm_gate2 schema={schema_name} rel={_rel}")
+            proposal, _answered = _llm_propose_equivalence(
                 _rel, novel_nl or "", subj_types, obj_types, candidates, qwen_api_url
             )
+            if not _answered:
+                # THE BRAIN NEVER ANSWERED — there is no verdict to cache. Record a
+                # decision the skip-probe above does NOT honour (it matches
+                # `re_embedder_decision = 'left_novel'` exactly), so this rel is RE-OFFERED
+                # on the next sweep instead of being excluded forever. The row is written on
+                # the SAME (candidate_rel_type, sample_subject_id, sample_object) key, so a
+                # later real verdict simply overwrites it via the ON CONFLICT below.
+                stats["brain_unavailable"] = stats.get("brain_unavailable", 0) + 1
+                try:
+                    with db_conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO ontology_evaluations"
+                            "  (candidate_rel_type, extraction_method, sample_subject_id, sample_object,"
+                            "   occurrence_count, last_seen_at, re_embedder_decision, decision_reason,"
+                            "   decision_timestamp)"
+                            " VALUES (%s, %s, %s, %s, 1, now(), %s, %s, now())"
+                            " ON CONFLICT (candidate_rel_type, sample_subject_id, sample_object)"
+                            " DO UPDATE SET last_seen_at = now(),"
+                            "   re_embedder_decision = %s,"
+                            "   decision_reason = EXCLUDED.decision_reason",
+                            (_rel, _SYNONYM_CONV_METHOD, _SYNONYM_CONV_MEMO_SUBJ,
+                             _SYNONYM_CONV_MEMO_OBJ, _MEMO_BRAIN_UNAVAILABLE,
+                             ("brain did not answer (never reached / empty / error envelope) — "
+                              "NOT a verdict; retried on a later sweep")[:500],
+                             _MEMO_BRAIN_UNAVAILABLE),
+                        )
+                    db_conn.commit()
+                except Exception:
+                    try:
+                        db_conn.rollback()
+                        with db_conn.cursor() as _spc:
+                            _spc.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                    except Exception:
+                        pass
+                log.warning(
+                    f"re_embedder.synonym_conv_not_memoized schema={schema_name} rel={_rel} "
+                    f"decision={_MEMO_BRAIN_UNAVAILABLE} "
+                    f"note=a non-answer is not a verdict (RFC 9520 type-3); door stays OPEN"
+                )
+                continue
             _ans = (proposal.get("equivalent_to") if isinstance(proposal, dict) else None)
             _ans = (_ans or "").strip().lower() if isinstance(_ans, str) else ""
             try:
@@ -7306,7 +13420,8 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
                     try:
                         db_conn.rollback()
                         with db_conn.cursor() as _spc:
-                            _spc.execute(f"SET search_path TO {schema_name}")
+                            _spc.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                     except Exception:
                         pass
                 log.info(
@@ -7380,7 +13495,8 @@ def converge_lifted_synonyms(db_conn, dsn: str, schema_name: str, qwen_api_url: 
             try:
                 db_conn.rollback()
                 with db_conn.cursor() as _spc:
-                    _spc.execute(f"SET search_path TO {schema_name}")
+                    _spc.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
             except Exception:
                 pass
             stats["errors"] += 1
@@ -7441,7 +13557,8 @@ def decay_ontology_candidates(db_conn, user_id: str = None) -> dict:
     try:
         # Step 1: Decay — undecided candidates past their window with remaining score.
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 UPDATE ontology_evaluations
                 SET occurrence_count = occurrence_count - 1,
@@ -7464,7 +13581,8 @@ def decay_ontology_candidates(db_conn, user_id: str = None) -> dict:
         # candidate is never eligible here; only one decremented to <= 0 a full window
         # ago (i.e. never reinforced) is forgotten. No Qdrant point — DB delete only.
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 DELETE FROM ontology_evaluations
                 WHERE re_embedder_decision IS NULL
@@ -7491,18 +13609,47 @@ def decay_ontology_candidates(db_conn, user_id: str = None) -> dict:
 
 
 # Freq gate for CARVED cue-class growth — mirrors the rel_type / correction-signal threshold (≥3).
-LINGUISTIC_CUE_GROWTH_THRESHOLD = 3
+# ── ENGINE STRUCTURE IS USABLE ON DERIVATION — NOT AT >=3 (owner ruling, 2026-08-27) ────────────
+# "those aspects that are ours to control should not require validation to become useable, they
+#  should be hinged on the growth. The only aspect requiring 'validation' should be the user's
+#  actual memory ie. inferred class C, otherwise everything is provided and tabled straight out."
+# and: "We should rely on the actual growth to improve the L4 and useability, not wait for x
+#  confirmations. The ability for users to correct that shape directly is the metric, ie. we rely on
+#  surfacing to the user to be able to correct if it's wrong."
+#
+# A cue class is a SHELF (engine scaffolding — ours). A fact about the user is a MEMORY. Shelves get
+# built on sight; memories get checked. A frequency gate here does NOT filter noise — it HIDES the
+# growth from the only thing that can judge it, so three occurrences of a wrong shelf is still a
+# wrong shelf, just later, and uncorrectable in the meantime.
+#
+# WHY THIS ONE IS SAFE TO UNGATE (the others in this file are NOT — see their own notes):
+#   * It writes only <tenant>.linguistic_cues, per-tenant, never public, never another tenant.
+#   * The proposal is already firewalled by the PARSE at the proposal site, not by frequency (e.g.
+#     the cessative rail proposes only the observed gerundive-complement shape).
+#   * It is REVERSIBLE without touching stored memory: `UPDATE linguistic_cues SET is_active=false`
+#     retires a member and the 5s overlay TTL applies it on the next turn; no stored fact is
+#     rewritten (the three-level kill switch is documented at linguistics.py:6929).
+#   * It is NOT the `staged_facts.confirmed_count >= 3` promotion — that is INFERRED USER MEMORY and
+#     is deliberately untouched.
+# ROLLBACK LEVER: CUE_GROWTH_THRESHOLD=3 restores the legacy freq gate exactly.
+LINGUISTIC_CUE_GROWTH_THRESHOLD = max(1, int(os.environ.get("CUE_GROWTH_THRESHOLD", "1") or 1))
 
 
 def grow_linguistic_cue_candidates(db_conn, schema_name: str = None) -> dict:
     """Grow CARVED cue classes (social_role / problem_noun) PER-TENANT from observed, freq-gated
     candidates.
 
-    THE CARVE-OUT (lean-seed): social_role and problem_noun are DOMAIN-FLAVORED classes that are no
-    longer seeded — they are GROWN from the OBSERVED construction. The ingest/harvest seam records a
+    ⚠️ AMENDED 2026-08-27. This used to read "social_role and problem_noun are DOMAIN-FLAVORED
+    classes that are no longer seeded". HALF OF THAT IS OVERRULED: `social_role`
+    (colleague/coworker/teammate/roommate) is CLOSED-CLASS ENGLISH STRUCTURE, the same category as
+    the already-seeded kinship_noun, and migration 272 SEEDS it from a WordNet derivation
+    (DEV/derivations/social_role_from_wordnet.py). Growth still ADDS a tenant's own roles on top —
+    seed the grammar, grow the subject. `problem_noun` remains genuinely domain-flavored and unseeded.
+    Classes are GROWN from the OBSERVED construction. The ingest/harvest seam records a
     candidate into ``ontology_evaluations`` (extraction_method='linguistic_cue_candidate',
     candidate_object_type=<category>, sample_object=<cue lemma>) and bumps occurrence_count on each
-    re-sighting (ON CONFLICT). This sweep reads candidates that crossed the freq gate (≥3) and writes
+    re-sighting (ON CONFLICT). This sweep reads candidates at or above LINGUISTIC_CUE_GROWTH_THRESHOLD (default 1 — usable on
+    derivation, per the engine-structure ruling) and writes
     them into ``<tenant>.linguistic_cues`` so the overlay resolves them on the next turn — then the
     consumer routes the construction correctly instead of degrading.
 
@@ -7523,6 +13670,56 @@ def grow_linguistic_cue_candidates(db_conn, schema_name: str = None) -> dict:
     _CARVED = {
         "social_role": "knows",
         "problem_noun": "grown problem/fault eventive head (freq-gated, observed)",
+        # Possessive-attribute head nouns proposed by the spine when it CONTAINED a construction
+        # ("<possessor>'s <attribute-noun> is <adjectival value>") because the noun was not yet a
+        # known attribute for this tenant. Without this registration the candidate is fetched,
+        # found un-carved, and resolved away — the proposal would be recorded and then discarded,
+        # i.e. a growth rail that is built and dark.
+        "attribute_noun": "grown possessive-attribute head noun (freq-gated, observed)",
+        # CESSATIVE-aspect matrix verbs the spine PROPOSED from the recognised phrasal aspectual
+        # frame ("<matrix> <prt> <V-ing> …") when this tenant's class did not yet admit the cue.
+        # ⚠️ REGISTRATION IS LOAD-BEARING, NOT BOOKKEEPING: the loop below resolves any candidate
+        # whose category is NOT in this dict away as 'cue_skipped'. Without this line the spine
+        # proposes, the queue counts, and NOTHING EVER GROWS — a rail that is built and dark, and
+        # indistinguishable in the data from a lane that was never called.
+        # ⚠️ AND THE VALUE IS NOT A HUMAN NOTE FOR THIS CLASS: cessative_verb rows carry their
+        # ADMITTED COMPLEMENT SHAPES in `description` ('|'-joined), which is what
+        # linguistic_cue_overlay.resolve_cessative_verb_shapes() parses. A prose note here would
+        # grow a member admitting NO shape, i.e. a member that can never fire. The grown member
+        # admits ONLY the gerundive-complement shape the proposal actually observed — never
+        # direct_object or intransitive, which are the polysemous readings ("I dropped my phone")
+        # the seeded class deliberately withholds.
+        "cessative_verb": "xcomp_progressive",
+        # LABEL-noun members of the identifier_noun class (issue #225): the unit-designator
+        # heads of label+code NPs ("VLAN 30", "cone 6", "berth 14"). The spine PROPOSES the
+        # noun via record_cue_candidate('identifier_noun', …) whenever a label+code NP meets a
+        # non-class head; without this registration the candidate is fetched, found un-carved,
+        # resolved away as 'cue_skipped' — the miss→grow half of the #225 ruling was BUILT AND
+        # DARK (critic round 1: occ=3 candidates for three novel nouns, sweep {'grown': 0}).
+        # ⚠️ THE VALUE IS THE ROLE, NOT A HUMAN NOTE (the cessative_verb trap, same class):
+        # resolve_identifier_noun_roles reads `description` as the ROLE map value via
+        # _resolve_keyed_map — a prose note here grows a member that can never fire. The
+        # grown row (cue=<noun>, category='identifier_noun', description='label') makes the
+        # NEXT sighting of "<noun> <code>" capture the code as a scalar named by the noun.
+        "identifier_noun": "label",
+        # MEASUREMENT UNITS the spine PROPOSED from a geometry-valid measure whose unit
+        # noun was OUTSIDE this tenant's unit_scalar map (the copula chain's unmapped-unit
+        # growth arm, the possessed-measure Option A arm, and the /ingest re-home planner's
+        # unit_misses all record the same candidate). ⚠️ THIS ENTRY COMPLETES A RAIL THAT
+        # WAS BUILT AND DARK: without it every proposed unit was fetched, found un-carved,
+        # and resolved away as 'cue_skipped' — measured on a fresh seat at eea12a11,
+        # decade/quarter/hectare/knot could NEVER enter the map no matter how often the
+        # tenant measured in them (the owner's decade/quarter faceplant). ⚠️ AND THE VALUE
+        # IS NOT A HUMAN NOTE (the cessative_verb/identifier_noun trap, same class):
+        # unit_scalar rows carry their SCALAR REL in `description` via
+        # resolve_unit_scalar_map -> _resolve_keyed_map, so the grown value is the GENERIC
+        # measured-value rel ``related_measure`` — the exact rel the unmapped paths ALREADY
+        # capture under, seeded-agnostic (no attribute-family guess: family-specific maps
+        # stay user/seed authority), head/tail ANY at /ingest so nothing is quarantined.
+        # After growth the unit RESOLVES (map membership) — family recognition,
+        # measure-interrogative admission and the mapped capture paths light up; a tenant
+        # that wants decade->duration specifically states it (user authority wins the key).
+        "unit_scalar": "related_measure",
     }
     try:
         with db_conn.cursor() as cur:
@@ -7585,7 +13782,8 @@ def grow_linguistic_cue_candidates(db_conn, schema_name: str = None) -> dict:
                 db_conn.rollback()
                 if schema_name:
                     with db_conn.cursor() as _r:
-                        _r.execute(f"SET search_path TO {schema_name}")
+                        _r.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
             except Exception:  # noqa: BLE001
                 pass
             log.warning(f"re_embedder.cue_growth_error schema={schema_name} "
@@ -7664,7 +13862,8 @@ def _is_safe_firing_pattern(pattern: str, confidence: float) -> tuple[bool, str]
     try:
         re.compile(p)
     except re.error as _re_err:
-        return False, f"invalid_regex {str(_re_err)[:60]}"
+        # re.error's text quotes the pattern (tenant-grown text) — keep the reason a code + ref.
+        return False, "invalid_regex " + _errors.public_detail(_re_err, where="firing_pattern.compile", what="re.error")
     return True, "ok"
 
 
@@ -7872,9 +14071,17 @@ def flag_suspect_preferred_names(db_conn) -> dict:
     try:
         with db_conn.cursor() as cur:
             cur.execute(
+                # 'lexical' belongs in this ENGINE-WEAK set like any other growth source — it
+                # ranks EQUAL to 'inferred' (registry._PREFERENCE_RANK); its distinct name
+                # records a co-reference WARRANT, not extra trust, so it must never be read as
+                # a user-chosen name. Currently unreachable here (the lexical lane hardwires
+                # is_preferred=False) but listed so the set stays the whole engine-weak
+                # vocabulary — an enumeration that silently omits a member is how this column
+                # drifts. Keep in sync with sweep_ledger.py 'suspect_preferred_names'.
                 "SELECT entity_id, alias, preference_source FROM entity_aliases "
                 "WHERE is_preferred = true "
-                "AND preference_source IN ('inferred', 'provisioned', 'merge', 'unspecified')"
+                "AND preference_source IN "
+                "  ('inferred', 'lexical', 'provisioned', 'merge', 'unspecified')"
             )
             suspects = cur.fetchall()
         for entity_id, alias, source in suspects:
@@ -7912,6 +14119,132 @@ def has_pending_retraction_outcomes(db_conn) -> bool:
     except Exception as e:
         log.warning(f"re_embedder.pending_retraction_outcomes_check_failed error={str(e)}")
         return False
+
+
+def _tenant_has_reembed_work(db_conn, schema_name: str = "") -> bool:
+    """EXECUTION GATE — True iff ANY re-embedder work is DUE for the tenant bound on
+    ``db_conn`` (caller has already ``SET search_path TO {schema}``, NO public).
+
+    Reads REAL DB state via indexed EXISTS/LIMIT-1 probes, ordered cheapest-first with
+    early-exit — NOT a dirty-flag watermark. A provably-idle tenant (nothing unsynced,
+    nothing promotable, nothing expiring/decaying, no pending ontology/conflicts) is
+    detected in a handful of index probes and SKIPPED before ANY embedding-model spin /
+    Qdrant scroll / lifecycle pass.
+
+    FAIL-SAFE — "WE DON'T FORGET": any probe error / ambiguity (missing column on an old
+    schema, aborted txn, etc.) → return True (PROCESS the tenant). The gate may ONLY ever
+    skip a PROVABLY-idle tenant; it never skips due work on a check failure. This function
+    NEVER raises — an unexpected error returns True.
+
+    Probe → guarded work map (each maps 1:1 to a real pass in main()'s PHASE 2b lifecycle):
+      1. unsynced staged rows (Class-C embed/upsert; non-C mark-synced housekeeping)
+                                                  → fetch_unsynced_staged embed/upsert loop
+      2. staged Class-B promotable now (cc>=3)    → promote_staged_facts
+      3. staged Class-C promotable by hits (>=3)  → promote_class_c_hits
+      4. staged Class-C past window (expiry/decay) → expire_staged_facts + decay_class_c_hits
+      5. unsynced facts-table (A/B) — legacy only → fetch_unsynced facts sync (VECTOR_CLASS_C_ONLY OFF)
+      6. pending ontology_evaluations             → evaluate_ontology_candidates
+      7. unresolved entity_name_conflicts         → resolve_name_conflicts
+
+    Reconcile/divergence is deliberately NOT probed here (knowing it requires a full Qdrant
+    scroll); it is bounded on a COARSER cadence in main() (activity-driven OR a max-interval
+    ceiling) rather than scrolling every cycle just to check.
+    """
+    def _exists(sql: str, params: tuple = ()) -> bool:
+        with db_conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        return bool(row and row[0])
+
+    try:
+        # 1. Unsynced staged rows awaiting the embed/upsert pass. Predicate is IDENTICAL to
+        #    fetch_unsynced_staged() (qdrant_synced=false, not promoted, not expired, live).
+        #    Under VECTOR_CLASS_C_ONLY only Class C is embedded and non-C rows are
+        #    mark-synced — both are real work the staged loop performs, so gate on either.
+        if _exists(
+            "SELECT 1 FROM staged_facts "
+            "WHERE qdrant_synced = false AND promoted_at IS NULL "
+            "  AND expires_at > now() AND deleted_at IS NULL "
+            "LIMIT 1"
+        ):
+            return True
+
+        # 2. Staged Class-B rows promotable now — mirrors promote_staged_facts() candidates.
+        if _exists(
+            "SELECT 1 FROM staged_facts "
+            "WHERE fact_class = 'B' AND confirmed_count >= 3 AND promoted_at IS NULL "
+            "LIMIT 1"
+        ):
+            return True
+
+        # 3. Staged Class-C rows promotable by query hits — mirrors promote_class_c_hits().
+        if _exists(
+            "SELECT 1 FROM staged_facts "
+            "WHERE fact_class = 'C' AND hit_count >= 3 AND promoted_at IS NULL "
+            "LIMIT 1"
+        ):
+            return True
+
+        # 4. Class-C rows past their 30-day window (expiry/decay due). ONE probe covers BOTH
+        #    expire_staged_facts (confirmed_count decay/remove) AND decay_class_c_hits
+        #    (hit_count decay/drop) — both key on fact_class='C' AND expires_at<=now().
+        if _exists(
+            "SELECT 1 FROM staged_facts "
+            "WHERE fact_class = 'C' AND expires_at <= now() AND promoted_at IS NULL "
+            "LIMIT 1"
+        ):
+            return True
+
+        # 5. Unsynced facts-table (A/B) rows — ONLY work in legacy mode. Under the default
+        #    VECTOR_CLASS_C_ONLY the facts-table sync loop is SKIPPED entirely, so unsynced
+        #    A/B is NOT work; don't probe it (avoids waking an idle C-only tenant).
+        if not _VECTOR_CLASS_C_ONLY:
+            if _exists(
+                "SELECT 1 FROM facts "
+                "WHERE qdrant_synced = false AND superseded_at IS NULL "
+                "LIMIT 1"
+            ):
+                return True
+
+        # 6. Pending ontology candidates awaiting evaluation — mirrors has_pending_ontology_work().
+        if _exists(
+            "SELECT 1 FROM ontology_evaluations WHERE re_embedder_decision IS NULL LIMIT 1"
+        ):
+            return True
+
+        # 7. Unresolved name conflicts — mirrors has_pending_name_conflicts().
+        if _exists(
+            "SELECT 1 FROM entity_name_conflicts WHERE status = 'pending' LIMIT 1"
+        ):
+            return True
+
+        # 8. Pending async-ingestion documents — mirrors drain_pending_documents().
+        #    A brand-new tenant that JUST enqueued a document has NO staged/ontology work,
+        #    so without this probe the gate would skip it and the doc would never drain.
+        #    Pre-migration-183 schemas lack the table → the _exists probe raises →
+        #    fail-safe except-branch returns True (harmless; nothing to drain there anyway).
+        if _exists(
+            "SELECT 1 FROM documents WHERE status IN ('pending', 'processing') LIMIT 1"
+        ):
+            return True
+
+        return False
+    except Exception as e:
+        # FAIL-SAFE ("we don't forget"): any probe error → process the tenant. Roll back the
+        # aborted txn and re-apply the tenant search_path so the ensuing pass runs clean.
+        log.warning(
+            f"re_embedder.gate.probe_error schema={schema_name} "
+            f"(fail-safe -> processing tenant): {type(e).__name__}: {str(e)[:160]}"
+        )
+        try:
+            db_conn.rollback()
+            if schema_name:
+                with db_conn.cursor() as _spc:
+                    _spc.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+        except Exception:
+            pass
+        return True
 
 
 def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
@@ -7979,6 +14312,24 @@ def evaluate_retraction_outcomes(db_conn, frequency_threshold: int = 3) -> dict:
                     continue  # Skip empty/whitespace patterns
 
                 pattern_lower = pattern.lower().strip()
+
+                # DB→Python numeric boundary (prod crash 2026-08-20, pattern
+                # 'forget that they have a gender named F'): psycopg2 returns
+                # decimal.Decimal for AVG() over a NUMERIC expression — the
+                # CASE's 1.0/0.0 literals are numeric, so AVG(numeric) comes
+                # back numeric → Decimal, while everything downstream in this
+                # lane is float math (1.0 - rate, rate * 100, :.2f formats) and
+                # the retraction_signals.false_positive_rate column is FLOAT.
+                # Coerce ONCE here at the row-unpack boundary, ONE way, to
+                # float: float - Decimal raises TypeError (the
+                # retraction_outcome_processing_failed crash this pins), and
+                # Decimal's exact-decimal arithmetic is nothing this lane does.
+                # None → 0.5 preserves the historical no-data defaults exactly
+                # (false_positive_rate 0.5, priority 50) while keeping every
+                # downstream read uniformly float — the notes/log ':.2f'
+                # formats below crash on None (NoneType.__format__), which the
+                # old is-not-None ternaries half-supported.
+                success_rate = float(success_rate) if success_rate is not None else 0.5
 
                 # Compute empirical metrics
                 false_positive_rate = (1.0 - success_rate) if success_rate is not None else 0.5
@@ -8238,6 +14589,8 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                 LIMIT 20
             """)
             conflicts = cur.fetchall()
+        # READ BARRIER: the arbitration loop below is a per-conflict LLM call.
+        release_read_transaction(db_conn, context="re_embedder.resolve_name_conflicts.fetch")
 
         if not conflicts:
             log.debug("re_embedder.name_conflicts_none_pending")
@@ -8251,19 +14604,33 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
         # user_id from the bound per-tenant schema (faultline_<uuid-with-underscores>).
         # Fail-safe: None → today's LLM-only behavior.
         _tenant_user_id = None
+        # The BOUND schema name, kept for the arrival weld guard's seat-anchor exemption.
+        # This function takes no schema_name parameter (search_path is pre-set by the caller),
+        # and the guard's strongest seat marker is the UUID-shaped suffix of that schema name,
+        # so it must be read from the connection rather than guessed. Fail-safe None: the
+        # guard then falls back to its second marker (a provisioning-tier alias), which is
+        # measured present on 11 of 12 tenants.
+        _tenant_schema = None
         try:
             with db_conn.cursor() as _uc:
                 _uc.execute("SELECT current_schema()")
                 _sch = (_uc.fetchone() or [None])[0] or ""
             if _sch.startswith("faultline_"):
                 _tenant_user_id = _sch[len("faultline_"):].replace("_", "-")
+                _tenant_schema = _sch
         except Exception:
             _tenant_user_id = None
+            _tenant_schema = None
 
         # ────────────────────────────────────────────────────────────────
         # Step 2: Process each conflict
         # ────────────────────────────────────────────────────────────────
         for conflict_id, entity_id_1, entity_name_1, entity_id_2, entity_name_2, disputed_name in conflicts:
+            # READ BARRIER (per iteration): this loop body blocks on the brain/Qdrant, and a
+            # read left open by the PREVIOUS iteration would ride across it. A batch-level
+            # barrier alone does not cover this — measured live: climb_state and the
+            # taxonomy reads were each caught idle-in-transaction at 58-59s inside a loop.
+            release_read_transaction(db_conn, context="re_embedder.resolve_name_conflicts.iteration")
             try:
                 # ────────────────────────────────────────────────────────────────
                 # Build context for Entity 1
@@ -8323,23 +14690,54 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                 )
 
                 messages = [{"role": "user", "content": prompt}]
-                payload = build_llm_payload(
-                    messages=messages,
-                    model=LLMModels.get("NAME_CONFLICT"),
-                    user_id="re_embedder",
-                    temperature=0.2,
-                    max_tokens=10
-                )
 
-                # Use global HTTP client with timeout
+                # ⚠️ SECURITY FIX 2026-07-30 — this call used to leak the TENANT'S API KEY.
+                #
+                # It hand-rolled the request: `_http_client_sync.post(llm_url, ...,
+                # headers=get_llm_headers())`. `llm_url` is the OPERATOR's endpoint, resolved
+                # ONCE at process start with no tenant bound — but `get_llm_headers()` IS
+                # tenant-aware and returns the tenant's DECRYPTED BYO key. The caller binds
+                # the tenant brain immediately before this (_reembedder_bind_tenant_brain),
+                # so the combination was: operator endpoint + operator model id + TENANT's
+                # `sk-…` in the Authorization header.
+                #
+                # A tenant's credential was therefore sent to a host they never authorized —
+                # and with a stale LLM_BASE_URL (exactly what was found in /health on
+                # 2026-07-30, pointing at a provider we no longer use) that host is a third
+                # party. Secondary effect: the operator's model id 400s on the tenant's
+                # provider, so name-conflict arbitration was silently dead for every BYO seat.
+                #
+                # Routing through the centralized stack fixes all of it at once —
+                # _apply_tenant_brain binds the tenant's ENDPOINT, MODEL and per-account
+                # breaker, and the SaaS fail-closed + rate pacing come along. `llm_url` is
+                # deliberately no longer used here; it stays in the signature for the caller.
                 try:
-                    response = _http_client_sync.post(
-                        llm_url,
-                        json=payload,
-                        headers=get_llm_headers(),
-                        timeout=10.0
+                    # READ BARRIER (immediately before the blocking call — the RE-ARM case). A barrier at
+                    # the top of the enclosing block is NOT enough: a per-row read helper opens a FRESH
+                    # transaction after it, and that read then rides across this hop. Measured live on the
+                    # deployed image — climb_classification_chains was killed twice this way (02:42:25 and
+                    # 02:45:06), its whole _ont_db subsystem chain failing 'connection already closed' four
+                    # seconds later.
+                    release_read_transaction(db_conn, context="re_embedder.resolve_name_conflicts.pre_blocking_call")
+                    result = call_llm_with_retry_sync(
+                        messages=messages,
+                        model=LLMModels.get("NAME_CONFLICT"),
+                        operation="NAME_CONFLICT",
+                        # PER-TENANT: the seat whose entities are being arbitrated. Deliberately
+                        # the LOOP-BOUND seat rather than the `_tenant_user_id` derived above:
+                        # that one is the CANONICAL-USER guard (it is compared against entity
+                        # ids and is intentionally shape-unchecked), while this must pair with
+                        # the brain the caller bound — same schema, but validated, so a
+                        # non-`faultline_<uuid>` search_path can never become a junk identity.
+                        user_id=_reembedder_llm_user_id(),
+                        # NO `temperature=` here. call_llm_with_retry_sync takes no such
+                        # parameter and has no **kwargs, so passing it raised TypeError on
+                        # EVERY call — swallowed by the `except Exception` below, which meant
+                        # resolve_name_conflicts had never once reached the LLM since this line
+                        # was written. Temperature is pinned 0.0 centrally (llm_client.py) and
+                        # determinism is what we want for arbitration anyway.
+                        max_tokens=10,
                     )
-                    response.raise_for_status()
                 except Exception as e:
                     log.error(
                         f"re_embedder.name_conflict_llm_call_failed "
@@ -8353,12 +14751,11 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                 # Parse LLM decision
                 # ────────────────────────────────────────────────────────────────
                 try:
-                    result = response.json()
                     # Handle both direct JSON and wrapped response
                     if isinstance(result, dict) and "choices" in result:
-                        llm_choice = result["choices"][0]["message"]["content"].strip().lower()
+                        llm_choice = response_message_text(result, "NAME_CONFLICT").lower()
                     elif isinstance(result, dict) and "content" in result:
-                        llm_choice = result.get("content", "").strip().lower()
+                        llm_choice = (result.get("content") if isinstance(result.get("content"), str) else "").strip().lower()
                     else:
                         llm_choice = str(result).strip().lower()
 
@@ -8477,6 +14874,64 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                     # ────────────────────────────────────────────────────────────────
                     try:
                         with db_conn.cursor() as _mcur:
+                            # ── ARRIVAL WELD GUARD — PRE-FLIGHT ADMISSIBILITY ────────────
+                            # A merge is a co-reference assertion about EVERY surface the
+                            # loser holds: step 5 re-parents each one onto the winner, and it
+                            # does so with raw UPDATEs rather than EntityRegistry.register_alias,
+                            # so none of them pass the guard that every other alias weld
+                            # passes. This is the largest remaining weld vector — one
+                            # LLM-arbitrated decision moves N surfaces at once.
+                            #
+                            # Checked PER ALIAS, but the VERDICT IS MERGE-LEVEL: if any single
+                            # surface is inadmissible on the winner, the whole merge is
+                            # abandoned. Partially merging is not the safe half-measure it
+                            # looks like — steps 1-4 have already repointed facts and
+                            # attributes, so skipping just the offending alias would leave the
+                            # loser as an empty husk holding a name whose facts now live on a
+                            # different entity, which is a WORSE state than either outcome. A
+                            # merge is one identity claim; it applies whole or not at all.
+                            #
+                            # The alias-resolution fix above has already COMMITTED and is
+                            # deliberately untouched — refusing here declines the merge only.
+                            # Fail-open: any probe error inside the guard returns "allow".
+                            _weld_block = None
+                            try:
+                                _mcur.execute(
+                                    "SELECT alias, preference_source FROM entity_aliases "
+                                    "WHERE entity_id = %s AND alias NOT IN ("
+                                    "  SELECT alias FROM entity_aliases WHERE entity_id = %s)",
+                                    (loser_id, winner_id),
+                                )
+                                _moving = _mcur.fetchall() or []
+                                for _m_alias, _m_src in _moving:
+                                    if weld_guard.refuse_weld(
+                                            _mcur, winner_id, _m_alias, _m_src,
+                                            is_preferred=False, schema_name=_tenant_schema):
+                                        _weld_block = (_m_alias, _m_src)
+                                        break
+                            except Exception as _wg_e:  # noqa: BLE001 — never block on our own error
+                                log.warning(
+                                    "re_embedder.merge_weld_preflight_failed "
+                                    f"conflict_id={conflict_id} error={str(_wg_e)[:200]} "
+                                    "note=failing OPEN, merge proceeds as before"
+                                )
+                                _weld_block = None
+                            if _weld_block is not None:
+                                # `log` in this module is a STDLIB logger, so the structlog
+                                # kwargs shape of logging_config.log_crit would raise —
+                                # _doc_log_crit renders the same CRITICAL key=value line.
+                                _doc_log_crit(
+                                    "re_embedder.merge_refused_inadmissible_weld",
+                                    conflict_id=conflict_id,
+                                    winner=str(winner_id)[:16], loser=str(loser_id)[:16],
+                                    alias=str(_weld_block[0])[:64],
+                                    preference_source=_weld_block[1],
+                                    note="an_LLM_arbitrated_merge_would_have_welded_a_surface_"
+                                         "onto_an_entity_it_does_not_denote__nothing_moved_"
+                                         "nothing_deleted",
+                                )
+                                raise _MergeRefused(_weld_block[0])
+
                             # Step 1: Repoint facts from loser to winner (subject_id)
                             # Handle UNIQUE constraint (subject_id, object_id, rel_type):
                             # delete loser rows that would conflict, then update the rest.
@@ -8680,6 +15135,25 @@ def resolve_name_conflicts(db_conn, llm_url: str) -> dict:
                             f"repointed_facts={_repointed_subj + _repointed_obj}"
                         )
 
+                    except _MergeRefused as _refused:
+                        # NOT a failure — a deliberate refusal by the arrival weld guard.
+                        # Caught before the generic handler so it is never reported as
+                        # `entity_merge_failed`; the log_crit at the raise site carries the
+                        # detail. The rollback undoes steps 1-4, so the merge is all-or-nothing
+                        # and both entities are left exactly as they were.
+                        try:
+                            db_conn.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        log.warning(
+                            f"re_embedder.entity_merge_declined "
+                            f"conflict_id={conflict_id} "
+                            f"winner={str(winner_id)[:16]} "
+                            f"loser={str(loser_id)[:16]} "
+                            f"alias={str(_refused)[:64]} "
+                            f"note=inadmissible_weld_nothing_moved"
+                        )
+
                     except Exception as _merge_err:
                         # Merge failed — alias resolution already committed above.
                         # Rollback the failed merge transaction and continue.
@@ -8747,9 +15221,8 @@ def detect_embedding_model_change() -> None:
         stored_version = _embedding_cache.client.get("_embedding_model_version")
         if stored_version and stored_version != embedding_model_version:
             log.warning(
-                "embedding_cache.model_version_changed",
-                old=stored_version,
-                new=embedding_model_version,
+                "embedding_cache.model_version_changed "
+                f"old={stored_version} new={embedding_model_version}"
             )
             deleted = _embedding_cache.clear_pattern(f"{_embedding_cache.prefix}*")
             log.info(f"embedding_cache.cleared_model_change entries_deleted={deleted}")
@@ -8889,11 +15362,31 @@ def process_reembedder_event(
                         "SELECT rel_type FROM rel_types WHERE rel_type = %s LIMIT 1",
                         (rel_type,)
                     )
-                    if not cur.fetchone():
-                        # Novel rel_type — log for re_embedder evaluation
-                        log.debug(f"reembedder_event_processed event_type=class_c_ingest "
-                                 f"rel_type={rel_type} confidence={confidence} user_id={user_id[:8]}")
-                        return True
+                    _rel_type_known = cur.fetchone()
+                # CONNECTION HYGIENE (idle-in-transaction leak fix): this branch is
+                # READ-ONLY, but `db_conn` is the LONG-LIVED poll-loop connection
+                # (autocommit OFF), so the SELECT above opens a transaction and holds
+                # ACCESS SHARE on `rel_types`. With no commit/rollback, that transaction
+                # lingered idle-in-transaction for the REMAINDER of the poll cycle's
+                # `with ... as db:` block — through the cycle's slow (LLM) ontology work
+                # — and its lock blocked a concurrent per-tenant `reset_tenant`
+                # `TRUNCATE ... CASCADE` (observed during LME: pid holding
+                # `SELECT rel_type FROM rel_types WHERE rel_type = '<novel>' LIMIT 1`
+                # idle-in-transaction, cascading the run into infra errors). Roll back so
+                # the read's implicit transaction is released the instant the event is
+                # processed. Nothing is written here → rollback is behaviourally identical
+                # to the prior code, minus the leaked transaction. Writers on the
+                # negation/correction branches already commit/rollback internally, so this
+                # closes the last uncommitted path in this function.
+                try:
+                    db_conn.rollback()
+                except Exception:  # noqa: BLE001 — hygiene rollback is best-effort
+                    pass
+                if not _rel_type_known:
+                    # Novel rel_type — log for re_embedder evaluation
+                    log.debug(f"reembedder_event_processed event_type=class_c_ingest "
+                             f"rel_type={rel_type} confidence={confidence} user_id={user_id[:8]}")
+                    return True
             return True
 
         elif event_type == "negation_pattern_novel":
@@ -8963,7 +15456,8 @@ def learn_negation_pattern_by_hash(
             # For now, just track the hash as a generic pattern
             # In future, this would match against actual pattern_text via hash comparison
             # Per-user schema: no user_id filter needed — schema provides isolation
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 SELECT id FROM negation_patterns
                 WHERE pattern_hash IS NOT NULL
@@ -8976,7 +15470,8 @@ def learn_negation_pattern_by_hash(
             existing = cur.fetchone()
             if existing:
                 # Pattern already exists — increment confirmed count
-                cur.execute(
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                     """
                     UPDATE negation_patterns
                     SET confirmed_count = confirmed_count + 1,
@@ -8991,7 +15486,8 @@ def learn_negation_pattern_by_hash(
                 # The pattern_text field will be populated by the re-embedder when it
                 # reconstructs the full pattern from context (if available)
                 # Per-user schema: no user_id column needed
-                cur.execute(
+                cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                     """
                     INSERT INTO negation_patterns
                     (pattern_text, pattern_hash, negation_type, confidence, confirmed_count, learned_from)
@@ -9041,8 +15537,10 @@ def record_confidence_feedback(
         from src.provisioning.schema_manager import derive_user_slug_from_uuid as _dslug
         _fb_schema = f"faultline_{_dslug(user_id)}"
         with db_conn.cursor() as cur:
-            cur.execute(f"SET search_path TO {_fb_schema}")
-            cur.execute(
+            cur.execute(f"SET search_path TO {_fb_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """
                 INSERT INTO intent_confidence_feedback
                 (user_id, confidence_bin, feedback_type, count)
@@ -9247,7 +15745,7 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
     These are rows where the subject_id is a generic ontology token
     (person, organization, location, etc.) rather than a real entity UUID.
     They were created by mis-extracted triples with subject/object swapped, e.g.:
-        person instance_of alexander
+        person instance_of alicia
         organization instance_of company
 
     Runs once per re_embedder startup — not every poll cycle.  The function is
@@ -9281,11 +15779,13 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
         try:
             with psycopg2.connect(postgres_dsn) as db:
                 with db.cursor() as cur:
-                    cur.execute(f"SET search_path TO {schema_name}")
+                    cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                 db.commit()
 
                 with db.cursor() as cur:
-                    cur.execute(
+                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                         """
                         DELETE FROM staged_facts
                         WHERE rel_type IN ('instance_of', 'subclass_of', 'part_of', 'is_a', 'member_of')
@@ -9311,39 +15811,49 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
                     )
                     total_deleted += len(deleted_ids)
 
-                    # Best-effort Qdrant cleanup for deleted rows
-                    try:
-                        collection = derive_collection(user_id)
-                        for _did in deleted_ids:
+                    # Best-effort Qdrant cleanup for deleted rows (partition choke-point).
+                    # REMOVAL (REMOVE_QDRANT_MEMORY_LANE default ON): the memory-point
+                    # mirror purge is removed with the lane (the Postgres DELETE above is
+                    # core lifecycle and stays). Rollback arm: truth-identical to legacy.
+                    if not _REMOVE_QDRANT_MEMORY_LANE:
+                        try:
+                            from src.api.qdrant_partition import (
+                                resolve_partition as _qp_resolve, require_tenant as _qp_require,
+                                build_delete_body as _qp_delbody, resolve_point_id as _qp_pid,
+                                qdrant_headers as _qp_hdr,
+                            )
+                            collection, _tflt = _qp_resolve(user_id, "memory")
+                            _qp_require(_tflt, op="delete", collection=collection)
+                            for _did in deleted_ids:
+                                _http_client.post(
+                                    f"{qdrant_url}/collections/{collection}/points/delete",
+                                    json=_qp_delbody(_tflt, must=[
+                                        {"key": "source_table", "match": {"value": "staged_facts"}},
+                                        {"key": "fact_id",     "match": {"value": _did}},
+                                    ]),
+                                    headers=_qp_hdr(),
+                                    timeout=5.0,
+                                )
+                            # Fallback by derived point ID (new-scheme points). The filtered
+                            # delete above already covers payload-tagged points; this removes
+                            # the deterministic (source_table, fact_id) point even if its
+                            # source_table payload were somehow absent. Legacy bare-int points
+                            # are handled by reconcile / collection re-sync.
+                            # POST /points/delete with a points-selector body; httpx .delete()
+                            # takes no body kwarg (json/content) and would raise.
                             _http_client.post(
                                 f"{qdrant_url}/collections/{collection}/points/delete",
-                                json={
-                                    "filter": {
-                                        "must": [
-                                            {"key": "source_table", "match": {"value": "staged_facts"}},
-                                            {"key": "fact_id",     "match": {"value": _did}},
-                                        ]
-                                    }
-                                },
+                                json=_qp_delbody(_tflt, point_ids=[
+                                    _qp_pid(user_id, "staged_facts", _did, "memory") for _did in deleted_ids
+                                ]),
+                                headers=_qp_hdr(),
                                 timeout=5.0,
                             )
-                        # Fallback by derived point ID (new-scheme points). The filtered
-                        # delete above already covers payload-tagged points; this removes
-                        # the deterministic (source_table, fact_id) point even if its
-                        # source_table payload were somehow absent. Legacy bare-int points
-                        # are handled by reconcile / collection re-sync.
-                        # POST /points/delete with a points-selector body; httpx .delete()
-                        # takes no body kwarg (json/content) and would raise.
-                        _http_client.post(
-                            f"{qdrant_url}/collections/{collection}/points/delete",
-                            json={"points": [derive_qdrant_point_id("staged_facts", _did) for _did in deleted_ids]},
-                            timeout=5.0,
-                        )
-                    except Exception as qe:
-                        log.warning(
-                            f"re_embedder.inverted_sweep.qdrant_failed "
-                            f"user_id={user_id[:8]} error={qe}"
-                        )
+                        except Exception as qe:
+                            log.warning(
+                                f"re_embedder.inverted_sweep.qdrant_failed "
+                                f"user_id={user_id[:8]} error={qe}"
+                            )
 
         except Exception as e:
             log.error(
@@ -9359,224 +15869,203 @@ def _sweep_inverted_staged_hierarchy_rows(postgres_dsn: str, qdrant_url: str) ->
     return total_deleted
 
 
-def _read_remine_attempts(db_conn, doc_id, schema_name) -> int:
-    """The row's re-mine attempt count (migration 298), or 0 when unavailable.
+# The tenant schema prefix is env-configurable (src/config/settings.py::SCHEMA_NAME_PREFIX
+# resolves the same env with the same default) — the sweep must follow the deployment,
+# not a hardcoded literal, or a renamed deployment is silently unwatched. The LIKE
+# pattern escapes LIKE metacharacters and rides as a bound parameter; the identifier
+# regex guards the only string interpolated into SQL (SET search_path).
+_WATCHDOG_SCHEMA_PREFIX = os.environ.get("SCHEMA_NAME_PREFIX", "faultline") or "faultline"
+_WATCHDOG_SCHEMA_RE = re.compile(re.escape(_WATCHDOG_SCHEMA_PREFIX) + r"_[A-Za-z0-9_]+\Z")
+_WATCHDOG_SCHEMA_LIKE = (
+    _WATCHDOG_SCHEMA_PREFIX.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    + "\\_%"
+)
 
-    Its own guarded SELECT: 0 on ANY failure (pre-298 schema, error) = "not a
-    replay" = byte-for-byte the first-drain /ingest POST shape."""
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute("SELECT reextract_attempts FROM documents WHERE id = %s", (doc_id,))
-            row = cur.fetchone()
+
+def _drain_watchdog_once(db_conn) -> int:
+    """DRAIN WATCHDOG — the single sweep that makes silent starvation impossible.
+
+    FOUNDING WOUND (owner, 2026-11-05: 'this has been ongoing now for literal weeks'):
+    prod doc 14 sat status='pending' for FIFTEEN DAYS producing zero signal while
+    every sibling reached a terminal state. Nothing in the system surfaced it — a
+    silent drain is invisible, and every rescue had to come from a human polling.
+    This sweep closes that class: ANY document sitting non-terminal past the
+    threshold fires a loud CRIT carrying the board, per row.
+
+    One predicate covers both lived starvation classes:
+      (a) never-claimed  - status='pending', started_at NULL -> age = created_at
+      (b) claimed-stalled - started_at set, no terminal transition -> age = started_at
+    Terminal states ('ready'/'partial'/'error') are never flagged: partial/error are
+    the retry lane's territory, already surfaced by /documents/status.
+
+    Gated by DOC_WATCHDOG_HOURS (default 24; '0' disables). Cadence: the caller's
+    loop (DOC_WATCHDOG_INTERVAL_S, default 900). Sweeps EVERY schema carrying a
+    documents table - not only ready seats, because a wiped/suspended seat's rows
+    must still be able to scream. Soft-fails per schema (one bad schema must not
+    silence the others). Returns the number of starved rows."""
+    hours = _drain_watchdog_hours()
+    if hours <= 0:
+        return 0
+    starved_total = 0
+    cur = db_conn.cursor()
+    cur.execute(
+        "SELECT nspname FROM pg_namespace WHERE nspname LIKE %s "
+        "AND nspname NOT LIKE %s AND EXISTS ("
+        "  SELECT 1 FROM pg_tables t WHERE t.schemaname = nspname AND t.tablename = 'documents')",
+        (_WATCHDOG_SCHEMA_LIKE, "%template%"),
+    )
+    schemas = [r[0] for r in cur.fetchall()]
+    for schema in schemas:
+        if not _WATCHDOG_SCHEMA_RE.fullmatch(schema):
+            # The only string interpolated into SQL below is SET search_path; a
+            # pg_namespace name outside the tenant contract is skipped LOUDLY, never
+            # interpolated (a hostile name must not be able to smuggle a statement).
+            log.warning(f"drain_watchdog.schema_skipped schema={schema[:24]} "
+                        f"reason=name_outside_tenant_contract")
+            continue
+        try:
+            cur.execute(f"SET search_path TO {schema}")
+            cur.execute(
+                "SELECT id, status, "
+                "EXTRACT(EPOCH FROM (now() - COALESCE(started_at, created_at))) / 3600.0 "
+                "FROM documents WHERE status IN ('pending', 'processing') "
+                "AND now() - COALESCE(started_at, created_at) > (%s * interval '1 hour') "
+                "ORDER BY created_at ASC",
+                (hours,))
+            rows = cur.fetchall() or []
+        except Exception as e:  # noqa: BLE001 - one bad schema must not silence the others
+            log.warning(f"drain_watchdog.schema_error schema={schema[:24]}: "
+                        f"{type(e).__name__}: {str(e)[:120]}")
+            try:
+                db_conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        for (doc_id, status, age_hours) in rows:
+            starved_total += 1
+            # CRITICAL — logging.Logger has no .crit(): the first cut called log.crit
+            # here, which raised AttributeError OUTSIDE the per-schema try and degraded
+            # every starvation CRITICAL to a cycle_error warning — the watchdog could
+            # never scream. Pinned by test_watchdog_uses_only_real_logger_api.
+            log.critical(f"drain_watchdog.starved schema={schema[:24]} doc_id={doc_id} "
+                         f"status={status} age_hours={age_hours:.1f} "
+                         f"threshold_hours={hours:.0f} "
+                         f"action=check /documents/status; retry_document re-pends terminal "
+                         f"rows - a pending/processing straggler this old is a claim-path bug "
+                         f"(file it), not a slow drain")
         db_conn.commit()
-        return int(row[0] or 0) if row else 0
-    except Exception as e:  # noqa: BLE001 — pre-298 schema, or anything else: not a replay
-        _rollback_and_reapply_search_path(db_conn, schema_name)
-        return 0
+    if starved_total:
+        log.critical(f"drain_watchdog.board starved={starved_total} "
+                     f"threshold_hours={hours:.0f}")
+    return starved_total
 
 
-def remine_documents_prepass(postgres_dsn: str, ready_schemas, skip_tenants=None) -> int:
-    """DOCUMENT-lane ontology-regrowth re-mine (gauntlet R2; DOC_REMINE_ENABLED, default OFF).
+def _drain_watchdog_hours() -> float:
+    """Resolved DOC_WATCHDOG_HOURS as a usable threshold; 0.0 means disabled.
 
-    The migration-298 analog of the episodic lane's regrowth re-eligibility: re-queue
-    terminal documents whose chunks produced ZERO committed edges (or that terminated
-    'partial') so the NORMAL drain re-reads them against the ontology as it stands NOW —
-    including rel_types/taxonomies grown since their last (failed) pass.
-
-    SELECTOR + STAMPER, NEVER A SECOND PIPELINE. The pass only (a) selects, (b) re-opens
-    the zero-edge/failed chunks in ``chunk_state`` (done chunks that committed something
-    are KEPT — re-reading a captured fact would double-count), and (c) flips the row
-    terminal → pending with the same transition POST /documents/retry uses
-    (started_at/ready_at NULL, attempts reset, brain_deferred_since cleared). The
-    ordinary drain then re-reads the owed chunks under the X-FL-Deferred-Replay marker
-    (their reextract_attempts > 0), inheriting every bound the drain already enforces:
-    the atomic claim, the DOC_RETRY_BACKOFF reclaim gate (a rate_deferred re-mine
-    reschedules at the paced cadence instead of hammering — the shared-backoff
-    requirement), the lease reclaim, the brain bind, the chunk queue.
-
-    BUDGET — every axis is bounded, because a growth-triggered backfill that ignores
-    budget is BUG-005 at corpus scale (and GraphRAG's own "indexing can be an expensive
-    operation" warning):
-      • DOC_REMINE_BATCH documents per pass, total (default 2);
-      • at most ONE document per tenant per pass, round-robin via a rotation cursor —
-        with batch=2 two DIFFERENT tenants are served each pass, never the same
-        corpus twice in a row;
-      • the pass runs at most once per DOC_REMINE_INTERVAL_SECONDS (default 900s) no
-        matter how often its callers tick (the doc-drain daemon ticks every 4s);
-      • eligibility: terminal ('ready'/'partial'/'error') AND (facts_committed = 0 OR
-        status = 'partial') AND terminal since >= DOC_REMINE_MIN_AGE_HOURS (default 24)
-        AND reextract_attempts < DOC_REMINE_MAX_ATTEMPTS (default 3). A document that
-        re-terminates zero-edge is re-selected only after the age floor again, and only
-        while attempts remain — no infinite re-mining.
-
-    The mark (``reextract_ontology_mark``) is stamped with the tenant's walkable-place
-    count at selection time — the migration-197 bookkeeping, recorded even though
-    selection itself is time+attempts based, so a future regrowth-gated variant has its
-    baseline.
-
-    Returns the number of documents re-queued; NEVER raises (per-tenant fail-safe, the
-    prepass contract). Callers do not need to gate on DOC_REMINE_ENABLED — the check is
-    inside, first thing, so an OFF deploy costs one env read.
-    """
-    if not DOC_REMINE_ENABLED:
-        return 0
-    now_m = time.monotonic()
-    if now_m - _DOC_REMINE_LAST_RUN[0] < _DOC_REMINE_INTERVAL_S:
-        return 0
-    _DOC_REMINE_LAST_RUN[0] = now_m
-
-    skip_tenants = skip_tenants or set()
-    tenants = [(u, s) for u, s in (ready_schemas or []) if u not in skip_tenants]
-    if not tenants:
-        return 0
-
-    # ROUND-ROBIN: start at the tenant AFTER the last one served last pass (the cursor
-    # holds the user_id that was being served when the batch ran out). A restart resuming
-    # from the top is correct — process-local cursors only ever cost one rotation.
-    _start = 0
-    if _DOC_REMINE_CURSOR[0] is not None:
-        for _i, (_u, _s) in enumerate(tenants):
-            if _u == _DOC_REMINE_CURSOR[0]:
-                _start = (_i + 1) % len(tenants)
-                break
-    ordered = tenants[_start:] + tenants[:_start]
-
-    queued = 0
-    served: list = []
-    _db = None
+    Shared by the sweep and the daemon so the started line and the sweep can never
+    disagree on the threshold. Invalid input warns and falls back to 24 rather than
+    silently guessing per caller; nan/inf/negative all resolve to disabled."""
+    hours_raw = os.getenv("DOC_WATCHDOG_HOURS", "24").strip().lower()
     try:
-        _db = psycopg2.connect(postgres_dsn)
-        for _user, _schema in ordered:
-            if queued >= _DOC_REMINE_BATCH:
-                break
-            if _schema in _remine_columns_missing_schemas:
-                continue
+        hours = float(hours_raw)
+    except ValueError:
+        log.warning(f"drain_watchdog.bad_threshold value={hours_raw!r} fallback_hours=24")
+        return 24.0
+    if not (hours > 0) or hours == float("inf"):
+        return 0.0
+    return hours
+
+
+def _drain_watchdog_loop(postgres_dsn: str) -> None:
+    """Watchdog daemon: sweep every DOC_WATCHDOG_INTERVAL_S (default 900). Never
+    raises - a watchdog that dies from one bad cycle is exactly the silence it exists
+    to prevent. Startup config is guarded too: a garbage DOC_WATCHDOG_INTERVAL_S warns
+    and falls back to 900 instead of killing the thread the way an unguarded float()
+    would — a watchdog dead at startup is the founding wound again."""
+    interval_raw = os.getenv("DOC_WATCHDOG_INTERVAL_S", "900")
+    try:
+        interval = float(interval_raw)
+        if not (interval > 0):
+            raise ValueError("non-positive")
+    except ValueError:
+        log.warning(f"drain_watchdog.bad_interval value={interval_raw!r} fallback_s=900")
+        interval = 900.0
+    hours = _drain_watchdog_hours()
+    if hours <= 0:
+        log.info("drain_watchdog.disabled")
+        return
+    log.info(f"drain_watchdog.started interval={interval:g}s "
+             f"threshold_hours={hours:g}")
+    while True:
+        try:
+            time.sleep(interval)
+            with psycopg2.connect(postgres_dsn) as _db:
+                _drain_watchdog_once(_db)
+        except Exception as e:  # noqa: BLE001 - never die
+            log.warning(f"drain_watchdog.cycle_error: {type(e).__name__}: {str(e)[:150]}")
             try:
-                with _db.cursor() as cur:
-                    # Capability probe (pre-298 schema → self-disable the lane for this
-                    # tenant, log once): the flip names the new columns, and an
-                    # UndefinedColumn there would abort this tenant's txn every pass.
-                    cur.execute(
-                        "SELECT 1 FROM information_schema.columns "
-                        "WHERE table_schema = %s "
-                        "AND table_name = 'documents' "
-                        "AND column_name = 'reextract_attempts'",
-                        (_schema,))
-                    if cur.fetchone() is None:
-                        _remine_columns_missing_schemas.add(_schema)
-                        log.warning(
-                            f"re_embedder.doc_remine_columns_missing schema={_schema} "
-                            f"(migration 298 not applied — re-mine lane disabled for "
-                            f"this tenant)")
-                        continue
-                    # The candidate. Partial-index-shaped predicate (migration 298's
-                    # idx_documents_regrowth): expressions MUST stay identical to the
-                    # index predicate or the planner cannot use it. Oldest terminal
-                    # first; ONE row per tenant per pass (round-robin).
-                    cur.execute(f"SET search_path TO {_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
-                    # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
-                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
-                        """
-                        SELECT id, chunk_state FROM documents
-                        WHERE status IN ('ready', 'partial', 'error')
-                          AND (facts_committed = 0 OR status = 'partial')
-                          AND reextract_attempts < %s
-                          AND COALESCE(ready_at, started_at, created_at)
-                              < now() - (%s * INTERVAL '1 hour')
-                        ORDER BY created_at ASC
-                        LIMIT 1
-                        """,
-                        (_DOC_REMINE_MAX_ATTEMPTS, _DOC_REMINE_MIN_AGE_HOURS),
+                time.sleep(interval)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+
+def _standalone_doc_drain_loop(postgres_dsn: str, backend_api_url: str):
+    """DEDICATED fast doc-drain worker — decouples document latency from the heavy
+    per-tenant maintenance cycle (LATENCY + SCALE fix).
+
+    The main re_embedder cycle walks EVERY ready tenant's heavy ontology work
+    (enrichment, synonym convergence, whatis-climb, promotion, expiry, reconcile)
+    before the top-of-cycle doc pre-pass comes around again. With many tenants — or a
+    single slow/failing brain anywhere in the walk — a freshly enqueued document waits
+    a FULL cycle (measured multi-minute). But documents are LATENCY-SENSITIVE (a caller
+    blocks on READY) while ontology maintenance is BACKGROUND. This thread runs the SAME
+    fast pre-pass (``fast_drain_pending_documents_prepass`` — atomic claim, per-tenant
+    fail-safe, tenant-brain-bound) on its OWN tight loop, so document draining NEVER
+    queues behind unrelated per-tenant work or 999 other seats. It is the first concrete
+    step of the per-seat-scaled worker fan-out (see design-scaling-multitenancy).
+
+    Claim safety: the drain's UPDATE…WHERE status='pending' RETURNING is atomic, so this
+    thread and the in-order walk can never double-process a doc — whoever claims first
+    wins; the loser's pending probe returns nothing. Gated by DOC_DRAIN_STANDALONE
+    (default on); tick = DOC_DRAIN_STANDALONE_INTERVAL (default 4s). Re-reads the
+    INGEST_ENABLED freeze every tick. Never raises — a failure logs, sleeps, and retries.
+    """
+    poll = float(os.getenv("DOC_DRAIN_STANDALONE_INTERVAL", "4"))
+    log.info(f"re_embedder.standalone_doc_drain_started interval={poll}s")
+    # STARTUP GATE (BUG-005 symptom b): this thread starts before uvicorn binds the API
+    # port, so its very first ticks used to spend the bind window spamming
+    # document_drain_backend_unreachable — one WARN per tenant per tick for ~60s. Wait
+    # (bounded — never forever) for the backend to answer /health once before the first
+    # claim cycle; on expiry proceed anyway with one loud CRIT, because the per-claim
+    # probe still guards every tick and a drain that never starts is silent loss.
+    _doc_drain_startup_gate(backend_api_url)
+    while True:
+        try:
+            frozen = os.getenv("INGEST_ENABLED", "true").strip().lower() in ("false", "0", "no", "off")
+            if not frozen:
+                with psycopg2.connect(postgres_dsn) as _adb:
+                    with _adb.cursor() as _c:
+                        _c.execute(
+                            "SELECT user_id, schema_name FROM public.user_provisioning "
+                            "WHERE status = 'ready' ORDER BY ready_at ASC"
+                        )
+                        ready = [(r[0], r[1]) for r in _c.fetchall()]
+                if ready:
+                    skip = _saas_suspended_user_ids(postgres_dsn, [u for u, _ in ready])
+                    fast_drain_pending_documents_prepass(
+                        postgres_dsn, ready, skip, backend_api_url, statement_route="rewrite",
                     )
-                    row = cur.fetchone()
-                _db.commit()
-                if not row:
-                    continue
-                doc_id, chunk_state = row[0], row[1]
-                state = chunk_state if isinstance(chunk_state, dict) else {}
-                if isinstance(chunk_state, str):
-                    try:
-                        state = json.loads(chunk_state)
-                    except Exception:  # noqa: BLE001 — unreadable ledger → whole doc re-owed
-                        state = {}
-                # CHUNK-LEVEL RE-OPEN (the actual re-mine): a chunk with NO entry has no
-                # terminal state and is already owed. Of the TERMINAL entries, KEEP only
-                # the ones that captured something (s='done' with c>0 — re-reading them
-                # would double-count what already landed); re-ow the ZERO-EDGE done
-                # entries (c==0 — the ontology could not cast them then) and the FAILED
-                # ones by dropping their ledger entries entirely.
-                kept = {k: v for k, v in (state or {}).items()
-                        if isinstance(v, dict) and v.get("s") == "done"
-                        and (int(v.get("c") or 0)) > 0}
-                dropped = len(state or {}) - len(kept)
-                # The mark for THIS pass (migration-197 bookkeeping: walkable places now).
-                _mark = _tenant_walkable_place_count(_db, _schema)
-                # The flip — atomic on STILL-terminal: a concurrent drain/retry that
-                # already took the row makes this UPDATE a no-op (rowcount 0 → skip).
-                # attempts = 0 mirrors POST /documents/retry: the re-mine is a deliberate
-                # fresh re-read, not an outage redelivery, so the drain's redelivery bound
-                # starts clean (the RE-MINE bound is reextract_attempts, separate).
-                with _db.cursor() as cur:
-                    cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
-                        """
-                        UPDATE documents
-                        SET status = 'pending', started_at = NULL, ready_at = NULL,
-                            attempts = 0, brain_deferred_since = NULL,
-                            reextract_ontology_mark = COALESCE(%s, reextract_ontology_mark),
-                            reextract_attempts = reextract_attempts + 1,
-                            chunk_state = %s::jsonb
-                        WHERE id = %s AND user_id = %s
-                          AND status IN ('ready', 'partial', 'error')
-                          AND (facts_committed = 0 OR status = 'partial')
-                        RETURNING reextract_attempts
-                        """,
-                        (_mark, json.dumps(kept), doc_id, _user),
-                    )
-                    _flipped = cur.fetchone()
-                    flipped = 1 if _flipped else 0
-                    _new_attempt = int(_flipped[0] or 0) if _flipped else 0
-                _db.commit()
-                if not flipped:
-                    continue
-                queued += 1
-                served.append(_user)
-                log.info(f"re_embedder.doc_remine_queued doc_id={doc_id} "
-                         f"user_id={_user[:8]} schema={_schema} "
-                         f"attempt={_new_attempt} "
-                         f"reopened_chunks={dropped} kept_chunks={len(kept)} "
-                         f"mark={_mark} "
-                         f"(zero-edge/failed chunks re-owed to the NORMAL drain under "
-                         f"the replay marker)")
-            except psycopg2.Error as _probe_err:
-                _rollback_and_reapply_search_path(_db, _schema)
-                if getattr(_probe_err, "pgcode", None) == "42703":
-                    # UndefinedColumn mid-pass (migration 298 vanished? partial schema):
-                    # self-disable for this tenant, same as the probe above.
-                    _remine_columns_missing_schemas.add(_schema)
-                    log.warning(f"re_embedder.doc_remine_columns_missing_midpass "
-                                f"schema={_schema}: {_probe_err}")
-                    continue
-                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
-                            f"{_probe_err}")
-            except Exception as _t_err:  # noqa: BLE001 — one tenant never aborts the pass
-                _rollback_and_reapply_search_path(_db, _schema)
-                log.warning(f"re_embedder.doc_remine_tenant_error user_id={_user[:8]}: "
-                            f"{_t_err}")
-    except Exception as _pass_err:  # noqa: BLE001 — never raises, prepass contract
-        log.warning(f"re_embedder.doc_remine_pass_error: {_pass_err}")
-    finally:
-        if _db is not None:
-            try:
-                _db.close()
-            except Exception as _close_err:  # noqa: BLE001 — a failed close on an
-                # already-dead connection is not actionable here; logged so it is
-                # never silent.
-                log.debug(f"re_embedder.doc_remine_pass_close_failed: {_close_err}")
-    # Advance the rotation cursor to the LAST tenant actually served this pass, so the
-    # next pass starts after it. No tenant served → cursor untouched (start from top).
-    if served:
-        _DOC_REMINE_CURSOR[0] = served[-1]
-    return queued
+                    # DOCUMENT re-mine prepass (gauntlet R2): separately gated (inside the
+                    # helper) by DOC_REMINE_ENABLED + its own pass cadence — self-paced, so
+                    # calling it every 4s tick costs one env read when idle or disengaged.
+                    _n_remine = remine_documents_prepass(postgres_dsn, ready, skip)
+                    if _n_remine:
+                        log.info(f"re_embedder.doc_remine_pass_complete docs={_n_remine}")
+        except Exception as _dd_err:  # noqa: BLE001 — daemon must never die
+            log.warning(f"re_embedder.standalone_doc_drain_error: {_dd_err}")
+        time.sleep(poll)
 
 
 def main():
@@ -9594,13 +16083,28 @@ def main():
 
     postgres_dsn = os.getenv("POSTGRES_DSN")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
-    from src.api.llm_client import get_backend_endpoint, get_endpoint_list as _get_llm_endpoint_list
+    from src.api.llm_client import (
+        get_backend_endpoint,
+        get_endpoint_list as _get_llm_endpoint_list,
+        _saas_mode as _llm_saas_mode,
+    )
+    # NOTE (SaaS): this resolves ONCE at process start with NO tenant bound, so under
+    # SAAS_MODE it is EMPTY by design — there is no operator-global brain to fall back on.
+    # Every LLM-calling function below routes through the centralized stack, which re-resolves
+    # the endpoint per tenant after `_reembedder_bind_tenant_brain(schema)`; this variable
+    # survives only as the embedding-URL hint threaded through `embed_text`. Do NOT reintroduce
+    # a hardcoded default here — it would hand every tenant lane a global endpoint.
     _typed_endpoint = get_backend_endpoint()
     if _typed_endpoint:
         qwen_api_url = _typed_endpoint
     else:
         _endpoints = _get_llm_endpoint_list()
-        qwen_api_url = _endpoints[0] if _endpoints else "http://localhost:11434/v1/chat/completions"
+        if _endpoints:
+            qwen_api_url = _endpoints[0]
+        elif _llm_saas_mode():
+            qwen_api_url = ""
+        else:
+            qwen_api_url = "http://localhost:11434/v1/chat/completions"
     interval = int(os.getenv("REEMBED_INTERVAL", "60"))  # dprompt-121: Changed from 10 to 60
     confidence_threshold = float(os.getenv("QDRANT_SYNC_CONFIDENCE_THRESHOLD", "0.0"))
 
@@ -9639,11 +16143,33 @@ def main():
     # dprompt-121: Detect if embedding model changed (auto-clear cache if so)
     detect_embedding_model_change()
 
+    # Dedicated fast doc-drain worker — runs the async document lane on its OWN tight
+    # loop so document latency is decoupled from the heavy per-tenant maintenance cycle
+    # (a doc never waits behind ontology work or other seats). Daemon; gated by
+    # DOC_DRAIN_STANDALONE (default on). See _standalone_doc_drain_loop.
+    if os.getenv("DOC_DRAIN_STANDALONE", "true").strip().lower() not in ("false", "0", "no", "off"):
+        import threading
+        threading.Thread(
+            target=_standalone_doc_drain_loop, args=(postgres_dsn, backend_api_url),
+            daemon=True, name="doc-drain",
+        ).start()
+
+    # DRAIN WATCHDOG (founding wound: prod doc 14 sat 'pending' for FIFTEEN DAYS with
+    # zero signal — owner: 'this has been ongoing now for literal weeks'). A daemon
+    # sweep that CRITs any document sitting non-terminal past DOC_WATCHDOG_HOURS
+    # (default 24; '0' disables). Same lifecycle as the doc-drain thread above:
+    # daemon, own connection, never raises.
+    import threading as _threading_wd
+    _threading_wd.Thread(
+        target=_drain_watchdog_loop, args=(postgres_dsn,),
+        daemon=True, name="drain-watchdog",
+    ).start()
+
     log.info(f"re_embedder.start interval={interval}s qdrant_url={qdrant_url} confidence_threshold={confidence_threshold} loglevel=INFO")
     log.info("re_embedder.entering_main_loop")
 
     # One-time startup sweep: remove pre-existing inverted staged_facts hierarchy rows
-    # (e.g. "person instance_of alexander") that were created before the ingest-path
+    # (e.g. "person instance_of alicia") that were created before the ingest-path
     # cleanup was in place.  Gated here so it runs once per process start, not every
     # 60-second poll cycle.
     if ingest_enabled:
@@ -9664,8 +16190,57 @@ def main():
     else:
         log.warning("re_embedder.redis_client_unavailable queue_events_disabled")
 
+    # ── Reconcile cadence (EXECUTION GATE, task §3) ──────────────────────────────────────
+    # reconcile_qdrant scrolls EVERY per-tenant collection each cycle — the expensive
+    # cleanup pass. It does NOT need to run every cycle for an idle rig. Bound it:
+    # run when ANY tenant had work this cycle (activity-driven) OR when a coarse
+    # max-interval ceiling has elapsed (so cleanup NEVER starves even on a perfectly idle
+    # rig). `_last_reconcile_at` starts at 0.0 → the very first cycle always reconciles.
+    # Monotonic clock so a wall-clock jump can't defer cleanup indefinitely.
+    _last_reconcile_at = 0.0
+    reconcile_max_interval = int(
+        os.getenv("REEMBED_RECONCILE_MAX_INTERVAL", str(max(interval * 10, 3600)))
+    )
+
+    # GLOBAL re-embedder kill-switch edge-log state (SaaS migration 223). The gate is read at
+    # the top of every cycle; this flag suppresses per-cycle logging so a sustained OFF emits a
+    # single transition line (and one on resume) instead of one per cycle.
+    _global_idle = False
+
+    # Rotation cursor for the cycle-wide episodic-drain budget (see the block at the top of the
+    # per-tenant pass). Single-element list so the cycle body can rebind it without `global`.
+    # Holds the user_id of the first tenant DENIED a drain by the budget, or None for "start
+    # from the top". Deliberately process-local, not persisted: a restart resuming from the top
+    # is correct behaviour, and a persisted cursor would be one more thing to go stale.
+    _reextract_cycle_cursor = [None]
+
+    # Rotation cursor for the cortex sweep's cycle budget (see "THE CORTEX-SWEEP BUDGET" block
+    # near the top of this module). Single-element list so the cycle body can rebind it without
+    # `global`. Holds the user_id of the first seat DENIED a sweep by the budget, or None for
+    # "start from the top". Process-local by design, exactly like its reextract sibling: a
+    # restart resuming from the top is correct, and a persisted cursor is one more thing that
+    # can go stale and silently starve a seat forever.
+    _cortex_sweep_cursor = [None]
+
     while True:
         try:
+            # ── GLOBAL re-embedder gate (SaaS control plane, migration 223) ──────────────
+            # Operator kill-switch, composed AND with the per-tenant gate below. When the
+            # GLOBAL switch is OFF the loop IDLES this cycle: NO ready-schema fetch, NO
+            # per-tenant work, NO LLM/Qdrant spend — the box stops and aurora calms. Kept
+            # alive (sleep + continue, NOT exit) so a flip back to ON resumes within one
+            # cycle without a restart. SAAS off → always enabled (no-op, byte-for-byte core).
+            if not _saas_re_embedder_global_enabled():
+                if not _global_idle:
+                    log.info("re_embedder.global_re_embedder_disabled idling_cycle "
+                             "(operator kill-switch OFF; no per-tenant work)")
+                    _global_idle = True
+                time.sleep(interval)
+                continue
+            if _global_idle:
+                log.info("re_embedder.global_re_embedder_resumed")
+                _global_idle = False
+
             # Phase 3c: Check circuit breaker health for awareness
             breaker_status = _get_circuit_breaker_status()
             if breaker_status["is_open"]:
@@ -9720,89 +16295,248 @@ def main():
             if ready_schemas:
                 log.info(f"re_embedder.ready_schemas_found count={len(ready_schemas)}")
 
-            # R2 DOCUMENT RE-MINE PREPASS (DOC_REMINE_ENABLED, default OFF): re-queue
-            # terminal zero-edge/'partial' documents against the grown ontology. Runs
-            # at most once per _DOC_REMINE_INTERVAL_S, bounded batch, round-robin.
-            # Fail-safe: a prepass fault never blocks the cycle.
-            if ingest_enabled and DOC_REMINE_ENABLED:
+            # ── GHOST-TENANT HEALTH SKIP (cortex bug-reembedder-cascade-and-tenant-hygiene) ──
+            # Some seats read status='ready' in public.user_provisioning but have had their
+            # faultline_<uuid> schema DROPPED (0 tables — leftover benchmark/throwaway tenants,
+            # ~15 on pre-prod). Every per-tenant pass below would throw UndefinedTable on such a
+            # schema → aborted txn → on any pass that shares a connection across tenants, the
+            # "current transaction is aborted, commands ignored" cascade that STALLS Class-B
+            # promotion + Class-C sync for HEALTHY tenants. Deterministically drop ghosts from
+            # ready_schemas ONCE per cycle — a SINGLE structural chokepoint feeding ALL the
+            # per-tenant loops below (every one of them iterates ready_schemas), so the invariant
+            # "ghosts are never processed" holds structurally, not by each loop remembering to
+            # guard. Fail-LOUD (log.error) one line per ghost + a total (the orphan public rows
+            # are a DATA/ops cleanup, main-loop-owned — the CODE stays resilient to them). The
+            # probe is fail-SAFE toward inclusion (any probe error → tenant kept), so a transient
+            # catalog hiccup can never mass-skip live tenants. One short-lived admin connection.
+            if ready_schemas:
+                _live_schemas = []
+                _ghost_count = 0
                 try:
-                    _n_remined = remine_documents_prepass(postgres_dsn, ready_schemas)
-                    if _n_remined:
-                        log.info(f"re_embedder.remine_prepass requeued={_n_remined}")
-                except Exception as _remine_err:  # noqa: BLE001 — non-fatal by contract
-                    log.warning(f"re_embedder.remine_prepass_error: {_remine_err}")
+                    with psycopg2.connect(postgres_dsn) as _health_admin:
+                        for _hu, _hs in ready_schemas:
+                            if tenant_schema_is_live(_health_admin, _hs):
+                                _live_schemas.append((_hu, _hs))
+                            else:
+                                _ghost_count += 1
+                                log.error(
+                                    f"re_embedder.ghost_tenant_skipped schema={_hs} "
+                                    f"user_id={str(_hu)[:8]} "
+                                    f"reason=schema_dropped_or_no_staged_facts_table "
+                                    f"(status=ready in public.user_provisioning but schema absent "
+                                    f"— orphan row; ops cleanup owed)"
+                                )
+                    if _ghost_count:
+                        log.error(
+                            f"re_embedder.ghost_tenants_skipped_total count={_ghost_count} "
+                            f"live={len(_live_schemas)} — cycle continues on live tenants only"
+                        )
+                    ready_schemas = _live_schemas
+                except Exception as _ghost_err:
+                    # Fail-SAFE: if the whole health sweep fails (e.g. admin connect error), do
+                    # NOT drop anyone — keep the full list and let per-tenant isolation handle it.
+                    log.warning(
+                        f"re_embedder.ghost_tenant_sweep_failed (processing all tenants): "
+                        f"{_ghost_err}"
+                    )
+
+            # SAAS_MODE only: skip tenants whose seat belongs to a non-active account
+            # (suspended/locked/archived) so a locked/suspended account's data stops being
+            # processed. Fail-SAFE + backward-compat: empty set when SAAS off / tables absent /
+            # any error → nothing skipped (see _saas_suspended_user_ids). A tenant that is not
+            # a registered seat is UNAFFECTED.
+            _saas_skip = _saas_suspended_user_ids(postgres_dsn, [u for u, _ in ready_schemas])
+            if _saas_skip:
+                log.info(f"re_embedder.saas_status_skip count={len(_saas_skip)}")
+
+            # ── PER-SEAT WORK LEDGER (public.sweep_work_state, migration 207) ─────────────
+            # ONE query answers "what is due, for EVERY seat", so a seat whose work tokens are
+            # all clean AND inside the max-run bound is skipped BEFORE its connection is opened.
+            # That is the cost model this exists for: a quiet seat costs NOTHING, instead of
+            # O(seats) full sweeps per interval forever. REEMBED_SWEEP_SKIP defaults OFF; flag
+            # off, table missing, or a failed query all yield the ALWAYS-RUN sentinel — exactly
+            # today's behaviour. The fail-safe direction is RUN and is never inverted.
+            _sweep_snap = _sweep.snapshot(postgres_dsn, [u for u, _ in ready_schemas])
+            if not _sweep_snap.always_run:
+                log.info(f"re_embedder.sweep_ledger.snapshot seats={_sweep_snap.seats_seen} "
+                         f"seats_with_work={_sweep_snap.seats_due} "
+                         f"max_interval_s={_sweep.max_interval_seconds()}")
+
+            # Count tenants that had work this cycle (drives the reconcile cadence below).
+            _active_tenants_this_cycle = 0
+
+            # ── CYCLE-WIDE EPISODIC-DRAIN BUDGET + ROTATION CURSOR ────────────────────────
+            # The per-tenant budget bounds ONE tenant; it still permits
+            # `len(ready_schemas) × tenant_budget` of predecessor per cycle, and the sweeps
+            # below only begin once this whole pass is done. This caps the AGGREGATE.
+            #
+            # ⚠️ A BUDGET WITHOUT A CURSOR IS A DIFFERENT STARVATION, NOT A FIX. `ready_schemas`
+            # is `ORDER BY ready_at ASC` — a STABLE order. Spend the budget from the top every
+            # cycle and the same head tenants drain forever while the tail never drains once:
+            # the wedge, moved rather than removed. The cursor records the first tenant DENIED
+            # this cycle and the next cycle resumes there, so the drain sweeps round-robin over
+            # the seat list.
+            # FAIL-SAFE DIRECTION IS RUN (sweep_ledger invariant 1): a cursor naming a tenant
+            # that is no longer in `ready_schemas` would arm nothing and starve everyone, so if
+            # the pass ends still un-armed the cursor is cleared LOUDLY and the next cycle
+            # starts from the top.
+            _rx_cycle_spent = 0.0
+            _rx_cycle_denied_first = None
+            _rx_cycle_denied_n = 0
+            _rx_armed = (_reextract_cycle_cursor[0] is None)
+
+            # ── PHASE 2z: ENDPOINT-HEALTH ALERT SWEEP (SaaS only) ──────────────────────
+            # WHY IT IS HERE AND NOT IN THE CONSOLE: measured on pre-prod 2026-08-01, the
+            # health surface was polled 41 times in 20 minutes and returned 401 every time,
+            # because the ONLY thing evaluating it was a signed-in browser. A health check
+            # that requires an audience cannot catch the thing it exists to catch — this box
+            # has already run a 13-day stall nobody was watching. So the verdict is now read,
+            # and acted on, HERE: no session, no request, no user.
+            #
+            # ⚠️ IT PERFORMS NO LLM CALL. The verdict already exists — brain_probe_state
+            # (migration 204) is written wherever real work succeeds or fails. This pass only
+            # reads it and decides whether anything CHANGED enough to tell somebody. A quiet
+            # seat is skipped by the ledger claim below without opening a connection; a seat
+            # with no brain bound returns before its tenant read. Cost for both: zero.
+            #
+            # Placed BEFORE the heavy per-tenant loops and given its own connections (it opens
+            # none of the loop's), so it neither inherits nor leaves a read transaction — the
+            # `release_read_transaction` invariant below is untouched by it.
+            #
+            # TOTAL fail-safe: the whole block is a telemetry lane. Any failure logs and the
+            # cycle continues; nothing here can delay or block ingest, recall or sync.
+            if ready_schemas:
+                try:
+                    from saas import brain_alerts as _brain_alerts
+
+                    # enabled() is checked BEFORE the seat list is materialised: with SaaS off
+                    # (or the lane switched off) this costs one env read per cycle instead of an
+                    # O(seats) list build feeding a sweep that would return zeros anyway.
+                    if _brain_alerts.enabled():
+                        def _ba_due(_uid):
+                            return _sweep.claim(_sweep_snap, _uid, _brain_alerts.SUBSYSTEM)
+
+                        def _ba_ran(_uid):
+                            _sweep.record_run_dsn(
+                                postgres_dsn, _uid, _brain_alerts.SUBSYSTEM,
+                                _sweep_snap.observed_token(_uid, _brain_alerts.SUBSYSTEM))
+
+                        _ba_stats = _brain_alerts.run_sweep(
+                            [(u, s) for u, s in ready_schemas if u not in _saas_skip],
+                            is_due=_ba_due, on_ran=_ba_ran)
+                        if any(_ba_stats.get(k) for k in ("alerted", "recovered", "suppressed",
+                                                          "errors")):
+                            log.info(
+                                "re_embedder.brain_alert_sweep "
+                                f"due={_ba_stats['due']} alerted={_ba_stats['alerted']} "
+                                f"recovered={_ba_stats['recovered']} "
+                                f"suppressed={_ba_stats['suppressed']} "
+                                f"errors={_ba_stats['errors']} skipped={_ba_stats['skipped']}")
+                except Exception as _ba_exc:  # noqa: BLE001 — never fails the cycle
+                    log.warning("re_embedder.brain_alert_sweep_failed "
+                                f"{type(_ba_exc).__name__}: {str(_ba_exc)[:160]}")
+
+            # ── PHASE 2a: FAST DOC-DRAIN PRE-PASS (flagship async doc lane) ────────────
+            # LATENCY FIX: drain the async document lane at the TOP of every cycle,
+            # BEFORE any heavy per-tenant pass, so a freshly-enqueued document is claimed
+            # on the very next poll tick instead of waiting a full cycle behind promotion/
+            # expiry/reextract/synonym work (measured >6 min live). Strict subset of the
+            # in-order walk's drain (same claim/finalize SQL); per-tenant fail-safe; gated
+            # on ingest_enabled (a frozen store never drains). See the helper docstring.
+            if ingest_enabled and ready_schemas:
+                _n_fast = fast_drain_pending_documents_prepass(
+                    postgres_dsn, ready_schemas, _saas_skip,
+                    backend_api_url, statement_route=reextract_route,
+                )
+                if _n_fast:
+                    log.info(f"re_embedder.fast_doc_drain_prepass_complete docs={_n_fast}")
+                # DOCUMENT re-mine prepass (gauntlet R2) — alongside the fast prepass but
+                # separately gated: DOC_REMINE_ENABLED (default OFF) + its own pass cadence
+                # + batch/age/attempt bounds, all enforced inside the helper. A frozen
+                # store never re-mines (the ingest_enabled gate above covers this call).
+                _n_remine = remine_documents_prepass(postgres_dsn, ready_schemas, _saas_skip)
+                if _n_remine:
+                    log.info(f"re_embedder.doc_remine_pass_complete docs={_n_remine}")
 
             # PHASE 2b: Process each user schema independently
             for user_id, schema_name in ready_schemas:
+                if user_id in _saas_skip:
+                    continue
+                # ── PER-TENANT re-embedder gate (SaaS control plane, migration 224) ──────
+                # Composes AND with the GLOBAL gate at the top of the cycle. A tenant whose
+                # switch is OFF is skipped THIS cycle (continue to the next); everyone else
+                # proceeds. SAAS off / legacy tenant → always enabled (no-op, byte-for-byte).
+                if not _saas_re_embedder_tenant_enabled(user_id):
+                    continue
+                # ── SaaS Gap-B (background loop): bind THIS tenant's BYO engine-brain so the
+                # re_embedder's in-process CHAT-LLM ops (name-conflict resolution, ontology
+                # evaluation) route to the tenant's own seat brain — and FAIL CLOSED (no global
+                # env/cloud spend) when the tenant has no brain configured. ABSOLUTE set every
+                # iteration (clears to global when a tenant has no owning account) so a no-config
+                # tenant can never inherit the PREVIOUS tenant's brain across this single-threaded
+                # loop. SAAS off → no-op. Lazy + fail-safe so the public core (no saas/) is
+                # unaffected.
+                #
+                # STUB / documented follow-up (BYO EMBEDDING model): the ACTUAL vector embedding
+                # here defaults to the LOCAL fastembed CPU path (see _get_local_embedder — already
+                # cost-safe on the CPU-only host; no external embedding spend). Per-account
+                # account_llm_config.embedding_{backend,url,model,dim} is RESOLVED
+                # (saas.llm_config.resolve_account_llm_config) but NOT yet wired into the embedding
+                # call, because switching a live account's embedder requires a full re-embed of
+                # that tenant's collection (dim/space change). TODO(byo-embedding): thread the
+                # tenant embedding config into upsert_to_qdrant / the embedding client at THIS
+                # seam, gated by a per-account re-embed migration. Deliberately NOT done here to
+                # avoid half-breaking the loop.
+                _reembedder_bind_tenant_brain(schema_name)
                 try:
                     with psycopg2.connect(postgres_dsn) as db_per_user:
                         with db_per_user.cursor() as cur:
-                            cur.execute(f"SET search_path TO {schema_name}")
+                            cur.execute(f"SET search_path TO {schema_name}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                         db_per_user.commit()
+
+                        # ── EXECUTION GATE (task §1/§2): skip a PROVABLY-idle tenant before
+                        # any expensive lifecycle work. The gate reads real DB state (indexed
+                        # EXISTS probes) and is fail-safe (probe error → True → processed), so
+                        # it can only ever skip a tenant with genuinely nothing due. When it
+                        # says work IS due the pass below runs byte-for-byte unchanged.
+                        if not _tenant_has_reembed_work(db_per_user, schema_name):
+                            log.debug(f"re_embedder.gate.skipped_idle schema={schema_name}")
+                            continue
+                        _active_tenants_this_cycle += 1
+
+                        # ── READ BARRIER, SUBSYSTEM BOUNDARY (`db_per_user` lane) ──
+                        # The SAME invariant the `_ont_db` lane below already enforces, and
+                        # the reason this campaign exists: it was applied to ONE of the two
+                        # long-lived per-tenant connections. NO SUBSYSTEM BEGINS ITS WORK
+                        # INHERITING THE PREVIOUS SUBSYSTEM'S READ TRANSACTION. Each lane
+                        # barriers its OWN work-set fetch; this is the belt-and-braces at the
+                        # seam, so a lane that is added later and forgets its own barrier
+                        # cannot poison the lane after it.
+                        # release_read_transaction() and NOT rollback(): it probes
+                        # pg_current_xact_id_if_assigned() and REFUSES (log_crit) on a
+                        # transaction that has written, so a pending write is never discarded.
+                        release_read_transaction(
+                            db_per_user,
+                            context=f"re_embedder.per_user.gate schema={schema_name}")
 
                         # INGEST_ENABLED freeze: the whole staged-fact lifecycle block
                         # (promotion, expiry, Class C hit promotion/decay, episodic
                         # re-extraction) mutates knowledge rows — paused as a unit.
                         # (Cycle-level pause already logged once above, not per user.)
                         if ingest_enabled:
-                            # ══ R8 GROWTH WORKSTACK — drain-on-recovery, priority-first ════
-                            # The per-tenant growth_work_queue (migration 300) holds the durable
-                            # breadcrumb for work left pending (recall_miss markers from the
-                            # query wrapper, brain-deferred re-examinations from the R9
-                            # uplift). Drain it BEFORE this cycle's new work — promotion
-                            # (recall-visible) first, then enrichment → synonym convergence →
-                            # what-is-climb. Each item re-attempts its deferred operation;
-                            # success stamps completed_at, failure leaves it pending
-                            # (rate-limited retry next cycle). Fail-safe: a drain fault warns
-                            # and the cycle proceeds exactly as before.
-                            try:
-                                if growth_work_queue.pending_count(db_per_user) > 0:
-                                    # BUG-08 (adversarial bench 20261024): the drain
-                                    # gate is OP-AWARE (_growth_drain_lane_open):
-                                    # deterministic operations drain unconditionally;
-                                    # brain-bearing ones keep the lane verdict (and its
-                                    # breadcrumb) when lane machinery exists. The probe
-                                    # receives the OPERATION TYPE — a closed verdict
-                                    # skips that op's items, never the whole batch.
-                                    _gq_changed: set = set()
-
-                                    def _gq_ledger_noop(op, tgt, ok):
-                                        pass  # no sweep ledger on this engine; hook point only
-
-                                    growth_work_queue.drain(
-                                        db_per_user,
-                                        schema_name=schema_name,
-                                        runner=lambda op, tgt: _growth_work_reattempt(
-                                            op, tgt, db_per_user, user_id, schema_name,
-                                            qwen_api_url, postgres_dsn, qdrant_url,
-                                            changed_schemas=_gq_changed,
-                                            backend_url=backend_api_url),
-                                        item_done=lambda op, tgt: _growth_work_item_done(
-                                            op, tgt, db_per_user),
-                                        lane_probe=lambda op: _growth_drain_lane_open(
-                                            user_id, schema_name, op),
-                                        on_attempted=_gq_ledger_noop,
-                                    )
-                                    # The drain's read re-opened a transaction on this
-                                    # shared connection — release it so the first subsystem
-                                    # below starts clean (the house invariant).
-                                    release_read_transaction(
-                                        db_per_user,
-                                        context=f"re_embedder.growth_work_drain schema={schema_name}")
-                            except Exception as _gq_err:  # noqa: BLE001 — non-fatal by contract
-                                _rollback_and_reapply_search_path(db_per_user, schema_name)
-                                log.warning(
-                                    f"re_embedder.growth_work_drain_error schema={schema_name} "
-                                    f"(non-fatal, cycle continues): {type(_gq_err).__name__}: "
-                                    f"{str(_gq_err)[:150]}"
-                                )
-
                             # Promote staged facts for this user
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.promote schema={schema_name}")
                             n_promoted = promote_staged_facts(db_per_user, qdrant_url, user_id=user_id, schema_name=schema_name)
                             if n_promoted:
                                 log.info(f"re_embedder.promotion_complete user_id={user_id[:8]} schema={schema_name} promoted={n_promoted}")
 
                             # Expire stale Class C facts for this user
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.expire schema={schema_name}")
                             n_expired = expire_staged_facts(db_per_user, qdrant_url, user_id=user_id)
                             if n_expired:
                                 log.info(f"re_embedder.expiry_complete user_id={user_id[:8]} expired={n_expired}")
@@ -9812,7 +16546,27 @@ def main():
                             # /extract/rewrite → /ingest) so content the ontology couldn't
                             # cast at capture time gets another chance after the per-tenant
                             # ontology has grown. The cast always pays the WGM validation toll.
-                            if reextract_enabled:
+                            # CYCLE BUDGET + ROTATION. `_rx_armed` implements the cursor: until
+                            # the tenant the last cycle stopped at comes round, this cycle's
+                            # drain budget is not spent, so the tail of the seat list gets the
+                            # turn the head already had. Every OTHER phase in this block runs
+                            # unconditionally — the budget gates the PREDECESSOR, never the
+                            # lifecycle work it was starving.
+                            _rx_armed, _rx_may_drain = _reextract_cycle_gate(
+                                _rx_armed, _reextract_cycle_cursor[0], user_id,
+                                _rx_cycle_spent, _REEXTRACT_CYCLE_BUDGET_S,
+                            )
+                            if reextract_enabled and not _rx_may_drain:
+                                _rx_cycle_denied_n += 1
+                                if _rx_cycle_denied_first is None and _rx_armed:
+                                    # Only an ARMED denial sets the cursor: a pre-arm skip is
+                                    # this cycle honouring the PREVIOUS cursor, not a new one.
+                                    _rx_cycle_denied_first = str(user_id)
+                            if reextract_enabled and _rx_may_drain:
+                                _rx_t_tenant = time.monotonic()
+                                release_read_transaction(
+                                    db_per_user,
+                                    context=f"re_embedder.per_user.reextract schema={schema_name}")
                                 try:
                                     n_reextracted = reextract_episodic(
                                         db_per_user, backend_api_url, user_id=user_id,
@@ -9823,11 +16577,39 @@ def main():
                                         log.info(f"re_embedder.reextract_complete user_id={user_id[:8]} schema={schema_name} rows={n_reextracted}")
                                 except Exception as _rex_err:
                                     log.warning(f"re_embedder.reextract_cycle_error user_id={user_id[:8]}: {_rex_err}")
+                                finally:
+                                    # `finally`, not the success path: a tenant that raised
+                                    # still SPENT the wall-clock, and the whole point of a time
+                                    # budget is that failures are the expensive case.
+                                    _rx_cycle_spent += time.monotonic() - _rx_t_tenant
+
+                            # Async document-ingestion lane (flagship): drain pending
+                            # `documents` rows the ingest_document tool enqueued. Each
+                            # chunk runs the HYBRID extraction (deterministic spine +
+                            # tenant-brain LLM /extract/rewrite for the sentences the
+                            # spine dropped) → /ingest source="mcp" (user_stated,
+                            # durable). Reuses the once-per-cycle brain route. Fail-safe:
+                            # per-tenant isolation, never poisons the loop.
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.doc_drain schema={schema_name}")
+                            try:
+                                n_docs = drain_pending_documents(
+                                    db_per_user, backend_api_url, user_id=user_id,
+                                    schema_name=schema_name, statement_route=reextract_route,
+                                )
+                                if n_docs:
+                                    log.info(f"re_embedder.document_drain_complete user_id={user_id[:8]} schema={schema_name} docs={n_docs}")
+                            except Exception as _doc_err:
+                                log.warning(f"re_embedder.document_drain_cycle_error user_id={user_id[:8]}: {_doc_err}")
 
                             # JOB 2 — Promote Class C rows that earned hit_count >= 3 (query-scoped
                             # hits) to Class B. Classify-if-needed (default B-2). Run BEFORE the
                             # hit-decay sweep so a row that just reached threshold promotes instead
                             # of being decremented in the same cycle.
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.class_c_promote schema={schema_name}")
                             n_c_promoted = promote_class_c_hits(
                                 db_per_user, qdrant_url, qwen_api_url,
                                 user_id=user_id, schema_name=schema_name
@@ -9837,11 +16619,27 @@ def main():
 
                             # JOB 1 — Decay Class C query-hit counter for idle rows (30d window
                             # elapsed with no hit): hit_count -= 1, reset window, DROP at <= 0.
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.class_c_decay schema={schema_name}")
                             c_decay = decay_class_c_hits(db_per_user, qdrant_url, user_id=user_id)
                             if c_decay["decremented"] or c_decay["dropped"]:
                                 log.info(
                                     f"re_embedder.class_c_decay user_id={user_id[:8]} "
                                     f"decremented={c_decay['decremented']} dropped={c_decay['dropped']}"
+                                )
+
+                            # JOB 3 — a STRUCK Class C row is evaluated against the durable A/B
+                            # tier: reaped when A/B already carries it at equal-or-higher declared
+                            # authority, extended for another attempt when it does not. This is
+                            # the third exit that keeps the short-term tier moving instead of
+                            # accumulating (the other two being promotion and expiry).
+                            c_strike = evaluate_struck_class_c(db_per_user, user_id=user_id)
+                            if c_strike["struck"]:
+                                log.info(
+                                    f"re_embedder.class_c_strike user_id={user_id[:8]} "
+                                    f"struck={c_strike['struck']} reaped={c_strike['reaped']} "
+                                    f"extended={c_strike['extended']}"
                                 )
 
                         # Fetch and embed unsynced facts for this user.
@@ -9852,17 +16650,50 @@ def main():
                         # already drops any A/B Qdrant result (VECTOR_CLASS_C_ONLY in main.py),
                         # so leaving A/B out of the vector is safe and shrinks the C catch-all
                         # toward zero as more grounds into A/B. Flag off → legacy: sync both.
-                        if _VECTOR_CLASS_C_ONLY:
+                        # KEPT BOOKKEEPING (REMOVE_QDRANT_MEMORY_LANE): the qdrant_synced
+                        # COLUMN stays (other lanes read it) — this loop keeps marking
+                        # unsynced `facts` rows synced WITHOUT any embedding or Qdrant
+                        # contact, so the queue drains and nothing flaps. Under the removal
+                        # this runs regardless of USER_MEMORY_VECTOR_LANE; the elif/else
+                        # embed arms below are unreachable. Rollback arm: `not LANE or False`
+                        # == the legacy `not LANE` gate.
+                        if not _USER_MEMORY_VECTOR_LANE or _REMOVE_QDRANT_MEMORY_LANE:
+                            try:
+                                _marked = 0
+                                with db_per_user.cursor() as _fc:
+                                    _fc.execute(
+                                        "UPDATE facts SET qdrant_synced = true "
+                                        "WHERE qdrant_synced = false AND superseded_at IS NULL"
+                                    )
+                                    _marked = _fc.rowcount or 0
+                                if _marked:
+                                    db_per_user.commit()
+                                    log.info("re_embedder.facts_mark_synced_lane_off "
+                                             f"marked={_marked} user_id={user_id[:8]}")
+                            except Exception as _e:  # noqa: BLE001
+                                log.warning(f"re_embedder.facts_mark_synced_failed error={str(_e)[:120]}")
+                        elif _VECTOR_CLASS_C_ONLY:
                             log.debug(f"re_embedder.facts_sync_skipped_class_c_only user_id={user_id[:8]}")
                         else:
                             rows = fetch_unsynced(db_per_user, user_id, confidence_threshold)
                             if rows:
                                 log.info(f"re_embedder.batch_start user_id={user_id[:8]} count={len(rows)}")
-                                collection = derive_collection(user_id)
+                                from src.api.qdrant_partition import resolve_partition as _qp_resolve
+                                collection, _ = _qp_resolve(user_id, "memory")
+                                # READ BARRIER (RE-ARM): the read directly above re-opened a transaction AFTER the
+                                # block-level barrier, and the call below blocks. A latching check cannot see this;
+                                # measured live, it killed climb_classification_chains' connection twice.
+                                release_read_transaction(db_per_user, context="re_embedder.per_user.facts_vector.pre_ensure")
                                 ensure_collection(collection, qdrant_url)
 
                                 # Resolve display names for batch
                                 rows = resolve_display_names_for_facts(db_per_user, rows)
+                                # READ BARRIER: the per-row embed + Qdrant upsert loop below
+                                # is HTTP on every iteration; the name-resolution reads must
+                                # not ride across it.
+                                release_read_transaction(
+                                    db_per_user,
+                                    context=f"re_embedder.per_user.facts_vector schema={schema_name}")
 
                                 for row in rows:
                                     try:
@@ -9877,10 +16708,15 @@ def main():
 
                         # Fetch and embed unsynced staged facts for this user
                         staged_rows = fetch_unsynced_staged(db_per_user, user_id)
-                        if staged_rows and not _USER_MEMORY_VECTOR_LANE:
+                        # KEPT BOOKKEEPING (REMOVE_QDRANT_MEMORY_LANE): mark Class-C rows
+                        # synced WITHOUT embedding — pure SQL, zero Qdrant contact. Under the
+                        # removal this runs regardless of USER_MEMORY_VECTOR_LANE and clears
+                        # staged_rows, so the embed loop below is unreachable. Rollback arm:
+                        # `not LANE or False` == the legacy `not LANE` gate.
+                        if staged_rows and (not _USER_MEMORY_VECTOR_LANE or _REMOVE_QDRANT_MEMORY_LANE):
                             # User-memory vector lane RETIRED: mark these Class-C rows synced WITHOUT
                             # embedding so the idle-probe stops firing and no Qdrant write happens. C
-                            # remains queryable from staged_facts (Postgres).
+                            # remains queryable from staged_facts (Postgres). Cortex is never in this loop.
                             try:
                                 with db_per_user.cursor() as _mc:
                                     _mc.executemany(
@@ -9889,14 +16725,23 @@ def main():
                                     )
                                 db_per_user.commit()
                             except Exception as _e:  # noqa: BLE001
-                                log.warning("re_embedder.staged_mark_synced_failed", error=str(_e)[:120])
+                                log.warning(f"re_embedder.staged_mark_synced_failed error={str(_e)[:120]}")
                             staged_rows = []
                         if staged_rows:
                             log.info(f"re_embedder.staged_batch user_id={user_id[:8]} count={len(staged_rows)}")
-                            collection = derive_collection(user_id)
+                            from src.api.qdrant_partition import resolve_partition as _qp_resolve
+                            collection, _ = _qp_resolve(user_id, "memory")
+                            # READ BARRIER (RE-ARM): the read directly above re-opened a transaction AFTER the
+                            # block-level barrier, and the call below blocks. A latching check cannot see this;
+                            # measured live, it killed climb_classification_chains' connection twice.
+                            release_read_transaction(db_per_user, context="re_embedder.per_user.staged_vector.pre_ensure")
                             ensure_collection(collection, qdrant_url)
 
                             staged_rows = resolve_display_names_for_facts(db_per_user, staged_rows)
+                            # READ BARRIER: same shape as the facts lane directly above.
+                            release_read_transaction(
+                                db_per_user,
+                                context=f"re_embedder.per_user.staged_vector schema={schema_name}")
                             for row in staged_rows:
                                 try:
                                     # TIER REALIGNMENT: the vector is the Class-C catch-all + the
@@ -9963,6 +16808,48 @@ def main():
                     log.error(f"re_embedder.per_user_promotion_failed user_id={user_id[:8] if user_id else 'unknown'} schema={schema_name}: {e}")
                     continue
 
+            # ── COMMIT THE ROTATION CURSOR (end of the per-tenant pass) ──────────────────
+            # Three outcomes, and the un-armed one is the failure mode a dirty-flag design
+            # actually dies of, so it is CRIT rather than a debug line:
+            #   * budget never tripped        → cursor cleared; next cycle starts from the top.
+            #   * budget tripped              → cursor = first ARMED tenant denied; next cycle
+            #                                   skips ahead to it before spending anything.
+            #   * cursor never armed          → the tenant it names left `ready_schemas`
+            #                                   (deprovisioned, ghost-swept, suspended). Left
+            #                                   alone it would deny EVERY tenant forever. Clear
+            #                                   it and say so.
+            # `ingest_enabled` is part of the condition, not an oversight: on a FROZEN cycle no
+            # tenant reaches the gate, so `_rx_armed` cannot advance and the un-armed branch
+            # would CRIT every cycle for as long as an operator deliberately holds the freeze.
+            # A chosen freeze must not cry wolf (the same rule the episodic-capture freeze
+            # follows) — and the cursor is still correct when the freeze lifts.
+            if ingest_enabled and reextract_enabled and _REEXTRACT_CYCLE_BUDGET_S:
+                if not _rx_armed:
+                    _doc_log_crit(
+                        "re_embedder.reextract_cursor_unarmed",
+                        cursor=str(_reextract_cycle_cursor[0])[:8],
+                        seats=len(ready_schemas), denied=_rx_cycle_denied_n,
+                        note="rotation cursor named a seat that never reached the drain gate "
+                             "this cycle (deprovisioned, ghost-swept, suspended, or skipped by "
+                             "the idle gate) — cleared so the drain resumes from the top next "
+                             "cycle rather than denying every seat forever",
+                    )
+                    _reextract_cycle_cursor[0] = None
+                else:
+                    _reextract_cycle_cursor[0] = _rx_cycle_denied_first
+                    if _rx_cycle_denied_first is not None:
+                        log.warning(
+                            "re_embedder.reextract_cycle_budget_exhausted "
+                            f"spent={_rx_cycle_spent:.1f}s budget={_REEXTRACT_CYCLE_BUDGET_S:.0f}s "
+                            f"seats_denied={_rx_cycle_denied_n} "
+                            f"next_cycle_resumes_at={_rx_cycle_denied_first[:8]} "
+                            "(drain deferred, NOT dropped; every other subsystem kept its turn)"
+                        )
+
+            # SaaS Gap-B: clear the last-bound tenant brain back to the global env path so no
+            # tenant's brain leaks into the between-tenant / gate-tuning work below. SAAS off → no-op.
+            _reembedder_clear_tenant_brain()
+
             # GROWTH ENGINE WIRE #2: Adjust per-user confidence gates based on feedback
             # Phase 2c: Intent classification gate self-healing (runs every cycle)
             # Enables system to learn from intent classification patterns without hardcoded thresholds.
@@ -9980,7 +16867,8 @@ def main():
                     try:
                         with psycopg2.connect(postgres_dsn) as db:
                             with db.cursor() as cur:
-                                cur.execute(f"SET search_path TO {_gate_schema}")
+                                cur.execute(f"SET search_path TO {_gate_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                             # Require significant feedback history (>= 10 classifications) for
                             # THIS tenant before tuning; otherwise leave the gate at its default.
                             with db.cursor() as cur:
@@ -10140,6 +17028,19 @@ def main():
                     except Exception as e:
                         log.warning(f"re_embedder.queue_consumer_error (non-blocking): {e}")
                         # Continue to DB poll even if queue fails
+                    finally:
+                        # CONNECTION HYGIENE (defense-in-depth for the idle-in-transaction
+                        # leak fixed in process_reembedder_event): guarantee the shared
+                        # poll-loop connection carries NO open read transaction out of the
+                        # queue consumer before the cycle's later slow (LLM) ontology work.
+                        # Any lingering idle-in-transaction here holds ACCESS SHARE and can
+                        # block a concurrent reset_tenant TRUNCATE. Event writers commit/
+                        # rollback internally and read-only events persist nothing, so this
+                        # rollback cannot lose data (it is a no-op on a clean connection).
+                        try:
+                            db.rollback()
+                        except Exception:  # noqa: BLE001 — hygiene rollback is best-effort
+                            pass
 
                 # NOTE: Per-user promotion and fact syncing now happens in PHASE 2b
                 # (see per-schema isolation above in the ready_schemas loop)
@@ -10168,17 +17069,147 @@ def main():
                 # endpoint falls back to a full overlay reset (backward-compatible).
                 _changed_schemas: set = set()
                 for _user_id, _schema in ready_schemas:
+                    # LEDGER SEAT GATE — the line that makes a quiet seat free. No connection,
+                    # no search_path bind, no tenant-brain bind, no probe, no LLM call.
+                    if not _sweep_snap.seat_has_work(_user_id):
+                        _sweep.log_seat_skip(_sweep_snap, _user_id, _schema)
+                        continue
                     try:
                         with psycopg2.connect(postgres_dsn) as _ont_db:
                             with _ont_db.cursor() as _spc:
-                                _spc.execute(f"SET search_path TO {_schema}")
+                                _spc.execute(f"SET search_path TO {_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                             _ont_db.commit()
+                            # SaaS Gap-B: bind THIS tenant's brain for the LLM ops in this loop
+                            # (ontology eval + the ±6 what-is/climb ENRICHMENT grounder + synonym
+                            # convergence). The primary sync loop cleared the brain to global; the
+                            # DB search_path above does NOT set the LLM ContextVar, so without this
+                            # every ENRICHMENT call here would route to the dead global default.
+                            _reembedder_bind_tenant_brain(_schema)
+
+                            # ══ R8 GROWTH WORKSTACK — drain-on-recovery, priority-first ════
+                            # The per-tenant growth_work_queue (migration 300) holds the durable
+                            # breadcrumb for work starved while this brain was unreachable (lane
+                            # closed: rate-limited/circuit-broken/down). The moment the lane is
+                            # OPEN again, drain it BEFORE this cycle's new work — promotion
+                            # (recall-visible) first, then enrichment → synonym convergence →
+                            # whatis-climb. Each item re-attempts its deferred operation via the
+                            # SAME bounded functions the cycle below calls; success stamps
+                            # completed_at, failure leaves it pending (rate-limited retry next
+                            # cycle). One observability line per drain cycle
+                            # ("growth_work_drain drained=N remaining=M by_type={...}") fires
+                            # inside growth_work_queue.drain. Fail-safe: a drain fault warns and
+                            # the cycle proceeds exactly as before. Gated on ingest_enabled — a
+                            # serve-mode freeze is a deliberate pause, not brain starvation, so
+                            # the breadcrumbs wait it out.
+                            try:
+                                if ingest_enabled and growth_work_queue.pending_count(_ont_db) > 0:
+                                    # BUG-08 (adversarial bench 20261024): this drain
+                                    # used to sit behind a BLANKET brain-lane gate
+                                    # (_reembedder_llm_lane_open("ontology_eval")) —
+                                    # outer gate AND lane_probe — so on a seat whose
+                                    # brain the document drain keeps permanently
+                                    # fail-closed, the drain NEVER ran: 8
+                                    # recall_miss_reexamine markers (deterministic,
+                                    # zero-brain runners) sat pending for 3+ hours
+                                    # while nothing re-attempted them. The gate is now
+                                    # OP-AWARE (_growth_drain_lane_open): deterministic
+                                    # operations drain unconditionally; brain-bearing
+                                    # ones keep the lane verdict (and its breadcrumb).
+                                    def _gq_ledger_record(op, tgt, ok):
+                                        """A successfully re-run subsystem records its
+                                        ledger run, so the normal cycle below does not
+                                        immediately re-spend on the same input token
+                                        (promotion is ledger-EXCLUDED — nothing to record)."""
+                                        if ok and tgt in _sweep.SUBSYSTEMS:
+                                            _sweep.record_run(
+                                                _ont_db, _user_id, tgt,
+                                                _sweep_snap.observed_token(_user_id, tgt))
+
+                                    growth_work_queue.drain(
+                                        _ont_db,
+                                        schema_name=_schema,
+                                        runner=lambda op, tgt: _growth_work_reattempt(
+                                            op, tgt, _ont_db, _user_id, _schema,
+                                            qwen_api_url, postgres_dsn, qdrant_url,
+                                            changed_schemas=_changed_schemas,
+                                            backend_url=backend_api_url),
+                                        item_done=lambda op, tgt: _growth_work_item_done(
+                                            op, tgt, _ont_db),
+                                        lane_probe=lambda op: _growth_drain_lane_open(
+                                            _user_id, _schema, op),
+                                        on_attempted=_gq_ledger_record,
+                                    )
+                                    # The drain's read re-opened a transaction on this
+                                    # shared connection — release it so the first subsystem
+                                    # below starts clean (the house invariant).
+                                    release_read_transaction(
+                                        _ont_db,
+                                        context=f"re_embedder.growth_work_drain schema={_schema}")
+                            except Exception as _gq_err:
+                                _rollback_and_reapply_search_path(_ont_db, _schema)
+                                log.warning(
+                                    f"re_embedder.growth_work_drain_error schema={_schema} "
+                                    f"(non-fatal, cycle continues): {type(_gq_err).__name__}: "
+                                    f"{str(_gq_err)[:150]}"
+                                )
+
+
+                            # ══ READ BARRIER — the "idle in transaction" invariant ══════════
+                            # PRODUCTION INCIDENT 2026-08-01: a connection from this container
+                            # sat `idle in transaction` for 10h08m holding AccessShareLock on
+                            # rel_types with backend_xid NULL — a PURE READ that never ended its
+                            # transaction. It queued a tenant DROP SCHEMA behind it, and once an
+                            # AccessExclusive waiter is queued EVERY later request queues too:
+                            # the metrics collector blocked, every `LOCK TABLE public.facts`
+                            # blocked, and a pg_dump of a 225 MB database produced a 0-byte file
+                            # for 10+ minutes of pure lock-wait (it finished in seconds with
+                            # faultline-api stopped).
+                            #
+                            # THIS LOOP IS THE CALL SITE. `_ont_db` is ONE connection shared by
+                            # every subsystem below. psycopg2 opens an implicit transaction on
+                            # the FIRST statement and holds it until an explicit commit/rollback
+                            # — closing the CURSOR does not end it. Several subsystems SELECT and
+                            # then hit `if not rows: return stats` with neither, so the NEXT
+                            # subsystem starts its LLM HTTP call INHERITING that read transaction
+                            # and holds rel_types' locks for the whole call. With a wedged LLM
+                            # (this repo has a 6s timeout that logged elapsed=762s as SUCCESS)
+                            # that hold is unbounded.
+                            #
+                            # THE INVARIANT, enforced at the top of every subsystem try-block
+                            # below: NO SUBSYSTEM BEGINS ITS WORK INHERITING THE PREVIOUS
+                            # SUBSYSTEM'S READ TRANSACTION.
+                            #
+                            # WHY release_read_transaction() AND NOT _rollback_and_reapply_search_path():
+                            # this barrier sits on a SUCCESS path, where a pending write is
+                            # possible. An unconditional rollback would silently DISCARD it.
+                            # release_read_transaction() probes pg_current_xact_id_if_assigned():
+                            # xid NULL (pure read) → rollback; xid ASSIGNED (a write is pending)
+                            # → it REFUSES and log_crit()s, so the write survives and the real
+                            # defect — a caller not reaching its own commit — is made loud.
+                            # `_rollback_and_reapply_search_path` stays where it belongs: the
+                            # `except` arms, where the transaction is already doomed.
+                            #
+                            # TENANT BINDING SURVIVES — verified against PG16, not assumed. The
+                            # `SET search_path TO {_schema}` above was COMMITTED (line ~11443), and
+                            # ROLLBACK does not clear a committed SET. So no re-apply is needed
+                            # here and none is added: re-applying would be noise implying the
+                            # barrier is dangerous when it is not. (The re-apply inside
+                            # `_rollback_and_reapply_search_path` is harmless, not load-bearing.)
 
                             # ── Ontology candidate evaluation (per-user schema) ──
                             # INGEST_ENABLED freeze: mutates rel_types/ontology_evaluations
                             # (ontology growth) — paused in knowledge-store mode.
                             try:
-                                if ingest_enabled and has_pending_ontology_work(_ont_db):
+                                _sw = "ontology_eval"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.ontology_eval schema={_schema}")
+                                if _sw_run and ingest_enabled and has_pending_ontology_work(_ont_db):
+                                    # READ BARRIER (RE-ARM): the read directly above re-opened a transaction AFTER the
+                                    # block-level barrier, and the call below blocks. A latching check cannot see this;
+                                    # measured live, it killed climb_classification_chains' connection twice.
+                                    release_read_transaction(_ont_db, context="re_embedder.ontology_eval.pre_blocking_call")
                                     ontology_stats = evaluate_ontology_candidates(_ont_db, qwen_api_url)
                                     if any(v > 0 for v in ontology_stats.values()):
                                         log.info(
@@ -10194,6 +17225,9 @@ def main():
                                         _changed_schemas.add(_schema)
                                 else:
                                     log.debug(f"re_embedder.no_pending_ontology_work schema={_schema}")
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.ontology_eval_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10205,7 +17239,11 @@ def main():
                             # paused in knowledge-store/serve mode. Writes rel_type_aliases →
                             # mark the schema changed so its overlay refreshes.
                             try:
-                                if ingest_enabled:
+                                _sw = "aspect_synonym"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.aspect_synonym schema={_schema}")
+                                if _sw_run and ingest_enabled:
                                     _asp_stats = evaluate_aspect_synonym_candidates(
                                         _ont_db, postgres_dsn, _schema, qwen_api_url)
                                     if _asp_stats.get("grown", 0) > 0:
@@ -10216,6 +17254,9 @@ def main():
                                             f"skipped={_asp_stats['skipped']} "
                                             f"errors={_asp_stats['errors']}")
                                         _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.aspect_synonym_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10232,8 +17273,13 @@ def main():
                             # INGEST_ENABLED freeze: mutates rel_types/entity_taxonomies —
                             # paused in knowledge-store mode.
                             try:
+                                _sw = "pending_placement_drain"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.pending_placement_drain schema={_schema}")
                                 _drain = (drain_pending_placement_by_morphology(
-                                    _ont_db, postgres_dsn, _schema) if ingest_enabled else {})
+                                    _ont_db, postgres_dsn, _schema)
+                                    if (_sw_run and ingest_enabled) else {})
                                 if _drain.get("reconciled", 0) > 0:
                                     log.info(
                                         f"re_embedder.pending_placement_drain schema={_schema} "
@@ -10241,6 +17287,9 @@ def main():
                                         f"scanned={_drain['scanned']} errors={_drain['errors']}"
                                     )
                                     _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.pending_placement_drain_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10259,7 +17308,11 @@ def main():
                             # INGEST_ENABLED freeze: mutates rel_types/entity_taxonomies/
                             # rel_type_aliases — paused in knowledge-store mode.
                             try:
-                                if ingest_enabled and _ENGINE_SYNONYM_CONVERGENCE:
+                                _sw = "synonym_convergence"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.synonym_convergence schema={_schema}")
+                                if _sw_run and ingest_enabled and _ENGINE_SYNONYM_CONVERGENCE:
                                     _synconv = converge_lifted_synonyms(
                                         _ont_db, postgres_dsn, _schema, qwen_api_url)
                                     if _synconv.get("converged", 0) > 0:
@@ -10268,10 +17321,28 @@ def main():
                                             f"converged={_synconv['converged']} "
                                             f"scanned={_synconv['scanned']} "
                                             f"left_novel={_synconv['left_novel']} "
+                                            f"brain_unavailable={_synconv.get('brain_unavailable', 0)} "
                                             f"errors={_synconv['errors']}"
                                         )
                                         _converged_any = True
                                         _changed_schemas.add(_schema)
+                                    # FAIL LOUD: a sweep in which the brain never answered
+                                    # converges nothing, so it is INVISIBLE at the log line
+                                    # above (gated on converged > 0). Without this, "the lane
+                                    # is working and found no synonyms" and "the tenant's brain
+                                    # has been unreachable for a week" read identically.
+                                    if _synconv.get("brain_unavailable", 0) > 0:
+                                        log.warning(
+                                            f"re_embedder.synonym_convergence_brain_unavailable "
+                                            f"schema={_schema} "
+                                            f"brain_unavailable={_synconv['brain_unavailable']} "
+                                            f"scanned={_synconv['scanned']} "
+                                            f"note=no verdicts cached for these rels; they are "
+                                            f"re-offered next sweep. Check this tenant's brain."
+                                        )
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.synonym_convergence_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10287,7 +17358,11 @@ def main():
                             # INGEST_ENABLED freeze: mutates rel_types/entities/staged_facts —
                             # paused in knowledge-store mode.
                             try:
-                                if ingest_enabled and _ENGINE_WHATIS_CLASSIFY:
+                                _sw = "whatis_classify"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.whatis_classify schema={_schema}")
+                                if _sw_run and ingest_enabled and _ENGINE_WHATIS_CLASSIFY:
                                     _whatis = classify_unknown_concepts(_ont_db, qwen_api_url, user_id=_user_id, schema_name=_schema)
                                     if _whatis.get("classified", 0) > 0:
                                         log.info(
@@ -10298,6 +17373,9 @@ def main():
                                             f"errors={_whatis['errors']}"
                                         )
                                         _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.whatis_classify_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10318,7 +17396,11 @@ def main():
                             # INGEST_ENABLED freeze: mutates staged_facts/facts/
                             # ontology_evaluations — paused in knowledge-store mode.
                             try:
-                                if ingest_enabled and _ENGINE_CLASSIFY_CLIMB:
+                                _sw = "classify_climb"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.classify_climb schema={_schema}")
+                                if _sw_run and ingest_enabled and _ENGINE_CLASSIFY_CLIMB:
                                     _climb = climb_classification_chains(_ont_db, qwen_api_url, user_id=_user_id, schema_name=_schema)
                                     if _climb.get("climbed", 0) > 0 or _climb.get("quarantined", 0) > 0:
                                         log.info(
@@ -10331,6 +17413,9 @@ def main():
                                             f"errors={_climb['errors']}"
                                         )
                                         _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.classify_climb_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10343,7 +17428,11 @@ def main():
                             # INGEST_ENABLED freeze: repoints facts hierarchy edges —
                             # paused in knowledge-store mode.
                             try:
-                                if ingest_enabled and _RUNG6_CONVERGENCE:
+                                _sw = "rung6_convergence"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.rung6_convergence schema={_schema}")
+                                if _sw_run and ingest_enabled and _RUNG6_CONVERGENCE:
                                     _conv = converge_hierarchy_by_identity(_ont_db, schema_name=_schema)
                                     if _conv.get("edges_repointed", 0) > 0:
                                         log.info(
@@ -10352,6 +17441,9 @@ def main():
                                             f"edges_repointed={_conv['edges_repointed']}"
                                         )
                                         _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.rung6_convergence_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10365,6 +17457,8 @@ def main():
                             # INGEST_ENABLED freeze: mutates/deletes ontology_evaluations
                             # candidate rows — paused in knowledge-store mode.
                             try:
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.ontology_candidate_decay schema={_schema}")
                                 _ont_decay = (decay_ontology_candidates(_ont_db, user_id=_user_id)
                                               if ingest_enabled else {"decayed": 0, "forgotten": 0})
                                 if _ont_decay["decayed"] or _ont_decay["forgotten"]:
@@ -10383,13 +17477,21 @@ def main():
                             # routes the grown construction correctly. Self-isolating (failure never
                             # crashes the tenant sweep). Per-tenant only (search_path already = _schema).
                             try:
-                                _cue_grow = grow_linguistic_cue_candidates(_ont_db, schema_name=_schema)
+                                _sw = "cue_class_growth"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.cue_class_growth schema={_schema}")
+                                _cue_grow = (grow_linguistic_cue_candidates(_ont_db, schema_name=_schema)
+                                             if _sw_run else {})
                                 if _cue_grow.get("grown", 0) > 0:
                                     log.info(
                                         f"re_embedder.cue_class_growth schema={_schema} "
                                         f"grown={_cue_grow['grown']} errors={_cue_grow['errors']}"
                                     )
                                     _changed_schemas.add(_schema)
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.cue_class_growth_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10403,7 +17505,12 @@ def main():
                             # public `db` connection read public.* (always empty) — the same
                             # severance bug documented for ontology_evaluations above.
                             try:
-                                _corr_stats = evaluate_correction_signal_candidates(_ont_db, qwen_api_url)
+                                _sw = "correction_eval"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.correction_eval schema={_schema}")
+                                _corr_stats = (evaluate_correction_signal_candidates(_ont_db, qwen_api_url)
+                                               if _sw_run else {})
                                 if any(v > 0 for v in _corr_stats.values()):
                                     log.info(
                                         f"re_embedder.correction_eval schema={_schema} "
@@ -10412,6 +17519,9 @@ def main():
                                         f"rejected={_corr_stats['rejected']} "
                                         f"errors={_corr_stats['errors']}"
                                     )
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.error(f"re_embedder.correction_signal_subsystem_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10423,8 +17533,12 @@ def main():
                             # INGEST_ENABLED freeze: the sweep UPDATEs rel_types type
                             # constraints (ontology mutation) — no rows selected when frozen.
                             try:
+                                _sw = "head_tail_sweep"
+                                _sw_run = _reembedder_claim(_sweep_snap, _user_id, _sw, _schema)
+                                release_read_transaction(
+                                    _ont_db, context=f"re_embedder.head_tail_sweep schema={_schema}")
                                 _sweep_rows = []
-                                if ingest_enabled:
+                                if _sw_run and ingest_enabled:
                                     with _ont_db.cursor() as cur:
                                         cur.execute(
                                             "SELECT rel_type, head_types, tail_types, natural_language"
@@ -10438,6 +17552,17 @@ def main():
 
                                 for _rt, _ht, _tt, _nl in _sweep_rows:
                                     try:
+                                        # PER-ITEM BARRIER. The SELECT that filled _sweep_rows
+                                        # left this connection INTRANS holding AccessShareLock on
+                                        # rel_types, and the very next statement is a blocking LLM
+                                        # call — the exact 10-hour shape. On later iterations the
+                                        # previous row's UPDATE has already COMMITTED, so this is a
+                                        # no-op; if it ever is NOT, a write is pending and
+                                        # release_read_transaction() log_crit()s instead of
+                                        # discarding it.
+                                        release_read_transaction(
+                                            _ont_db,
+                                            context=f"re_embedder.head_tail_sweep.row schema={_schema} rel={_rt}")
                                         _md = _query_llm_for_rel_type_metadata(
                                             _rt, "unknown", "unknown", _nl or "", qwen_api_url
                                         )
@@ -10476,9 +17601,25 @@ def main():
                                         except Exception:
                                             pass
                                         log.warning(f"re_embedder.head_tail_sweep_row_failed schema={_schema} rel_type={_rt}: {_sw_err}")
+                                if _sw_run:
+                                    _sweep.record_run(_ont_db, _user_id, _sw,
+                                                      _sweep_snap.observed_token(_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_ont_db, _schema)
                                 log.warning(f"re_embedder.head_tail_sweep_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
+                            # ENGINE-SIDE WRITER. A subsystem that GREW this tenant's
+                            # ontology has created work for the OTHERS (a newly-minted rel_type
+                            # needs head/tail types and a natural_language template; a new
+                            # hierarchy rung re-opens the climb). `_changed_schemas` is the
+                            # loop's existing "this tenant's metadata moved" signal — reuse it
+                            # rather than invent a second source of truth.
+                            if _schema in _changed_schemas:
+                                _sweep.mark_dirty_conn(
+                                    _ont_db, _user_id,
+                                    "rel_types", "rel_type_aliases", "entity_taxonomies",
+                                    "ontology_evaluations", "facts", "staged_facts",
+                                    "entity_aliases", "linguistic_cues")
+                                _ont_db.commit()
                     except Exception as e:
                         log.error(f"re_embedder.ontology_per_user_error schema={_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
 
@@ -10527,11 +17668,28 @@ def main():
                     # INGEST_ENABLED freeze: taxonomy discovery INSERTs entity_taxonomies
                     # rows (ontology growth) — iterate no schemas in knowledge-store mode.
                     for _tx_user_id, _tx_schema in (ready_schemas if ingest_enabled else []):
+                        # LEDGER GATE — taxonomy discovery is one LLM call PER NOVEL REL.
+                        if not _sweep.claim(_sweep_snap, _tx_user_id, "taxonomy_discovery"):
+                            _sweep.log_skip(_sweep_snap, _tx_user_id, "taxonomy_discovery", _tx_schema)
+                            continue
                         try:
                             with psycopg2.connect(postgres_dsn) as _tx_db:
                                 with _tx_db.cursor() as _spc:
-                                    _spc.execute(f"SET search_path TO {_tx_schema}")
+                                    _spc.execute(f"SET search_path TO {_tx_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                                 _tx_db.commit()
+                                # SaaS Gap-B: bind this tenant's brain for the taxonomy-discovery
+                                # LLM call (_llm_discover_taxonomy_from_facts) below.
+                                _reembedder_bind_tenant_brain(_tx_schema)
+                                # SPEND PRE-FLIGHT — must sit AFTER the bind (it reads the brain
+                                # that was just bound), which is why this subsystem's ledger
+                                # claim above is not folded into `_reembedder_claim` like the
+                                # others. This lane is LLM-ONLY (one call per novel rel, nothing
+                                # deterministic to salvage), so a seat with no reachable brain
+                                # skips the anti-join too. No `record_run` → still due next cycle.
+                                if not _reembedder_llm_lane_open(
+                                        _tx_user_id, "taxonomy_discovery", _tx_schema):
+                                    continue
 
                                 with _tx_db.cursor() as cur:
                                     cur.execute(
@@ -10546,6 +17704,18 @@ def main():
                                             discovered = _llm_discover_taxonomy_from_facts(
                                                 _tx_db, "system", [{"rel_type": rel_type}]
                                             )
+                                            if discovered and discovered.get("taxonomy_name") \
+                                                    and not (discovered.get("rel_types_defining_group") or []):
+                                                # HOLLOW-GROUPING GUARD (BUG-05 fix 3, doc-lane
+                                                # mirror of the growth-drain decline): a grouping
+                                                # whose defining rel list is empty scopes nothing
+                                                # at determine_path while reading identical to a
+                                                # healthy row - refuse the birth.
+                                                log.warning("re_embedder.taxonomy_hollow_declined "
+                                                            f"schema={_tx_schema} rel_type={rel_type} "
+                                                            "note=LLM returned no rel_types_defining_group, "
+                                                            "refusing to mint a hollow grouping (BUG-05 fix 3)")
+                                                discovered = None  # nothing mintable; skip the INSERT
                                             if discovered and discovered.get("taxonomy_name"):
                                                 with _tx_db.cursor() as cur:
                                                     cur.execute(
@@ -10570,13 +17740,15 @@ def main():
                                                 _tx_db.commit()
                                                 _load_taxonomy_cache(_tx_db)
                                                 _changed_schemas.add(_tx_schema)
-                                                log.info("re_embedder.taxonomy_discovered_async",
-                                                        schema=_tx_schema,
-                                                        rel_type=rel_type,
-                                                        taxonomy=discovered.get("taxonomy_name"))
+                                                log.info("re_embedder.taxonomy_discovered_async "
+                                                        f"schema={_tx_schema} rel_type={rel_type} "
+                                                        f"taxonomy={discovered.get('taxonomy_name')}")
                                         except Exception as e:
-                                            log.warning("re_embedder.taxonomy_discovery_failed",
-                                                       schema=_tx_schema, rel_type=rel_type, error=str(e))
+                                            log.warning("re_embedder.taxonomy_discovery_failed "
+                                                       f"schema={_tx_schema} rel_type={rel_type} error={str(e)}")
+                                _sweep.record_run(
+                                    _tx_db, _tx_user_id, "taxonomy_discovery",
+                                    _sweep_snap.observed_token(_tx_user_id, "taxonomy_discovery"))
                         except Exception as e:
                             log.error(f"re_embedder.taxonomy_discovery_per_tenant_error schema={_tx_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
                 except Exception as e:
@@ -10609,16 +17781,25 @@ def main():
                 # public (public is template/seed-source only).
                 _ext_pattern_changed = False
                 for _gw_user_id, _gw_schema in ready_schemas:
+                    # LEDGER SEAT GATE (see the ontology loop above).
+                    if not _sweep_snap.seat_has_work(_gw_user_id):
+                        continue
                     try:
                         with psycopg2.connect(postgres_dsn) as _gw_db:
                             with _gw_db.cursor() as _spc:
-                                _spc.execute(f"SET search_path TO {_gw_schema}")
+                                _spc.execute(f"SET search_path TO {_gw_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                             _gw_db.commit()
+                            # SaaS Gap-B: bind this tenant's brain for the name-conflict
+                            # arbitration LLM call (resolve_name_conflicts) below.
+                            _reembedder_bind_tenant_brain(_gw_schema)
 
                             # dprompt-137: Evaluate retraction outcomes for continuous learning
                             # Auto-register high-frequency patterns, update metrics for existing patterns
                             try:
-                                if has_pending_retraction_outcomes(_gw_db):
+                                _sw = "retraction_outcomes"
+                                _sw_run = _reembedder_claim(_sweep_snap, _gw_user_id, _sw, _gw_schema)
+                                if _sw_run and has_pending_retraction_outcomes(_gw_db):
                                     retraction_stats = evaluate_retraction_outcomes(_gw_db, frequency_threshold=3)
                                     if any(v > 0 for v in [retraction_stats["discovered"], retraction_stats["updated"]]):
                                         log.info(
@@ -10630,6 +17811,9 @@ def main():
                                         )
                                 else:
                                     log.debug(f"re_embedder.no_pending_retraction_outcomes schema={_gw_schema}")
+                                if _sw_run:
+                                    _sweep.record_run(_gw_db, _gw_user_id, _sw,
+                                                      _sweep_snap.observed_token(_gw_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_gw_db, _gw_schema)
                                 log.error(f"re_embedder.retraction_outcomes_subsystem_error schema={_gw_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10639,7 +17823,13 @@ def main():
                             # INGEST_ENABLED freeze: conflict arbitration mutates entities/
                             # entity_aliases (preferred flags, merges) — paused when frozen.
                             try:
-                                if ingest_enabled and has_pending_name_conflicts(_gw_db):
+                                _sw = "name_conflicts"
+                                _sw_run = _reembedder_claim(_sweep_snap, _gw_user_id, _sw, _gw_schema)
+                                if _sw_run and ingest_enabled and has_pending_name_conflicts(_gw_db):
+                                    # READ BARRIER (RE-ARM): the read directly above re-opened a transaction AFTER the
+                                    # block-level barrier, and the call below blocks. A latching check cannot see this;
+                                    # measured live, it killed climb_classification_chains' connection twice.
+                                    release_read_transaction(_gw_db, context="re_embedder.name_conflicts.pre_blocking_call")
                                     conflict_stats = resolve_name_conflicts(_gw_db, qwen_api_url)
                                     if conflict_stats["resolved"] > 0:
                                         log.info(
@@ -10651,6 +17841,9 @@ def main():
                                         )
                                 else:
                                     log.debug(f"re_embedder.no_pending_name_conflicts schema={_gw_schema}")
+                                if _sw_run:
+                                    _sweep.record_run(_gw_db, _gw_user_id, _sw,
+                                                      _sweep_snap.observed_token(_gw_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_gw_db, _gw_schema)
                                 log.error(f"re_embedder.name_conflict_subsystem_error schema={_gw_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10658,13 +17851,19 @@ def main():
                             # ALIAS-PROVENANCE-DESIGN §3: Flag suspect preferred names (preferred
                             # aliases nobody ever chose). Flag-only — never auto-mutates names.
                             try:
-                                suspect_stats = flag_suspect_preferred_names(_gw_db)
+                                _sw = "suspect_preferred_names"
+                                _sw_run = _reembedder_claim(_sweep_snap, _gw_user_id, _sw, _gw_schema)
+                                suspect_stats = (flag_suspect_preferred_names(_gw_db)
+                                                 if _sw_run else {"flagged": 0})
                                 if suspect_stats["flagged"] > 0:
                                     log.info(
                                         f"re_embedder.suspect_preferred_names_flagged "
                                         f"schema={_gw_schema} "
                                         f"count={suspect_stats['flagged']}"
                                     )
+                                if _sw_run:
+                                    _sweep.record_run(_gw_db, _gw_user_id, _sw,
+                                                      _sweep_snap.observed_token(_gw_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_gw_db, _gw_schema)
                                 log.error(f"re_embedder.suspect_preferred_names_subsystem_error schema={_gw_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10672,7 +17871,10 @@ def main():
                             # Job 6: Evaluate extraction patterns for accuracy and bootstrap confidence
                             # Scoring phase: analyze user feedback on extraction patterns, update confidence scores
                             try:
-                                pattern_stats = evaluate_extraction_patterns(_gw_db)
+                                _sw = "extraction_pattern_eval"
+                                _sw_run = _reembedder_claim(_sweep_snap, _gw_user_id, _sw, _gw_schema)
+                                pattern_stats = (evaluate_extraction_patterns(_gw_db)
+                                                 if _sw_run else {})
                                 _mutations = (
                                     pattern_stats.get("archived", 0)
                                     + pattern_stats.get("promoted", 0)
@@ -10691,6 +17893,9 @@ def main():
                                     )
                                 else:
                                     log.debug(f"re_embedder.no_pending_extraction_pattern_work schema={_gw_schema}")
+                                if _sw_run:
+                                    _sweep.record_run(_gw_db, _gw_user_id, _sw,
+                                                      _sweep_snap.observed_token(_gw_user_id, _sw))
                             except Exception as e:
                                 _rollback_and_reapply_search_path(_gw_db, _gw_schema)
                                 log.error(f"re_embedder.extraction_pattern_subsystem_error schema={_gw_schema} (non-fatal): {type(e).__name__}: {str(e)[:200]}")
@@ -10729,7 +17934,8 @@ def main():
                     try:
                         with psycopg2.connect(postgres_dsn) as _ev_db:
                             with _ev_db.cursor() as cur:
-                                cur.execute(f"SET search_path TO {_ev_schema}")
+                                cur.execute(f"SET search_path TO {_ev_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
                                 cur.execute("""
                                     DELETE FROM intent_pattern_cache
                                     WHERE is_permanent = false
@@ -10751,6 +17957,72 @@ def main():
                         log.warning(f"re_embedder.pattern_cache_eviction_failed schema={_ev_schema} (non-fatal): {type(e).__name__}: {str(e)[:100]}")
                 if _evict_deleted > 0 or _evict_extended > 0:
                     log.info(f"re_embedder.pattern_cache_eviction deleted={_evict_deleted} extended={_evict_extended}")
+
+                # AGENT CORTEX (Tier-1): decay/harden sweep of the firewalled per-seat
+                # cortex `flagent_<uuid>`. Reuses the Class-C job SHAPES (harden at
+                # observation_count>=3; decay inferred rows past expires_at). Each seat's
+                # sweep opens its OWN flagent connection bound WITHOUT public (inside
+                # _cortex.sweep_lifecycle_for_user) — the cortex NEVER shares the user
+                # search_path. Fail-safe: per-seat wrapped, never crashes the loop. The
+                # user-fact schema name is never derived here (firewall intact).
+                # BOUNDED: cycle wall-clock budget + rotation cursor — see "THE CORTEX-SWEEP
+                # BUDGET" near the top of this module for the measurement (2.0 s/seat median,
+                # ~46 min/cycle at 1,392 seats against a 30 s interval) and for why the bound
+                # is a BUDGET and not a ghost/orphan test (the ghost skip above already makes
+                # an orphan cortex seat unreachable from here; the seats that burned the cycle
+                # were LIVE). Deferral, never loss: the sweep is idempotent and time-based, so
+                # a seat skipped this cycle is swept next — and the cursor guarantees it goes
+                # FIRST, which is what stops a budget from simply moving the starvation to the
+                # tail of the list.
+                try:
+                    from src.api import cortex as _cortex_sweep
+                    _cx_hardened = 0
+                    _cx_decayed = 0
+                    _cx_swept = 0
+                    _cx_deferred = 0
+                    _cx_t0 = time.monotonic()
+                    _cx_armed = False
+                    _cx_cursor = _cortex_sweep_cursor[0]
+                    _cx_next_cursor = None
+                    for _cx_user_id, _cx_schema in ready_schemas:
+                        _cx_armed, _cx_may_sweep = _cortex_sweep_cycle_gate(
+                            _cx_armed, _cx_cursor, _cx_user_id,
+                            time.monotonic() - _cx_t0, _CORTEX_SWEEP_CYCLE_BUDGET_S,
+                        )
+                        if not _cx_may_sweep:
+                            # First denial in this cycle becomes NEXT cycle's starting point,
+                            # so the seats we are declining here are served before anyone else.
+                            if _cx_armed and _cx_next_cursor is None:
+                                _cx_next_cursor = str(_cx_user_id)
+                            _cx_deferred += 1
+                            continue
+                        try:
+                            _cx_res = _cortex_sweep.sweep_lifecycle_for_user(_cx_user_id)
+                            _cx_hardened += _cx_res.get("hardened", 0)
+                            _cx_decayed += _cx_res.get("decayed", 0)
+                            _cx_swept += 1
+                        except Exception as _cx_e:
+                            log.warning(f"re_embedder.cortex_sweep_failed user={str(_cx_user_id)[:8]} (non-fatal): {type(_cx_e).__name__}: {str(_cx_e)[:100]}")
+                    # Advance the rotation cursor. None when every seat was served → next cycle
+                    # starts from the top, which is the correct steady state for a deployment
+                    # whose whole cortex phase fits inside the budget.
+                    _cortex_sweep_cursor[0] = _cx_next_cursor
+                    if _cx_deferred:
+                        # FAIL LOUD: work we declined to do is a visible warning carrying the
+                        # resume point, never a success-shaped short count.
+                        log.warning(
+                            f"re_embedder.cortex_sweep_cycle_budget_exhausted "
+                            f"swept={_cx_swept} deferred={_cx_deferred} "
+                            f"elapsed={time.monotonic() - _cx_t0:.1f}s "
+                            f"budget={_CORTEX_SWEEP_CYCLE_BUDGET_S:.0f}s "
+                            f"next_cycle_resumes_at={str(_cx_next_cursor)[:8]} "
+                            f"(sweep is idempotent + time-based; deferred seats go FIRST next "
+                            f"cycle)"
+                        )
+                    if _cx_hardened or _cx_decayed:
+                        log.info(f"re_embedder.cortex_sweep hardened={_cx_hardened} decayed={_cx_decayed}")
+                except Exception as _cx_outer:
+                    log.warning(f"re_embedder.cortex_sweep_subsystem_error (non-fatal): {type(_cx_outer).__name__}: {str(_cx_outer)[:120]}")
 
                 # Job 7: Fill in missing natural_language for rel_types in use.
                 # Finds rel_types with NULL natural_language that appear in recent facts,
@@ -10785,17 +18057,36 @@ def main():
                     # Stub-then-fill on the same tenant connection guarantees a freshly
                     # minted stub is fill-eligible the same cycle.
                     for _us_id, _us_schema in ready_schemas:
+                        # LEDGER GATE — the FILL is one LLM call per un-phrased rel, and a rel
+                        # the brain will not phrase stays NULL and is re-sent every cycle.
+                        if not _sweep.claim(_sweep_snap, _us_id, "orphan_stub_and_nl_fill"):
+                            _sweep.log_skip(_sweep_snap, _us_id, "orphan_stub_and_nl_fill", _us_schema)
+                            continue
                         try:
                             with psycopg2.connect(postgres_dsn) as _stub_db:
                                 with _stub_db.cursor() as _spc:
-                                    _spc.execute(f"SET search_path TO {_us_schema}")
+                                    _spc.execute(f"SET search_path TO {_us_schema}")  # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                # nosemgrep: python.lang.security.audit.formatted-sql-query.formatted-sql-query, python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — schema from UUID-derived source with validation
+                                # SaaS Gap-B: bind this tenant's brain for the natural-language
+                                # phrasing FILL LLM call (generate_rel_type_phrasing) below.
+                                _reembedder_bind_tenant_brain(_us_schema)
+                                # SPEND PRE-FLIGHT — after the bind (it reads the brain just
+                                # bound). UNLIKE taxonomy discovery this subsystem is HALF
+                                # deterministic: Job 7a's orphan-stub mint is pure SQL and mints
+                                # the `label` the renderer falls back to, so it is NOT skipped —
+                                # only the LLM FILL is. The ledger run is therefore recorded only
+                                # when the FILL actually ran; otherwise the seat stays due and
+                                # fills the moment a brain is configured.
+                                _nl_lane_open = _reembedder_llm_lane_open(
+                                    _us_id, "orphan_stub_and_nl_fill", _us_schema)
                                 # INGEST_ENABLED freeze: the stub mint INSERTs new rel_types
                                 # rows (ontology growth) — skipped when frozen. The FILL below
                                 # (presentation-metadata columns on EXISTING rows) keeps running.
                                 _orphan_stubs = 0
                                 if ingest_enabled:
                                     with _stub_db.cursor() as _scur:
-                                        _scur.execute(
+                                        _scur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                                             """
                                             -- source MUST satisfy rel_types_source_check
                                             -- (wikidata|builtin|engine|user|expand); an
@@ -10830,15 +18121,21 @@ def main():
                                 # EITHER the 3p OR the 2p template. LIMIT 5 per tenant per
                                 # cycle to avoid LLM saturation. Self-limiting: once
                                 # filled, never re-selected for that rel_type.
-                                with _stub_db.cursor() as cur:
-                                    cur.execute(
-                                        """SELECT rel_type FROM rel_types
-                                           WHERE (natural_language IS NULL OR natural_language = ''
-                                                  OR natural_language_2p IS NULL OR natural_language_2p = '')
-                                           ORDER BY confidence DESC
-                                           LIMIT 5"""
-                                    )
-                                    missing_nl = [row[0] for row in cur.fetchall()]
+                                # Not even SELECTED when the spend pre-flight is closed — the
+                                # rows would be re-read and re-sent every cycle for a brain
+                                # that cannot answer.
+                                missing_nl = []
+                                if _nl_lane_open:
+                                    with _stub_db.cursor() as cur:
+                                        cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
+                                            """SELECT rel_type FROM rel_types
+                                               WHERE (natural_language IS NULL OR natural_language = ''
+                                                      OR natural_language_2p IS NULL OR natural_language_2p = '')
+                                               ORDER BY confidence DESC
+                                               LIMIT 5"""
+                                        )
+                                        missing_nl = [row[0] for row in cur.fetchall()]
 
                                 _nl_changed = False
                                 for rt in missing_nl:
@@ -10849,7 +18146,13 @@ def main():
                                         # helper validates placeholders (X in 3p; Y-and-not-X in 2p)
                                         # and returns only the keys that passed; failures yield {}.
                                         # Uses LLMTimeouts/LLMMaxTokens via operation NATURAL_LANGUAGE_FILL.
-                                        _phrasing = generate_rel_type_phrasing(rt, user_id="re_embedder")
+                                        # PER-TENANT: `_us_id` IS the seat of `_us_schema` —
+                                        # the loop already carries it (it is the ledger key one
+                                        # screen up), so the phrasing call is attributed to the
+                                        # tenant whose rel_type is being phrased and whose brain
+                                        # is bound. This is the lane that produced the prod
+                                        # `seat=re_embed op=NATURAL_LANGUAGE_FILL` noise.
+                                        _phrasing = generate_rel_type_phrasing(rt, user_id=_us_id)
                                         nl = _phrasing.get("natural_language", "")
                                         nl_2p = _phrasing.get("natural_language_2p", "")
                                         if nl:
@@ -10884,10 +18187,24 @@ def main():
                                         log.warning(f"re_embedder.natural_language_fill_failed schema={_us_schema} rel_type={rt}: {nl_err}")
                                 if _nl_changed:
                                     _changed_schemas.add(_us_schema)
+                                # Recorded ONLY when the FILL half actually ran. A pre-flight
+                                # skip leaves the token dirty on purpose: the un-phrased rels are
+                                # still owed, and marking them done would hide them for up to
+                                # REEMBED_SWEEP_MAX_INTERVAL after the tenant adds a brain.
+                                if _nl_lane_open:
+                                    _sweep.record_run(
+                                        _stub_db, _us_id, "orphan_stub_and_nl_fill",
+                                        _sweep_snap.observed_token(_us_id, "orphan_stub_and_nl_fill"))
                         except Exception as _stub_err:
                             log.warning(f"re_embedder.orphan_rel_stub_job_failed (non-fatal) schema={_us_schema}: {_stub_err}")
                 except Exception as e:
                     log.warning(f"re_embedder.natural_language_job_error (non-fatal): {e}")
+
+                # SaaS Gap-B: the per-tenant LLM growth loops above are done — clear the last
+                # tenant's brain back to the global env path so the between-cycle / reconcile work
+                # below (and the top of the next cycle before its per-tenant re-bind) never runs
+                # against a stale tenant brain. SAAS off → no-op.
+                _reembedder_clear_tenant_brain()
 
                 # Superseded / hard-delete Qdrant passes REMOVED (tenancy-audit Gap 7).
                 # They ran on the shared `db` (public search_path) and did
@@ -10901,10 +18218,37 @@ def main():
                 # per-collection and deletes `reason=superseded` / `reason=not_in_pg`
                 # using the collision-safe filter.
 
-                # Reconciliation pass — sync stale payloads and orphaned points
-                stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
-                if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
-                    log.info(f"re_embedder.reconcile deleted={stats['deleted']} reupserted={stats['reupserted']} ok={stats['ok']} errors={stats['errors']}")
+                # Reconciliation pass — sync stale payloads and orphaned points.
+                # CADENCE-GATED (task §3): the full per-collection Qdrant scroll runs only
+                # when a tenant had work this cycle (activity-driven) OR the coarse
+                # max-interval ceiling has elapsed (never starves cleanup). A perfectly
+                # idle rig scrolls at most once per `reconcile_max_interval`, not every cycle.
+                _now_mono = time.monotonic()
+                _reconcile_due = (
+                    _active_tenants_this_cycle > 0
+                    or (_now_mono - _last_reconcile_at) >= reconcile_max_interval
+                )
+                if _reconcile_due:
+                    stats = reconcile_qdrant(db, qdrant_url, qwen_api_url)
+                    _last_reconcile_at = _now_mono
+                    if any(v > 0 for v in [stats["deleted"], stats["reupserted"], stats["errors"]]):
+                        log.info(f"re_embedder.reconcile deleted={stats['deleted']} reupserted={stats['reupserted']} ok={stats['ok']} errors={stats['errors']}")
+                    # SaaS per-seat memories_kept gauge (SAAS_MODE only, best-effort). Rides the
+                    # same reconcile cadence — this IS the loop whose cost the meter tracks. Fully
+                    # self-guarded: any failure is swallowed so metering never disturbs the loop.
+                    try:
+                        from saas.metering import sample_all_gauges
+                        _n = sample_all_gauges()
+                        if _n:
+                            log.debug(f"re_embedder.usage_gauge sampled={_n} seats")
+                    except Exception as _me:
+                        log.debug(f"re_embedder.usage_gauge_skipped: {_me}")
+                else:
+                    log.debug(
+                        "re_embedder.reconcile.skipped_idle "
+                        f"elapsed={int(_now_mono - _last_reconcile_at)}s "
+                        f"max_interval={reconcile_max_interval}s active_tenants=0"
+                    )
 
         except Exception as e:
             log.error(f"re_embedder.loop_error: {e}")
@@ -10932,6 +18276,10 @@ def extract_retraction_pattern(text: str, rel_type: str, action: str, user_id: s
     try:
         from src.api.llm_client import build_llm_payload, get_llm_headers
         from src.api.llm_calls import call_llm_with_retry_sync, LLMTimeouts
+
+        # READ BARRIER: this helper is handed a caller-owned connection and then blocks on
+        # an LLM call. Whatever read the caller left open must not ride across it.
+        release_read_transaction(db_conn, context="re_embedder.extract_retraction_pattern")
 
         messages = [
             {
@@ -11015,7 +18363,8 @@ def store_retraction_pattern(pattern_text: str, pattern_type: str, negation_type
     """
     try:
         with db_conn.cursor() as cur:
-            cur.execute(
+            cur.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query — multi-line execute with schema from UUID-derived source
+
                 """INSERT INTO negation_patterns
                    (pattern_text, negation_type, learned_from, confidence, confirmed_count)
                    VALUES (%s, %s, %s, %s, 1)
@@ -11047,4 +18396,65 @@ def store_retraction_pattern(pattern_text: str, pattern_type: str, negation_type
 
 
 if __name__ == "__main__":
-    main()
+    # THIS PROCESS IS DEFERRABLE UPKEEP. Every LLM call it makes must yield to calls a user
+    # is actually waiting on: it takes only the capacity interactive traffic left behind,
+    # and when there is none it DEFERS to a later sweep instead of firing into a provider
+    # that is already refusing us.
+    #
+    # Declared HERE, not at module import, on purpose — the API process imports symbols from
+    # this module, and marking that process background would defer the user's own calls. A
+    # process-level default also reaches the sweep's worker threads, which a ContextVar set
+    # in main() would not. Genuinely user-driven work inside this process (e.g. draining a
+    # document someone just uploaded) re-enters the interactive lane via llm_lane.use_lane.
+    _llm_lane.set_process_default(_llm_lane.LANE_BACKGROUND)
+    # OBSERVABILITY (load-bearing): this is set at RUNTIME via os.environ, so it is invisible
+    # in /proc/<pid>/environ — that file is the env the process was STARTED with and never
+    # reflects a later write. Without this line the only way to check whether the sweep is
+    # actually deferring is to wait for a rate-limit storm. Log it once, at start-up.
+    log.info(f"re_embedder.llm_lane_declared lane={_llm_lane.current_lane()} "
+             f"is_background={_llm_lane.is_background()} "
+             f"note=deferrable upkeep; yields to interactive traffic and defers when the "
+             f"account budget is spent")
+    # STRUCTURAL FLOOD CHECK (dprompt-155 §2.3, the trap that already burned us): at a mint
+    # interval of 1/rate, any interactive-lane queue deeper than ~max_wait*rate CANNOT be
+    # served within the cap and those callers fail OPEN — uncapped fire into a provider
+    # already refusing us. Background callers defer (safe); this names the residual
+    # INTERACTIVE exposure at start-up so an operator can see the shape before the storm.
+    try:
+        from src.api import llm_calls as _lc
+        # Env-path brains only (SaaS brains are DB-configured per tenant — this check is
+        # diagnostics for the legacy/global path; QWEN_API_URL is the legacy priority-3
+        # fallback when LLM_BASE_URL is unset, see llm_client endpoint resolution).
+        _base = (os.environ.get("LLM_BASE_URL", "")
+                 or os.environ.get("QWEN_API_URL", "")).strip()
+        _limits = _lc.resolve_provider_limits(_base, os.environ.get("WGM_LLM_MODEL", ""))
+        _fb = _lc._fallback_entry_for(_base) or {}
+        _rpm = min([x for x in (_limits.get("rpm"), _fb.get("rpm"),
+                                float(os.environ.get("LLM_MAX_RPM", "480") or 480))
+                    if x] or [480.0])
+        _mint_s = 60.0 / float(_rpm)
+        _wait_s = _lc._rate_max_wait_s()
+        if _wait_s < 2.0 * _mint_s:
+            from src.api.logging_config import log_crit
+            log_crit(log, "re_embedder.rate_flood_shape_detected",
+                     effective_rpm=_rpm, token_mint_interval_s=round(_mint_s, 2),
+                     max_wait_s=_wait_s,
+                     note=f"LLM_RATE_MAX_WAIT_S={_wait_s}s is under 2x the mint interval "
+                          f"(60/{_rpm:.0f}s) at this brain's floor — interactive queues "
+                          f"deeper than ~{int(_wait_s / _mint_s)} call(s) WILL fail open "
+                          f"uncapped; background lanes defer safely. Raise LLM_RATE_MAX_WAIT_S "
+                          f"or accept the interactive exposure.")
+    except Exception as _flood_err:  # noqa: BLE001 — diagnostics must never block start-up
+        log.warning(f"re_embedder.rate_flood_shape_check_skipped: {_flood_err}")
+    if str(os.environ.get("REEMBEDDER_SUPERVISOR", "false")).strip().lower() in ("1", "true", "yes", "on"):
+        # OPT-IN event-driven supervisor (Deliverable C): one asyncio worker per active tenant,
+        # comparator-driven (idle ⇒ zero LLM calls) and yield-gated to interactive traffic.
+        # Unset/false (default) → the legacy single-threaded main() loop runs byte-for-byte.
+        import asyncio
+        from src.re_embedder.supervisor import run_supervisor
+        _sup_postgres_dsn = os.getenv("POSTGRES_DSN")
+        _sup_qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+        _sup_backend_api_url = os.getenv("FAULTLINE_API_URL", "http://faultline:8000").rstrip("/")
+        asyncio.run(run_supervisor(_sup_postgres_dsn, _sup_backend_api_url, _sup_qdrant_url))
+    else:
+        main()

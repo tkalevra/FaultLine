@@ -47,6 +47,37 @@ only by adding a writer to this module.
 REPLAY_MARKER_HEADER = "X-FL-Deferred-Replay"
 REPLAY_MARKER_VALUE = "1"
 
+# R11 (critic RG-Z): the ANCIENT-RETRY RECONCILE marker. A deferred-retry body older than
+# the age policy re-processes as RECONCILE, never overwrite: the backend arbitrates the
+# edges against CURRENT-value rows of the same single-current slot and drops the ancient
+# edge when a fresher current row exists (never planting a second live current). Header-
+# only, like the replay marker: byte-identity = the idempotency guarantee.
+BACKLOG_RECONCILE_HEADER = "X-FL-Backlog-Reconcile"
+BACKLOG_RECONCILE_VALUE = "1"
+# The body's backlog age in seconds at POST time (informational - feeds the backend's
+# fresher-than comparison; a missing/garbled value parses as 0.0 and the reconcile marker
+# alone still decides reconcile-ness).
+BACKLOG_AGE_HEADER = "X-FL-Backlog-Age-S"
+
+_RECONCILE_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def backlog_reconcile_from_raw(raw):
+    """Fail-safe parse of the reconcile marker (same doctrine as replay_from_raw):
+    absent / empty / unrecognized => NOT a reconcile (fail toward the user's latest words)."""
+    return str(raw or "").strip().lower() in _RECONCILE_TRUTHY
+
+
+def backlog_age_from_raw(raw):
+    """Fail-safe parse of the backlog-age hint: absent/garbled => 0.0 (no age claim)."""
+    try:
+        v = float(str(raw or "").strip())
+        if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+            return 0.0
+        return v
+    except (TypeError, ValueError):
+        return 0.0
+
 # Lane hint — informational only (see module docstring).
 REPLAY_LANE_HEADER = "X-FL-Replay-Lane"
 REPLAY_LANE_REEXTRACT = "reextract"  # the re_embedder episodic re-mine (embedder.py::reextract_episodic)

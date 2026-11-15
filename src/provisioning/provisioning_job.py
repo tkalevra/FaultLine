@@ -10,6 +10,7 @@ import psycopg2
 import psycopg2.extensions
 from typing import List, Dict, Any, Optional
 from .schema_manager import create_user_schema, get_postgres_connection
+from src.api.db_read import release_read_transaction
 
 log = structlog.get_logger()
 
@@ -29,7 +30,7 @@ async def provision_user_schema_background(user_id: str, user_slug: str, dsn: st
         >>> import asyncio
         >>> asyncio.run(provision_user_schema_background(
         ...     user_id="550e8400-e29b-41d4-a716-446655440000",
-        ...     user_slug="alexander"
+        ...     user_slug="alicia"
         ... ))
     """
     try:
@@ -44,6 +45,9 @@ async def provision_user_schema_background(user_id: str, user_slug: str, dsn: st
         )
 
         if status == "ready":
+            # READY MEANS READY: the agent cortex (`flagent_<uuid>` schema + seed + collection)
+            # is now created INSIDE create_user_schema, BEFORE the ready flag is written
+            # (first-touch-cold-path gauntlet). Nothing provisioning-shaped runs after `ready`.
             log.info(f"user_schema_provisioned", user_id=user_id, schema=schema_name)
         else:
             log.error(f"user_schema_provisioning_failed", user_id=user_id, schema=schema_name, status=status)
@@ -216,6 +220,18 @@ def process_provisioning_queue(batch_size: int = 10) -> Dict[str, Any]:
 
             pending = cur.fetchall()
 
+            # The queue SELECT above opened a read transaction on THIS connection, but the
+            # per-user provisioning below runs on SEPARATE connections (user_db) and takes
+            # tens of seconds each (template apply via psql subprocess). Held open, the
+            # queue transaction sat idle-in-transaction across the WHOLE batch — measured
+            # live 2026-08-22 on the gauntlet rig: 25s for one pending user, 97s when a
+            # batch spanned several (the 2026-08-01 incident class). Release the pure-read
+            # transaction BEFORE the slow loop; this connection does no further reads here.
+            try:
+                release_read_transaction(db, context="provisioning_queue_fetch")
+            except Exception:
+                pass  # fail-safe: the release protects lock retention, never the job
+
             if not pending:
                 return results
 
@@ -236,6 +252,11 @@ def process_provisioning_queue(batch_size: int = 10) -> Dict[str, Any]:
                         actual_schema_name, status = create_user_schema(user_id, slug, user_db)
                         if status == "ready":
                             results["provisioned"] += 1
+                            # READY MEANS READY: the cortex schema/seed/collection and the
+                            # migration-ledger stamp now run INSIDE create_user_schema,
+                            # BEFORE `status='ready'` is committed (first-touch-cold-path
+                            # gauntlet). This job does NO work after the flag — a poller that
+                            # sees `ready` sees a finished job.
                             log.info(f"provisioned_user_schema",
                                    user_id=user_id[:8],
                                    schema=actual_schema_name)
